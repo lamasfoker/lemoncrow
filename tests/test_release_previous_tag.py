@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from scripts import release_previous_tag
 from scripts.release_previous_tag import previous_tag
 
 
@@ -34,3 +35,22 @@ def test_missing_or_malformed_candidate_fails_closed() -> None:
         previous_tag("latest", [_release("v0.7.4")])
     with pytest.raises(ValueError, match="no published stable"):
         previous_tag("v0.8.0", [])
+
+
+def test_resolver_always_uses_published_public_repo(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json
+    import subprocess
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert argv[:6] == ["gh", "release", "list", "--repo", "lemoncrow-lab/lemoncrow", "--limit"]
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=0,
+            stdout=json.dumps([_release("v0.7.4"), _release("v0.8.0")]),
+        )
+
+    monkeypatch.setattr(release_previous_tag.subprocess, "run", fake_run)
+    assert release_previous_tag.main(["v0.8.0"]) == 0
+    assert capsys.readouterr().out.strip() == "v0.7.4"

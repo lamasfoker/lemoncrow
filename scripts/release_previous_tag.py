@@ -43,7 +43,17 @@ def main(argv: list[str] | None = None) -> int:
     if len(args) != 1:
         raise SystemExit("usage: release_previous_tag.py vMAJOR.MINOR.PATCH[-rcN]")
     result = subprocess.run(
-        ["gh", "release", "list", "--limit", "100", "--json", "tagName,isPrerelease,isDraft"],
+        [
+            "gh",
+            "release",
+            "list",
+            "--repo",
+            "lemoncrow-lab/lemoncrow",
+            "--limit",
+            "100",
+            "--json",
+            "tagName,isPrerelease,isDraft",
+        ],
         capture_output=True,
         text=True,
         check=True,
