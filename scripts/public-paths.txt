@@ -179,6 +179,7 @@ scripts/install_hermes.sh
 scripts/install_hosts.sh
 scripts/install_lemoncode.sh
 scripts/install_opencode.sh
+scripts/opencode_v2_config.py
 scripts/install_pi.sh
 scripts/install.sh
 scripts/hosted.sh
