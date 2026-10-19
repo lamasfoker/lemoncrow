@@ -205,6 +205,7 @@ scripts/refresh_model_prices.py
 scripts/release_changelog.py
 scripts/release_notes.py
 scripts/release_preflight.py
+scripts/release_previous_tag.py
 scripts/release_version.py
 scripts/sessions.sh
 scripts/verify_release_upgrade.sh

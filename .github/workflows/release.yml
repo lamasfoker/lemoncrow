@@ -207,10 +207,18 @@ jobs:
           path: candidate/
 
       - name: Upgrade previous release in place
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           archive="$(find candidate -maxdepth 1 -name 'lemoncrow-distribution-linux-x86_64.tar.gz' -print -quit)"
           test -n "$archive"
-          bash scripts/verify_release_upgrade.sh latest "$archive"
+          # A tag's release object may already be published when a slow job
+          # starts, especially when rerunning CI. `latest` would install the
+          # current candidate and falsely test a self-upgrade. Always use the
+          # highest prior *published stable* semver instead.
+          previous="$(python scripts/release_previous_tag.py "$GITHUB_REF_NAME")"
+          echo "Verifying actual release upgrade: $previous -> $GITHUB_REF_NAME"
+          bash scripts/verify_release_upgrade.sh "$previous" "$archive"
 
   release:
     name: Create GitHub Release
