@@ -41,11 +41,28 @@ from .errors import AgentAction, ClientError, ErrorCode
 __all__ = [
     "ROUTES",
     "SECURITY_EXCLUDED_TOOLS",
+    "Effect",
     "Route",
     "Site",
     "route_for",
     "tool_names",
 ]
+
+
+class Effect(StrEnum):
+    """What re-sending a call can do. Decides transparent retry after reconnect.
+
+    Only ``PURE`` and ``IDEMPOTENT`` calls are re-sent when the server vanished
+    mid-call; a ``SIDE_EFFECTING`` call is never re-sent automatically because
+    the first attempt may already have taken effect.
+    """
+
+    #: Reads only; any number of repeats is invisible.
+    PURE = "pure"
+    #: May write, but repeating it converges on the same state.
+    IDEMPOTENT = "idempotent"
+    #: A repeat can do something twice (append, execute, mutate).
+    SIDE_EFFECTING = "side_effecting"
 
 
 class Site(StrEnum):
@@ -78,6 +95,18 @@ class Route:
     #: Local executor used when the server never came up. Empty for rows with
     #: no honest local answer -- which is most of them.
     offline: str = ""
+    #: Retry class. Defaults to the fail-safe answer: never re-send.
+    effect: Effect = Effect.SIDE_EFFECTING
+    #: A server row whose answer cannot depend on the working tree. Every other
+    #: server row is answered from the View's tree (the server materializes it
+    #: at the call's revision), so the client must bring the View up to date
+    #: with out-of-band edits first. Opt-out, so a new server tool is fresh by
+    #: default rather than stale until someone remembers to list it.
+    view_independent: bool = False
+
+    @property
+    def retry_safe(self) -> bool:
+        return self.effect is not Effect.SIDE_EFFECTING
 
     @property
     def local(self) -> bool:
@@ -86,6 +115,11 @@ class Route:
     @property
     def remote(self) -> bool:
         return self.site in (Site.SERVER, Site.SERVER_ADMIN)
+
+    @property
+    def reads_view(self) -> bool:
+        """Answered from the server's copy of the tree: sync out-of-band edits first."""
+        return self.site is Site.SERVER and not self.view_independent
 
 
 # Public tools deliberately absent from the enterprise thin client. Each can
@@ -106,9 +140,11 @@ def _rows() -> tuple[Route, ...]:
             executor="edit",
             pushes_blobs=True,
         ),
-        Route("grep", Site.CLIENT, "ripgrep over the working tree, no index needed", executor="grep"),
-        Route("blame", Site.CLIENT, "git history is local", executor="blame"),
-        Route("scan", Site.CLIENT, "ast-grep binary over local files", executor="scan"),
+        Route(
+            "grep", Site.CLIENT, "ripgrep over the working tree, no index needed", executor="grep", effect=Effect.PURE
+        ),
+        Route("blame", Site.CLIENT, "git history is local", executor="blame", effect=Effect.PURE),
+        Route("scan", Site.CLIENT, "ast-grep binary over local files", executor="scan", effect=Effect.PURE),
         Route(
             "codemod",
             Site.CLIENT,
@@ -125,30 +161,45 @@ def _rows() -> tuple[Route, ...]:
             Site.CLIENT_UPLOAD_SERVER_BUILD,
             "client enumerates and uploads; server builds",
             executor="index",
+            effect=Effect.IDEMPOTENT,
         ),
         # -- server ------------------------------------------------------- #
-        Route("code_search", Site.SERVER, "needs the index"),
+        Route("code_search", Site.SERVER, "needs the index", effect=Effect.PURE),
         Route(
             "read",
             Site.SERVER,
             "resolves ranges/outlines/symbols from the index; falls back to a client pull on a blob miss",
             offline="read_from_disk",
+            effect=Effect.PURE,
         ),
-        Route("relations", Site.SERVER, "link index"),
-        Route("graph", Site.SERVER, "link index"),
-        Route("search", Site.SERVER, "embeddings"),
-        Route("context", Site.SERVER, "already remote-routable via RemoteClient"),
+        Route("relations", Site.SERVER, "link index", effect=Effect.PURE),
+        Route("graph", Site.SERVER, "link index", effect=Effect.PURE),
+        Route("search", Site.SERVER, "embeddings", effect=Effect.PURE),
+        Route("context", Site.SERVER, "already remote-routable via RemoteClient", effect=Effect.PURE),
         Route("memory", Site.SERVER, "already remote-routable via RemoteClient"),
-        Route("verify", Site.SERVER, "already remote-routable via RemoteClient"),
+        Route("verify", Site.SERVER, "already remote-routable via RemoteClient", effect=Effect.IDEMPOTENT),
         Route("trace", Site.SERVER, "already remote-routable via RemoteClient"),
         Route("rescue", Site.SERVER, "already remote-routable via RemoteClient"),
         Route("compact", Site.SERVER, "already remote-routable via RemoteClient"),
-        Route("orient", Site.SERVER, "already remote-routable via RemoteClient"),
-        Route("web_fetch", Site.SERVER, "pure network; keeps egress on the server where policy can see it"),
-        Route("statusline_segment", Site.SERVER, "session state moves server-side"),
+        Route("orient", Site.SERVER, "already remote-routable via RemoteClient", effect=Effect.PURE),
+        Route(
+            "web_fetch",
+            Site.CLIENT,
+            "public-page network requests run on the host, independent of the server",
+            executor="web_fetch",
+            effect=Effect.PURE,
+        ),
+        Route(
+            "statusline_segment",
+            Site.SERVER,
+            "session state moves server-side",
+            effect=Effect.PURE,
+            view_independent=True,
+        ),
         Route("review_rationale", Site.SERVER, "server, except screenshot capture"),
         Route("review_evidence", Site.SERVER, "server, except screenshot capture"),
         Route("review_feedback_addressed", Site.SERVER, "server, except screenshot capture"),
+        Route("review_guidance", Site.SERVER, "server, except screenshot capture"),
         # -- server, privileged ------------------------------------------- #
         Route("cache", Site.SERVER_ADMIN, "administers server-side index state"),
     )

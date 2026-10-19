@@ -1,82 +1,51 @@
-# Installing LemonCrow into Antigravity
+# Antigravity integration
 
-**Support level**: MCP config for Antigravity plus `agy` companion CLI support
+LemonCrow integrates with Antigravity through its external-tool configuration plus generated host guidance. The companion `agy` CLI can use the same workspace integration.
 
----
-
-## Quick Install
+## Source-checkout install
 
 ```bash
-make install
+bash scripts/install_antigravity.sh
 ```
 
-For project-local Antigravity artifacts:
+For one workspace:
 
 ```bash
-bash scripts/install_antigravity.sh --workspace /path/to/workspace
+bash scripts/install_antigravity.sh --workspace /path/to/repo
 ```
 
----
+The installer can write:
 
-## What Gets Installed
-
-| Artifact          | Global install                            | `--workspace DIR` install      |
-| ----------------- | ----------------------------------------- | ------------------------------ |
-| MCP server config | `~/.config/Antigravity/User/mcp.json`     | `<workspace>/.vscode/mcp.json` |
-| Host instructions | Existing workspace `AGENTS.md` entrypoint | same workspace entrypoint      |
-
-Global installs also copy the LemonCrow Antigravity plugin metadata and shared
-skills for `agy`, so Antigravity sessions get stronger LemonCrow-first guidance
-instead of only a bare MCP registration.
-
-The MCP config registers LemonCrow as a stdio server:
-
-```json
-{
-  "servers": {
-    "lc": {
-      "type": "stdio",
-      "command": "lc mcp",
-      "args": ["--host", "antigravity"]
-    }
-  }
-}
-```
-
-Global installs also try:
-
-```bash
-antigravity --add-mcp '{"name":"lc","command":"lc mcp","args":["--host","antigravity"]}'
-```
+- Antigravity's external-tool configuration;
+- workspace `AGENTS.md` guidance;
+- LemonCrow host/plugin metadata and shared skills used by `agy`.
 
 ## Verify
 
 ```bash
 make verify
+lc rt status
 ```
 
-## First Task
+Open the workspace in Antigravity or launch `agy` from the repository and confirm LemonCrow tools are available.
 
-Open the workspace in Antigravity or start `agy` in the repo and ask it to use LemonCrow context before coding.
+## Evidence and limits
 
-## Expected Behavior
+Antigravity does not expose the same deep lifecycle hook surface as Claude Code or Codex, so LemonCrow relies more heavily on tool traffic, generated guidance, and explicit recorded evidence.
 
-- Antigravity can invoke LemonCrow MCP tools through the local LemonCrow MCP wrapper
-- `agy` can work against the same workspace and MCP surface
-- Workspace installs stay local to `.vscode/mcp.json`
-- Active context/retrieval/verify tools require `LEMONCROW_DEV_MODE=1`; otherwise some tools may be visible but return passive `noop`
+## Implementation/debug details
 
-## Troubleshooting
+Antigravity stores its external-tool connection in an MCP-shaped configuration file. Current installer entries invoke the Runtime protocol adapter under:
 
-| Problem                 | Fix                                                                       |
-| ----------------------- | ------------------------------------------------------------------------- |
-| MCP tools not loading   | Reload Antigravity; check user `mcp.json` or workspace `.vscode/mcp.json` |
-| `antigravity` not found | Install the Antigravity app or ensure it is on `PATH`                     |
-| `agy` not found         | Install/configure the companion CLI if you want terminal-first usage      |
+```text
+lc runtime mcp --host antigravity
+```
+
+That protocol layer is an implementation detail; normal users should treat LemonCrow as an Antigravity integration rather than a service they operate.
 
 ## Uninstall
 
 ```bash
 bash scripts/uninstall_antigravity.sh
-bash scripts/uninstall_antigravity.sh --workspace /path/to/workspace
+bash scripts/uninstall_antigravity.sh --workspace /path/to/repo
 ```

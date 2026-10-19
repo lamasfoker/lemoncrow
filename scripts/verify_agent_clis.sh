@@ -56,8 +56,9 @@ for host in "${HOSTS[@]}"; do
         RESULTS[$host]="skipped"
         continue
     fi
-    output=$(bash "$script" "${PASSTHROUGH[@]+"${PASSTHROUGH[@]}"}" 2>&1)
-    exit_code=$?
+    # Capture the host's status without letting `set -e` abort the whole run.
+    exit_code=0
+    output=$(bash "$script" "${PASSTHROUGH[@]+"${PASSTHROUGH[@]}"}" 2>&1) || exit_code=$?
     echo "$output"
     if echo "$output" | grep -q "=== SKIPPED"; then
         RESULTS[$host]="skipped"
@@ -78,7 +79,7 @@ for h in "${HOSTS[@]}"; do
     case "$status" in
         pass)    echo "  PASS     $h" ;;
         skipped) echo "  SKIPPED  $h (CLI not found)" ;;
-        fail)    echo "  FAIL     $h"; ((FAIL_COUNT++)) ;;
+        fail)    echo "  FAIL     $h"; FAIL_COUNT=$((FAIL_COUNT + 1)) ;;
         *)       echo "  UNKNOWN  $h" ;;
     esac
 done

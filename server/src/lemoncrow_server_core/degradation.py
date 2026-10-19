@@ -139,8 +139,17 @@ class DegradationPolicy:
         return None
 
     def layer_report(self, *, org_id: str, view_id: str) -> Mapping[str, Any]:
-        """Per-view readiness, for the session and view status routes."""
-        return {
-            "link": self._backend.links.status(org_id, view_id).to_wire(),
-            "semantic": self._backend.semantic.status(org_id, view_id).to_wire(),
-        }
+        """Per-view readiness, for status routes and low-cardinality metrics."""
+        current = self._backend.views.get(org_id, view_id).view_revision
+        link = self._backend.links.status(org_id, view_id)
+        semantic = self._backend.semantic.status(org_id, view_id)
+        ops = self._backend.ops
+        if ops is not None:
+            for name, status in (("link", link), ("semantic", semantic)):
+                ops.layer(
+                    layer=name,
+                    state=status.state.value,
+                    revision_lag=max(0, current - status.at_view_revision),
+                    covered_paths=status.covered_paths,
+                )
+        return {"link": link.to_wire(), "semantic": semantic.to_wire()}

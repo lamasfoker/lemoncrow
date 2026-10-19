@@ -37,9 +37,18 @@ LLM_VISIBLE_TOOLS = frozenset(
 )
 
 # Profile membership can only narrow the explicit visible set. Keep this as a
-# separate name for future profile shaping, but require it to remain a subset
-# of LLM_VISIBLE_TOOLS.
 CORE_MCP_TOOLS = frozenset(LLM_VISIBLE_TOOLS)
+# Review Ask agents run against an immutable materialized Review snapshot.
+# Source/navigation/web tools operate on that Snapshot directly; Bash is safe
+# only because the Review composition redirects it to a disposable execution
+# copy and independently confines writes there. Edit/orchestration stay absent.
+REVIEW_MCP_TOOLS = frozenset({"bash", "code_search", "grep", "read", "web_fetch"})
+# Autonomous Review is a separate trust boundary from human-initiated Ask. It
+# receives exact Snapshot source investigation only: no shell, public web, edit,
+# broker/orchestration, or other registered tools. Bump the policy version when
+# native host restrictions change without changing this MCP membership.
+REVIEW_AUTONOMOUS_MCP_TOOLS = frozenset({"code_search", "grep", "read"})
+REVIEW_AUTONOMOUS_TOOL_POLICY_VERSION = 1
 HIDDEN_SKILLS: frozenset[str] = frozenset()
 # Public skills that ship by default when installing a host. `lc` (the
 # on-demand install/remove/list discovery skill, integrations/skills/lemoncrow/)

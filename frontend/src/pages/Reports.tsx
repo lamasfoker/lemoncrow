@@ -30,7 +30,7 @@ export default function Reports() {
         );
         setErr(null);
       })
-      .catch((error) => setErr(String(error)));
+      .catch((error) => setErr(error instanceof Error ? error.message : String(error)));
   }, []);
 
   const selected = useMemo(
@@ -53,7 +53,7 @@ export default function Reports() {
 
   return (
     <div className="space-y-4">
-      {err && <Alert tone="danger" description={err} />}
+      {err && <Alert tone="destructive" description={err} />}
 
       {list === null && !err && (
         <EmptyState title="Loading benchmark reports…" />
@@ -80,7 +80,7 @@ export default function Reports() {
               <Button
                 key={report.id}
                 onClick={() => setSelectedId(report.id)}
-                variant={selectedId === report.id ? "accent" : "ghost"}
+                variant={selectedId === report.id ? "default" : "ghost"}
                 className="h-auto w-full justify-start px-3 py-2 text-left normal-case tracking-normal"
               >
                 <div className="min-w-0">
@@ -88,14 +88,14 @@ export default function Reports() {
                     <span className="truncate font-semibold text-neutral-200">
                       {report.suite}
                     </span>
-                    <span className="text-[10px] text-neutral-600">
+                    <span className="text-caption text-muted-foreground">
                       {report.project_label}
                     </span>
                   </div>
-                  <div className="mt-0.5 truncate font-mono text-[10px] text-neutral-500">
+                  <div className="mt-0.5 truncate font-mono text-caption text-muted-foreground">
                     {report.run_id}
                   </div>
-                  <div className="mt-0.5 text-[10px] text-neutral-600">
+                  <div className="mt-0.5 text-caption text-muted-foreground">
                     {fmtDate(report.generated_at)}
                   </div>
                 </div>
@@ -104,23 +104,23 @@ export default function Reports() {
           </nav>
 
           <Card className="min-w-0 p-4">
-            {contentErr && <Alert tone="danger" description={contentErr} />}
+            {contentErr && <Alert tone="destructive" description={contentErr} />}
             {content === null && !contentErr && (
-              <div className="text-xs text-neutral-500">
+              <div className="text-xs text-muted-foreground">
                 Loading benchmark report…
               </div>
             )}
             {content && (
               <>
-                <div className="mb-4 flex flex-wrap items-center gap-2 border-b border-neutral-800 pb-3">
-                  <Chip tone="purple">{content.suite}</Chip>
-                  <span className="font-mono text-[10px] text-neutral-500">
+                <div className="mb-4 flex flex-wrap items-center gap-2 border-b border-border pb-3">
+                  <Chip tone="neutral">{content.suite}</Chip>
+                  <span className="font-mono text-caption text-muted-foreground">
                     {content.run_id}
                   </span>
-                  <span className="text-[10px] text-neutral-600">
+                  <span className="text-caption text-muted-foreground">
                     {content.project_label}
                   </span>
-                  <span className="ml-auto text-[10px] text-neutral-600">
+                  <span className="ml-auto text-caption text-muted-foreground">
                     {content.files.length} artifacts
                   </span>
                 </div>

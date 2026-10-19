@@ -1,4 +1,4 @@
-"""Local-only maintenance that keeps imported host usage fresh.
+"""Local-only maintenance: fresh imported host usage and the landing watch.
 
 The retired local controller imported host sessions periodically. The unified
 loopback server retained index maintenance but lost that duty, leaving /usage
@@ -34,8 +34,12 @@ class LocalMaintenance:
         state_root: Path,
         import_interval_s: float = _DEFAULT_IMPORT_INTERVAL_S,
         clock: Callable[[], float] = time.time,
+        landing_watch: Callable[[], object] | None = None,
+        flush_telemetry: bool = True,
     ) -> None:
         self._base = base
+        self._landing_watch = landing_watch
+        self._flush_telemetry_enabled = flush_telemetry
         self._runtime_root = Path(runtime_root)
         self._state_path = Path(state_root) / "session-import.json"
         self._import_interval_s = max(0.0, float(import_interval_s))
@@ -46,9 +50,37 @@ class LocalMaintenance:
         return getattr(self._base, "last_report", None)
 
     def run_once(self) -> Any:
-        report = self._base.run_once()
-        self._maybe_import_sessions()
-        return report
+        try:
+            return self._base.run_once()
+        finally:
+            # A failed index pass must not also stop landings, session import or telemetry.
+            self._watch_landings()
+            self._maybe_import_sessions()
+            self._flush_telemetry()
+
+    def _flush_telemetry(self) -> None:
+        """Daily anonymous rollups (savings and event counts). Each is a cheap
+        no-op until due, lock-guarded across processes, and opt-out aware; this
+        long-lived server is the one reliable caller now that thin-client
+        sessions no longer run the stdio MCP worker tick."""
+        if not self._flush_telemetry_enabled:
+            return
+        from lemoncrow.core.service.telemetry.event_rollup import maybe_flush_event_rollup
+        from lemoncrow.core.service.telemetry.public_rollup import maybe_flush_public_rollup
+
+        for flush in (maybe_flush_public_rollup, maybe_flush_event_rollup):
+            try:
+                flush(self._runtime_root)
+            except Exception:
+                _LOG.exception("telemetry rollup flush failed")
+
+    def _watch_landings(self) -> None:
+        if self._landing_watch is None:
+            return
+        try:
+            self._landing_watch()
+        except Exception:
+            _LOG.exception("landing watch failed")
 
     def _read_state(self) -> dict[str, Any]:
         try:
@@ -82,7 +114,8 @@ class LocalMaintenance:
         )
         if last_attempt > 0 and now - last_attempt < retry_after:
             return
-        command = [sys.executable, "-m", "lemoncrow.gateway.cli", "--root", str(self._runtime_root), "import", "--json"]
+        # Root `lc import` is retired; the internal worker prints the same JSON counts.
+        command = [sys.executable, "-m", "lemoncrow.core.service.session_import", "--root", str(self._runtime_root)]
         succeeded = False
         counts: dict[str, int] = {}
         error = ""

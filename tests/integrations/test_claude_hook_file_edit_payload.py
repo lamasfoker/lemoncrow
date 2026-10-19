@@ -223,3 +223,39 @@ def test_main_returns_zero_for_a_non_edit_tool(
 def test_main_returns_zero_on_garbage_stdin(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("sys.stdin", io.StringIO("not json at all"))
     assert HOOK.main() == 0
+
+
+def test_main_signals_live_review_prewarm_after_edit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root, workspace = _setup(tmp_path, monkeypatch)
+    target = workspace / "a.py"
+    target.write_text("x = 2\n", encoding="utf-8")
+    calls: list[tuple[Path, Path, str, str]] = []
+
+    from lemoncrow.pro.capabilities.review import live_runtime
+
+    monkeypatch.setattr(
+        live_runtime,
+        "request_live_review_prepare",
+        lambda store_root, repo_root, *, host, session_id: calls.append(
+            (Path(store_root), Path(repo_root), host, session_id)
+        ),
+    )
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "tool_name": "Edit",
+                    "session_id": _SESSION,
+                    "tool_input": {
+                        "file_path": str(target),
+                        "old_string": "x = 1\n",
+                        "new_string": "x = 2\n",
+                    },
+                }
+            )
+        ),
+    )
+
+    assert HOOK.main() == 0
+    assert calls == [(root.resolve(), workspace.resolve(), "claude", _SESSION)]

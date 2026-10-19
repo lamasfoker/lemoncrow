@@ -186,12 +186,12 @@ def test_seen_history_is_bounded_and_evicted_results_are_reemitted(search_server
     assert _text(_call(server, {"query": "1"})) == _SOURCE
 
 
-def test_search_force_recovery_is_advertised_in_both_profiles():
+def test_search_force_recovery_is_not_advertised_in_model_profiles():
     for profile in ("core", "full"):
         spec = next(
             item for item in tool_list(env={"LEMONCROW_MCP_TOOL_PROFILE": profile}) if item["name"] == "code_search"
         )
-        assert spec["inputSchema"]["properties"]["force"]["type"] == "boolean"
+        assert "force" not in spec["inputSchema"]["properties"]
 
 
 def test_hydrated_cache_hits_are_deduped_only_at_the_model_boundary(bootstrapped, monkeypatch):

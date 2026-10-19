@@ -405,24 +405,11 @@ def _write_outcomes(root: Path, session_id: str) -> Path:
     return p
 
 
-def _write_reports_index(cwd_reports: Path) -> None:
-    cwd_reports.mkdir(parents=True, exist_ok=True)
-    index = [
-        {
-            "week": "2026-W20",
-            "week_start": "2026-05-11",
-            "generated_at": "2026-05-15 17:00 UTC",
-            "routing_sessions": 50,
-            "total_routing_savings_usd": 43.61,
-            "routing_quality_score": 0.887,
-            "compact_retention_score": 0.81,
-        }
-    ]
-    (cwd_reports / "index.json").write_text(json.dumps(index))
-    week_dir = cwd_reports / "2026-W20"
-    week_dir.mkdir(parents=True, exist_ok=True)
-    (week_dir / "benchmark.md").write_text("# Benchmark report 2026-W20\n\nContent here.")
-    (week_dir / "benchmark.json").write_text(json.dumps({"week": "2026-W20", "metric_snapshot": {}}))
+def _write_benchmark_report(project_root: Path) -> None:
+    run_dir = project_root / "reports" / "benchmark" / "release" / "2026-W20"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "report.txt").write_text("# Benchmark report 2026-W20\n\nContent here.")
+    (run_dir / "summary.csv").write_text("metric,value\nquality,0.887\n")
 
 
 # ---------------------------------------------------------------------------
@@ -437,14 +424,17 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     _write_run(tmp_path, "sess-001", cost=1.23)
     _write_outcomes(tmp_path, "sess-001")
 
-    # Write fake reports/ next to cwd (api.py uses Path("reports") relative)
-    reports_dir = tmp_path / "reports"
-    _write_reports_index(reports_dir)
+    _write_benchmark_report(tmp_path)
 
-    # Patch env vars so cfg properties read from tmp_path
+    # Patch env vars so cfg properties read from tmp_path and expose this
+    # project through the same Code-project discovery contract the dashboard uses.
     monkeypatch.setenv("LEMONCROW_ROOT", str(tmp_path))
     monkeypatch.setenv("LEMONCROW_REQUIRE_AUTH", "0")
-    monkeypatch.chdir(tmp_path)  # chdir so relative Path("reports") resolves correctly
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "lemoncrow.core.service.code_map.list_projects",
+        lambda: [{"project_id": "project-test", "root": str(tmp_path), "label": "test-project"}],
+    )
 
     from lemoncrow.core.service.api import create_app
 
@@ -1417,47 +1407,52 @@ class TestListReports:
         data = resp.json()
         assert isinstance(data, list)
 
-    def test_contains_week_2026_w20(self, client: TestClient) -> None:
+    def test_contains_run_2026_w20(self, client: TestClient) -> None:
         data = client.get("/v1/reports").json()
-        weeks = [e["week"] for e in data]
-        assert "2026-W20" in weeks
+        run_ids = [e["run_id"] for e in data]
+        assert "2026-W20" in run_ids
 
     def test_entry_fields(self, client: TestClient) -> None:
         data = client.get("/v1/reports").json()
-        entry = next((e for e in data if e["week"] == "2026-W20"), None)
+        entry = next((e for e in data if e["run_id"] == "2026-W20"), None)
         assert entry is not None
-        assert "week_start" in entry
+        assert entry["project_id"] == "project-test"
+        assert entry["suite"] == "release"
+        assert entry["has_report"] is True
         assert "generated_at" in entry
 
 
 # ---------------------------------------------------------------------------
-# Tests: GET /v1/reports/{week}
+# Tests: GET /v1/reports/{project_id}/{suite}/{run_id}
 # ---------------------------------------------------------------------------
 
 
 class TestGetReport:
+    _PATH = "/v1/reports/project-test/release/2026-W20"
+
     def test_found(self, client: TestClient) -> None:
-        resp = client.get("/v1/reports/2026-W20")
+        resp = client.get(self._PATH)
         assert resp.status_code == 200
 
     def test_response_has_markdown(self, client: TestClient) -> None:
-        data = client.get("/v1/reports/2026-W20").json()
+        data = client.get(self._PATH).json()
         assert "markdown" in data
         assert "Benchmark report" in data["markdown"]
+        assert data["files"] == ["report.txt", "summary.csv"]
 
-    def test_response_has_json(self, client: TestClient) -> None:
-        data = client.get("/v1/reports/2026-W20").json()
-        assert "json" in data
-        assert isinstance(data["json"], dict)
+    def test_response_names_artifacts(self, client: TestClient) -> None:
+        data = client.get(self._PATH).json()
+        assert data["files"] == ["report.txt", "summary.csv"]
+        assert data["id"] == "project-test:release:2026-W20"
 
-    def test_404_unknown_week(self, client: TestClient) -> None:
-        resp = client.get("/v1/reports/2026-W99")
+    def test_404_unknown_run(self, client: TestClient) -> None:
+        resp = client.get("/v1/reports/project-test/release/2026-W99")
         assert resp.status_code == 404
 
     def test_400_bad_format(self, client: TestClient) -> None:
-        resp = client.get("/v1/reports/../secrets")
+        resp = client.get("/v1/reports/project-test/../secrets/run")
         assert resp.status_code in (400, 404, 422)
 
     def test_400_encoded_path_traversal(self, client: TestClient) -> None:
-        resp = client.get("/v1/reports/2026-W20%2F..%2Fsecrets")
+        resp = client.get("/v1/reports/project-test/release/2026-W20%2F..%2Fsecrets")
         assert resp.status_code in (400, 404, 422)

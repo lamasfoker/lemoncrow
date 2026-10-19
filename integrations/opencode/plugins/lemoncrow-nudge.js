@@ -172,6 +172,9 @@ export const LemonCrowNudge = async ({ client, directory }) => ({
       cwd: directory,
       model: input.model,
     });
+    if (typeof nudge.additionalContext === "string" && nudge.additionalContext.trim()) {
+      textParts[textParts.length - 1].text += `\n\n${nudge.additionalContext}`;
+    }
     await showToast(
       client,
       nudge.uiMessage

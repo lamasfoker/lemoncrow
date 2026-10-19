@@ -1,13 +1,23 @@
 from __future__ import annotations
 
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+import lemoncrow.pro.capabilities.review.chapters as chapters_mod
 from lemoncrow.pro.capabilities.review.chapters import (
     _dependency_order,
     _intent_chapters,
     _scope_label,
+    _summary_concept_label,
+    build_chapter_lenses,
     change_story_labels,
 )
 from lemoncrow.pro.capabilities.review.models import ChangedFile, ReviewOrderEntry, ReviewPacket
+from lemoncrow.pro.capabilities.review.preparation import build_review_brief
 from lemoncrow.pro.capabilities.review.render import render_review
+from lemoncrow.pro.capabilities.review.review_priority import TargetPriority
 
 
 def test_multi_scope_commit_is_not_one_fake_concept() -> None:
@@ -15,6 +25,13 @@ def test_multi_scope_commit_is_not_one_fake_concept() -> None:
     assert _scope_label("review-ux") == "Review Ux"
     assert _scope_label("review,usage,model") == ""
     assert _scope_label("review/usage") == ""
+
+
+def test_concept_label_truncation_does_not_leave_a_dangling_connector() -> None:
+    assert (
+        _summary_concept_label("feat(frontend): Code page file viewer, worktree picker and agent run")
+        == "Code page file viewer, worktree picker"
+    )
 
 
 def test_broad_commit_scope_falls_back_to_human_sized_structure() -> None:
@@ -65,21 +82,124 @@ def test_dependency_lens_respects_dependency_before_attention_priority() -> None
     assert [chapter["label"] for chapter in ordered] == ["Docs", "Infra"]
 
 
-def test_change_story_prefers_concepts_over_utility_buckets() -> None:
+def test_change_story_prefers_specific_concepts_over_source_area_buckets() -> None:
     chapters = [
-        {"label": "Other", "file_count": 20, "min_attention_rank": 1},
-        {"label": "Tests", "file_count": 18, "min_attention_rank": 2},
-        {"label": "Review", "file_count": 40, "min_attention_rank": 3},
-        {"label": "Usage", "file_count": 12, "min_attention_rank": 4},
-        {"label": "Gateway", "file_count": 4, "min_attention_rank": 5},
-        {"label": "Core", "file_count": 3, "min_attention_rank": 6},
-        {"label": "Install", "file_count": 2, "min_attention_rank": 0},
+        {"label": "Review", "file_count": 40, "min_attention_rank": 1},
+        {"label": "Frontend", "file_count": 18, "min_attention_rank": 2},
+        {"label": "Server", "file_count": 16, "min_attention_rank": 3},
+        {"label": "Live review ownership", "file_count": 10, "min_attention_rank": 4},
+        {"label": "Human judgment pinning", "file_count": 9, "min_attention_rank": 5},
+        {"label": "Agent feedback loop", "file_count": 8, "min_attention_rank": 6},
+        {"label": "Verification concurrency", "file_count": 7, "min_attention_rank": 7},
+        {"label": "Review history", "file_count": 6, "min_attention_rank": 8},
     ]
 
     labels, remaining = change_story_labels(chapters, limit=4)
 
-    assert labels == ("Review", "Usage", "Gateway", "Core")
+    assert labels == (
+        "Live review ownership",
+        "Human judgment pinning",
+        "Agent feedback loop",
+        "Verification concurrency",
+    )
     assert remaining == 1
+
+
+def test_large_repository_change_starts_with_grounded_concepts_and_target_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase-2's real 25-file Change is representative of the agentic-review shape."""
+
+    root = Path(__file__).resolve().parents[2]
+    paths = [
+        "frontend/src/review/ReviewHistorySheet.tsx",
+        "frontend/src/review/ReviewHistorySheet.test.tsx",
+        "frontend/src/review/ReviewReadinessSheet.tsx",
+        "frontend/src/review/ReviewReadinessSheet.test.tsx",
+        "src/lemoncrow/pro/capabilities/review/api.py",
+        "tests/gateway/test_review_api.py",
+        "src/lemoncrow/pro/capabilities/review/store.py",
+        "tests/gateway/test_review_store.py",
+        "server/src/lemoncrow_server_core/local_reviews.py",
+        "server/tests/test_local_review.py",
+        "src/lemoncrow/pro/capabilities/review/session_models.py",
+        "src/lemoncrow/pro/capabilities/review/relationships.py",
+    ]
+    assert all((root / path).is_file() for path in paths)
+    rows = [
+        {
+            "path": path,
+            "group": "changed_since_my_review" if index == 0 else "reviewed" if index % 3 == 0 else "unreviewed",
+            "attention_rank": index + 1,
+            "category": "test" if ".test." in path or "/tests/" in path or path.startswith("tests/") else "production",
+        }
+        for index, path in enumerate(paths)
+    ]
+    commit = {
+        "sha": "4fa6e30a2",
+        "summary": "feat(review): make Change identity durable",
+        "scope": "review",
+        "paths": set(paths),
+    }
+    monkeypatch.setattr(chapters_mod, "_commit_records", lambda *_args, **_kwargs: [commit])
+    targets = tuple(
+        SimpleNamespace(
+            target_id=f"target-{index}",
+            path=path,
+            label=Path(path).stem,
+            symbol="",
+            kind="file",
+            start_line=10 + index,
+            end_line=12 + index,
+            state="changed_since_review" if index == 0 else "reviewed" if index % 3 == 0 else "unreviewed",
+            changed_since_mark=index == 0,
+            attention_rank=index + 1,
+            priority=TargetPriority(position=index, outstanding=index == 0 or index % 3 != 0),
+        )
+        for index, path in enumerate(paths)
+    )
+
+    lenses = build_chapter_lenses(rows, {"impact": []}, repo_root=root, targets=targets)
+    labels = {chapter["label"] for chapter in lenses["intent"]}
+
+    assert {
+        "Review history",
+        "Review readiness",
+        "Review API",
+        "Review store",
+        "Make Change identity durable",
+    } <= labels
+    history = next(chapter for chapter in lenses["intent"] if chapter["label"] == "Review history")
+    assert history["file_count"] == 2
+    assert history["target_count"] == 2
+    assert history["progress"]["changed_since_review"] == 1
+    assert history["targets"][0]["target_id"] == "target-0"
+    assert history["targets"][0]["start_line"] == 10
+    assert "Grounded in commit: Make Change identity durable" in history["explanation"]
+
+    story, more = change_story_labels(lenses["intent"], limit=4)
+    assert len(story) == 4
+    assert "Review history" in story
+    assert more >= 1
+    assert lenses["dependency"]
+    assert lenses["commits"][0]["label"] == "feat(review): make Change identity durable"
+
+    brief = build_review_brief(
+        packet={"evidence": []},
+        groups=({"key": "unreviewed", "rows": rows},),
+        chapters=lenses,
+        annotations=(),
+        artifacts=(),
+        revision_id="revision-large",
+        targets=targets,  # type: ignore[arg-type]
+    )
+    major_labels = [item["label"] for item in brief["major_changes"]]
+    assert len(major_labels) == len(story) + more
+    assert "Review history" in major_labels
+    history_change = next(item for item in brief["major_changes"] if item["label"] == "Review history")
+    assert history_change["target_count"] == 2
+    assert history_change["changed_since_review"] == 1
+    assert "Key targets:" in history_change["explanation"]
 
 
 def test_default_terminal_review_spends_attention_on_only_eight_ranked_files() -> None:

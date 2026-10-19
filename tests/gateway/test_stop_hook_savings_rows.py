@@ -54,6 +54,28 @@ def _write_transcript(tmp_path: Path, prose_chars: int, code_chars: int) -> str:
     return str(p)
 
 
+def test_stop_seeds_ledger_only_for_lemoncrow_usage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LEMONCROW_ROOT", str(tmp_path))
+    stop = _load_stop()
+    sid = "sid-exact-tools"
+    stop._ensure_savings_sidecar(sid, {"tools_used": {"WebSearch": 4}})
+    assert not stop._sidecar_path(sid).exists()
+
+    stats = {
+        "tools_used": {"mcp__lc__bash": 374, "mcp__lc__read": 82},
+        "last_model": MODEL,
+        "cache_read_tokens": 100_000,
+    }
+    stop._ensure_savings_sidecar(sid, stats)
+    sidecar = stop._sidecar_path(sid)
+    assert sidecar is not None and sidecar.exists()
+    stop._write_input_style_row(sid, stats)
+    assert [r["kind"] for r in _rows(sidecar)] == ["input_style"]
+    stop._ensure_savings_sidecar(sid, stats)
+    stop._write_input_style_row(sid, stats)
+    assert len(_rows(sidecar)) == 1
+
+
 def test_output_style_row_credits_prose_not_code(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LEMONCROW_ROOT", str(tmp_path))
     monkeypatch.setenv("LEMONCROW_OUTPUT_STYLE_RATIO", "1.5")
@@ -361,3 +383,57 @@ def test_credit_rtk_gain_disabled_by_env(tmp_path: Path, monkeypatch: pytest.Mon
     sidecar = _seed_sidecar(tmp_path, sid)
     stop._credit_rtk_gain(sid, {"last_model": MODEL})
     assert [r for r in _rows(sidecar) if r.get("kind") == "external_compactor"] == []
+
+
+def test_visible_assistant_blocks_exclude_thinking_and_tool_blocks(tmp_path: Path) -> None:
+    stop = _load_stop()
+    transcript = tmp_path / "visible.jsonl"
+    transcript.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "id": "m1",
+                            "content": [
+                                {"type": "thinking", "thinking": "PRIVATE_REASONING_MUST_NOT_APPEAR"},
+                                {"type": "text", "text": "Visible implementation summary."},
+                                {"type": "tool_use", "name": "Edit", "input": {"path": "a.py"}},
+                            ],
+                        },
+                    }
+                ),
+                json.dumps({"type": "user", "message": {"content": [{"type": "text", "text": "user prompt"}]}}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    blocks = stop._visible_assistant_blocks(str(transcript))
+
+    assert blocks == [("m1:1", "Visible implementation summary.")]
+    assert "PRIVATE_REASONING_MUST_NOT_APPEAR" not in repr(blocks)
+
+
+def test_claude_visible_assistant_messages_are_idempotent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from lemoncrow.core.foundation.paths import session_dir
+
+    monkeypatch.setenv("LEMONCROW_ROOT", str(tmp_path / ".lemoncrow"))
+    monkeypatch.setenv("CLAUDE_WORKSPACE_ROOT", str(tmp_path / "workspace"))
+    (tmp_path / "workspace").mkdir()
+    stop = _load_stop()
+    transcript = _write_transcript(tmp_path, prose_chars=80, code_chars=0)
+
+    stop._write_visible_assistant_messages("claude-visible", transcript)
+    stop._write_visible_assistant_messages("claude-visible", transcript)
+
+    run_file = session_dir(tmp_path / ".lemoncrow", "claude", "claude-visible") / "run.json"
+    run = json.loads(run_file.read_text(encoding="utf-8"))
+    assistant = [
+        event
+        for event in run["events"]
+        if event.get("kind") == "agent_message" and (event.get("payload") or {}).get("role") == "assistant"
+    ]
+    assert len(assistant) == 1

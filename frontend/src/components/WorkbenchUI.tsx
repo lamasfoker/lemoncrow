@@ -1,3 +1,5 @@
+import { Button as UiButton } from "./ui/button";
+import { Input as UiInput } from "./ui/input";
 import { type ReactNode, useState } from "react";
 import { Check } from "lucide-react";
 import { cn } from "../lib/utils";
@@ -12,63 +14,33 @@ export { Card, CardContent, CardFooter, CardHeader } from "./ui/card";
 export { DisclosureCard } from "./ui/disclosure-card";
 export { EmptyState } from "./ui/empty-state";
 export { Input } from "./ui/input";
-export { Select } from "./ui/select";
+export { Select, SelectItem } from "./ui/select";
+export { Textarea } from "./ui/textarea";
 export { ToggleGroup } from "./ui/toggle-group";
 
-type Tone =
-  | "amber"
-  | "cyan"
-  | "emerald"
-  | "violet"
-  | "neutral"
-  | "red"
-  | "purple";
+/** Semantic tone. Panels stay neutral except `destructive`; chips/badges carry the colour. */
+type Tone = "neutral" | "info" | "success" | "warning" | "destructive";
+
+const NEUTRAL_PANEL = {
+  panel: "border-border bg-background/60",
+  eyebrow: "text-neutral-400",
+  value: "text-foreground",
+  border: "border-border",
+};
 
 const TONES: Record<
   Tone,
   { panel: string; eyebrow: string; value: string; border: string }
 > = {
-  amber: {
-    panel: "border-neutral-800 bg-neutral-950/60",
-    eyebrow: "text-neutral-400",
-    value: "text-neutral-100",
-    border: "border-neutral-800",
-  },
-  cyan: {
-    panel: "border-neutral-800 bg-neutral-950/60",
-    eyebrow: "text-neutral-400",
-    value: "text-neutral-100",
-    border: "border-neutral-800",
-  },
-  emerald: {
-    panel: "border-neutral-800 bg-neutral-950/60",
-    eyebrow: "text-neutral-400",
-    value: "text-neutral-100",
-    border: "border-neutral-800",
-  },
-  violet: {
-    panel: "border-neutral-800 bg-neutral-950/60",
-    eyebrow: "text-neutral-400",
-    value: "text-neutral-100",
-    border: "border-neutral-800",
-  },
-  neutral: {
-    panel: "border-neutral-800 bg-neutral-950/60",
-    eyebrow: "text-neutral-400",
-    value: "text-neutral-100",
-    border: "border-neutral-800",
-  },
-  red: {
+  neutral: NEUTRAL_PANEL,
+  info: NEUTRAL_PANEL,
+  success: NEUTRAL_PANEL,
+  warning: NEUTRAL_PANEL,
+  destructive: {
     panel: "border-red-900/30 bg-red-950/20",
     eyebrow: "text-red-300",
     value: "text-red-200",
     border: "border-red-900/50",
-  },
-  purple: {
-    panel: "border-neutral-800 bg-neutral-950/60",
-    eyebrow: "text-neutral-400",
-    value: "text-neutral-100",
-    border: "border-neutral-800",
   },
 };
 
@@ -103,7 +75,7 @@ export function FieldLabel({
   return (
     <div
       className={cn(
-        "text-[10px] font-semibold uppercase tracking-[0.1em] text-neutral-500",
+        "text-caption font-semibold uppercase tracking-[0.1em] text-muted-foreground",
         className
       )}
     >
@@ -147,12 +119,12 @@ export function SectionHeader({
   action?: ReactNode;
 }) {
   return (
-    <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
+    <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
       <div>
         {eyebrow && <FieldLabel className="tracking-[0.2em]">{eyebrow}</FieldLabel>}
-        <h2 className="mt-1 text-lg font-semibold text-neutral-100">{title}</h2>
+        <h2 className="mt-1 text-sm font-semibold text-foreground">{title}</h2>
         {description && (
-          <p className="mt-1 text-sm leading-relaxed text-neutral-400">
+          <p className="mt-1 text-label leading-5 text-muted-foreground">
             {description}
           </p>
         )}
@@ -178,7 +150,7 @@ export function FeaturePanel({
   bullets?: string[];
 }) {
   return (
-    <Card tone="muted" className="p-5">
+    <Card tone="muted" className="p-4">
       <div className="flex items-start gap-4">
         <div className="shrink-0 text-3xl">{icon}</div>
         <div className="flex-1">
@@ -186,10 +158,10 @@ export function FeaturePanel({
             <h2 className="text-lg font-semibold text-neutral-200">
               {title}
             </h2>
-            <Badge tone="emerald">{status}</Badge>
+            <Badge tone="success">{status}</Badge>
           </div>
           {subtitle && (
-            <p className="mb-3 text-[11px] text-neutral-400">
+            <p className="mb-3 text-label text-neutral-400">
               {subtitle}
             </p>
           )}
@@ -224,7 +196,7 @@ export function ExplainerCard({
 }) {
   return (
     <Card className="p-4">
-      <div className="text-sm font-semibold text-neutral-100">{title}</div>
+      <div className="text-sm font-semibold text-foreground">{title}</div>
       <dl className="mt-4 space-y-3 text-sm">
         <div className="grid gap-1 md:grid-cols-[88px_1fr]">
           <dt>
@@ -293,10 +265,10 @@ export function SnippetCard({
   caption?: string;
 }) {
   return (
-    <Card className="bg-neutral-950/70">
-      <div className="flex items-center justify-between gap-3 border-b border-neutral-800 px-4 py-3">
+    <Card className="bg-background/70">
+      <div className="flex items-center justify-between gap-3 border-b border-border px-4 py-3">
         <div>
-          <div className="text-sm font-semibold text-neutral-100">{title}</div>
+          <div className="text-sm font-semibold text-foreground">{title}</div>
           {caption && <div className="mt-1 text-xs text-neutral-400">{caption}</div>}
         </div>
         <CopyButton text={body} />
@@ -317,10 +289,8 @@ export function Chip({
   tone?: Tone;
   className?: string;
 }) {
-  const badgeTone =
-    tone === "violet" ? "purple" : tone === "purple" ? "purple" : tone;
   return (
-    <Badge tone={badgeTone} className={className}>
+    <Badge tone={tone} className={className}>
       {children}
     </Badge>
   );
@@ -347,11 +317,11 @@ export function Slider({
     <div className="space-y-3">
       <div className="flex items-center justify-between">
         <FieldLabel>{label}</FieldLabel>
-        <span className="font-mono text-sm text-neutral-100">
+        <span className="font-mono text-sm text-foreground">
           {formatValue(value)}
         </span>
       </div>
-      <input
+      <UiInput unstyled
         type="range"
         min={min}
         max={max}
@@ -374,7 +344,7 @@ export function Switch({
   onChange: (checked: boolean) => void;
 }) {
   return (
-    <button
+    <UiButton unstyled
       type="button"
       onClick={() => onChange(!checked)}
       className="flex items-center gap-3 transition hover:opacity-80"
@@ -387,14 +357,14 @@ export function Switch({
       >
         <div
           className={cn(
-            "h-3 w-3 rounded-full bg-white transition",
+            "h-3 w-3 rounded-full bg-neutral-100 transition",
             checked ? "translate-x-4" : "translate-x-0"
           )}
         />
       </div>
-      <span className="text-[10px] font-mono uppercase tracking-widest text-neutral-400">
+      <span className="text-caption font-mono uppercase tracking-widest text-neutral-400">
         {label}
       </span>
-    </button>
+    </UiButton>
   );
 }

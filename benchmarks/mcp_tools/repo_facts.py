@@ -174,6 +174,15 @@ def unique_substring_queries(
     *,
     max_file_hits: int = 6,
 ) -> list[tuple[str, SymbolFact]]:
+    return list(_unique_substring_queries_cached(repo_root, tuple(symbol_facts), max_file_hits))
+
+
+@functools.lru_cache(maxsize=8)
+def _unique_substring_queries_cached(
+    repo_root: Path,
+    symbol_facts: tuple[SymbolFact, ...],
+    max_file_hits: int,
+) -> tuple[tuple[str, SymbolFact], ...]:
     token_to_symbols: dict[str, list[tuple[str, SymbolFact]]] = defaultdict(list)
     for symbol in symbol_facts:
         seen_norms: set[str] = set()
@@ -195,13 +204,13 @@ def unique_substring_queries(
         if len(symbols) != 1:
             continue
         symbol = next(iter(symbols))
-        token = max((candidate for candidate, _symbol in entries), key=len)
+        token = entries[0][0]
         file_hits = [relative_path for relative_path, text in file_texts.items() if token in text]
         if symbol.path not in file_hits or len(file_hits) == 0 or len(file_hits) > max_file_hits:
             continue
         pairs.append((token, symbol))
     pairs.sort(key=lambda item: (item[1].path, item[1].line, item[0].lower()))
-    return pairs
+    return tuple(pairs)
 
 
 def stable_symbol_facts(

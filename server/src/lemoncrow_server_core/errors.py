@@ -73,6 +73,7 @@ class ErrorCode(StrEnum):
     DISPATCHER_UNAVAILABLE = "dispatcher_unavailable"
 
     # Resource governance
+    STORAGE_LIMIT = "storage_limit"
     REQUEST_TOO_LARGE = "request_too_large"
     CONCURRENCY_LIMIT = "concurrency_limit"
     DEADLINE_EXCEEDED = "deadline_exceeded"
@@ -87,6 +88,8 @@ class AgentAction(StrEnum):
 
     NONE = "none"
     UPGRADE_CLIENT = "upgrade_client"
+    #: The client is newer than the server's protocol window or manifest.
+    UPGRADE_SERVER = "upgrade_server"
     REAUTHENTICATE = "reauthenticate"
     REQUEST_ACCESS = "request_access"
     REOPEN_SESSION = "reopen_session"
@@ -131,12 +134,15 @@ _SPEC: Final[Mapping[ErrorCode, tuple[int, bool, AgentAction]]] = {
     ErrorCode.TOOL_NOT_SERVER_SIDE: (400, False, AgentAction.USE_CLIENT_TOOL),
     ErrorCode.TOOL_FAILED: (200, False, AgentAction.NONE),
     ErrorCode.DISPATCHER_UNAVAILABLE: (503, True, AgentAction.RETRY_LATER),
+    ErrorCode.STORAGE_LIMIT: (507, False, AgentAction.FIX_REQUEST),
     ErrorCode.REQUEST_TOO_LARGE: (413, False, AgentAction.SPLIT_REQUEST),
     ErrorCode.CONCURRENCY_LIMIT: (429, True, AgentAction.RETRY_LATER),
     ErrorCode.DEADLINE_EXCEEDED: (504, True, AgentAction.RETRY_LATER),
     ErrorCode.CANCELLED: (499, False, AgentAction.NONE),
     ErrorCode.SHUTTING_DOWN: (503, True, AgentAction.RETRY_LATER),
-    ErrorCode.INTERNAL: (500, False, AgentAction.RETRY_LATER),
+    # Retryable, to agree with its action: an unhandled failure is often a race
+    # (a restart, a store handoff) that one later attempt no longer meets.
+    ErrorCode.INTERNAL: (500, True, AgentAction.RETRY_LATER),
 }
 
 _ALLOWED_DETAIL_TYPES: Final[tuple[type, ...]] = (str, int, float, bool)

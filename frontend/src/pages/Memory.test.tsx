@@ -49,7 +49,7 @@ describe("Memory page", () => {
             })
           );
         }
-        if (url.includes("/api/v1/memory/blocks?agent_id=lc%3Acode")) {
+        if (url.includes("/api/v1/memory/blocks?agent_id=lemoncrow%3Acode")) {
           return Promise.resolve(
             jsonResponse([
               {
@@ -72,7 +72,7 @@ describe("Memory page", () => {
         if (url.includes("/api/v1/memory/blocks?agent_id=lc")) {
           return Promise.resolve(jsonResponse([]));
         }
-        if (url.includes("/api/v1/memory/passages?agent_id=lc%3Acode")) {
+        if (url.includes("/api/v1/memory/passages?agent_id=lemoncrow%3Acode")) {
           return Promise.resolve(jsonResponse([]));
         }
         if (url.includes("/api/v1/memory/passages?agent_id=lc")) {
@@ -97,7 +97,7 @@ describe("Memory page", () => {
     render(<Memory />);
 
     // Default tab is "Cross-vendor" — switch to the Lessons (knowledge blocks) tab
-    const knowledgeTab = await screen.findByRole("button", {
+    const knowledgeTab = await screen.findByRole("radio", {
       name: /Lessons/i,
     });
     await userEvent.click(knowledgeTab);

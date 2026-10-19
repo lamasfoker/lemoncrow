@@ -1,11 +1,25 @@
-import { useState } from "react";
+import { Select, SelectItem } from "../components/ui/select";
+import { Button as UiButton } from "../components/ui/button";
+import {
+  Sheet,
+  SheetBody,
+  SheetClose,
+  SheetContent,
+  SheetHeader,
+  SheetTitle,
+} from "../components/ui/sheet";
+import { Suspense, lazy, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { X } from "lucide-react";
 import { PageFrame } from "../components/WorkbenchUI";
+import { useProductCapabilities } from "../lib/RuntimeCapabilities";
 import Analytics from "./Analytics";
-import Savings from "./Savings";
-import Optimizations from "./Optimizations";
-import Reports from "./Reports";
+import ReviewAnalytics from "../review/analytics/ReviewAnalytics";
+
+// Inspector views render only inside the opened sheet; load each on demand.
+const Savings = lazy(() => import("./Savings"));
+const Optimizations = lazy(() => import("./Optimizations"));
+const Reports = lazy(() => import("./Reports"));
 
 type InspectorView = "savings" | "advisor" | "benchmarks";
 
@@ -17,9 +31,12 @@ const INSPECTOR_LABELS: Record<InspectorView, string> = {
 
 export default function Usage() {
   const [searchParams, setSearchParams] = useSearchParams();
+  // The advisor and benchmarks read local-runtime endpoints; a server without
+  // runtime diagnostics (hosted) does not answer them, so do not offer them.
+  const hasRuntimeInspectors = useProductCapabilities().features["runtime.diagnostics"];
   const requestedView = searchParams.get("inspect");
   const initialView: InspectorView =
-    requestedView === "advisor" || requestedView === "benchmarks"
+    hasRuntimeInspectors && (requestedView === "advisor" || requestedView === "benchmarks")
       ? requestedView
       : "savings";
   const [inspectorOpen, setInspectorOpen] = useState(
@@ -55,59 +72,63 @@ export default function Usage() {
     <>
       <PageFrame className="space-y-4">
         <Analytics onInspectSavings={() => openInspector("savings")} />
+        <ReviewAnalytics />
       </PageFrame>
 
-      {inspectorOpen && (
-        <>
-          <button
-            type="button"
-            aria-label="Dismiss usage inspector"
-            className="fixed inset-0 z-40 bg-black/35"
-            onClick={closeInspector}
-          />
-          <aside
-            aria-label="Usage inspector"
-            className="fixed bottom-0 right-0 top-12 z-50 flex w-[min(900px,88vw)] flex-col border-l border-neutral-800 bg-neutral-950 shadow-2xl"
-          >
-            <div className="flex items-center gap-3 border-b border-neutral-800 px-4 py-3">
-              <div className="min-w-0 flex-1">
-                <div className="text-[10px] font-mono uppercase tracking-widest text-neutral-500">
-                  Usage inspector
-                </div>
-                <div className="mt-0.5 text-sm font-semibold text-neutral-100">
-                  {INSPECTOR_LABELS[inspectorView]}
-                </div>
+      <Sheet
+        open={inspectorOpen}
+        onOpenChange={(open) => {
+          if (!open) closeInspector();
+        }}
+      >
+        <SheetContent
+          side="right"
+          className="w-[min(900px,88vw)]"
+          aria-describedby={undefined}
+        >
+          <SheetHeader className="items-center">
+            <div className="min-w-0 flex-1">
+              <SheetTitle className="text-caption font-mono font-normal uppercase tracking-widest text-muted-foreground">
+                Usage inspector
+              </SheetTitle>
+              <div className="mt-0.5 text-sm font-semibold text-foreground">
+                {INSPECTOR_LABELS[inspectorView]}
               </div>
-              <select
-                aria-label="Usage inspector view"
-                value={inspectorView}
-                onChange={(event) =>
-                  selectInspectorView(event.target.value as InspectorView)
-                }
-                className="h-8 border border-neutral-800 bg-neutral-900 px-2 text-xs text-neutral-200 outline-none focus:border-neutral-600"
-              >
-                <option value="savings">Savings evidence</option>
-                <option value="advisor">Optimization advisor</option>
-                <option value="benchmarks">Benchmarks</option>
-              </select>
-              <button
+            </div>
+            <Select
+              aria-label="Usage inspector view"
+              value={inspectorView}
+              onValueChange={(value) =>
+                selectInspectorView(value as InspectorView)
+              }
+              uiSize="xs"
+              className="min-w-44"
+            >
+              <SelectItem value="savings">Savings evidence</SelectItem>
+              {hasRuntimeInspectors && <SelectItem value="advisor">Optimization advisor</SelectItem>}
+              {hasRuntimeInspectors && <SelectItem value="benchmarks">Benchmarks</SelectItem>}
+            </Select>
+            <SheetClose asChild>
+              <UiButton
                 type="button"
-                onClick={closeInspector}
-                className="inline-flex h-8 w-8 items-center justify-center rounded-sm text-neutral-400 hover:bg-neutral-900 hover:text-neutral-100"
+                size="icon"
+                variant="ghost"
                 aria-label="Close usage inspector"
               >
                 <X size={16} />
-              </button>
-            </div>
+              </UiButton>
+            </SheetClose>
+          </SheetHeader>
 
-            <div className="flex-1 overflow-y-auto p-4">
+          <SheetBody>
+            <Suspense fallback={null}>
               {inspectorView === "savings" && <Savings />}
-              {inspectorView === "advisor" && <Optimizations />}
-              {inspectorView === "benchmarks" && <Reports />}
-            </div>
-          </aside>
-        </>
-      )}
+              {hasRuntimeInspectors && inspectorView === "advisor" && <Optimizations />}
+              {hasRuntimeInspectors && inspectorView === "benchmarks" && <Reports />}
+            </Suspense>
+          </SheetBody>
+        </SheetContent>
+      </Sheet>
     </>
   );
 }

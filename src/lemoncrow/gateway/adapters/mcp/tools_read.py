@@ -126,6 +126,7 @@ def recover_read_stray_query(args: dict[str, Any], known_params: frozenset[str])
         "max_lines": "lines",
         "filePath": "path",
         "file_path": "path",
+        "paths": "files",
     },
     recover_args=recover_read_stray_query,
 )
@@ -147,7 +148,7 @@ def tool_smart_read(
     ] = None,
     project_id: Annotated[
         str | None,
-        Field(description="Optional registered project id returned by multi-project search."),
+        Field(description="Registered project id from multi-project search."),
     ] = None,
     projection_kind: str | None = None,
     filePath: str = "",

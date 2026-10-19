@@ -82,10 +82,38 @@ IMPACT_KIND_VALUES: tuple[str, ...] = (
 EvidenceStatus = Literal["PASS", "FAIL", "NOT_RUN", "UNKNOWN"]
 EVIDENCE_STATUS_VALUES: tuple[str, ...] = ("PASS", "FAIL", "NOT_RUN", "UNKNOWN")
 
+ReviewJournalKind = Literal[
+    "intent",
+    "plan",
+    "decision",
+    "fact",
+    "question",
+    "blocker",
+    "edit",
+    "command",
+    "validation",
+    "message",
+    "tool",
+]
+REVIEW_JOURNAL_KIND_VALUES: tuple[str, ...] = (
+    "intent",
+    "plan",
+    "decision",
+    "fact",
+    "question",
+    "blocker",
+    "edit",
+    "command",
+    "validation",
+    "message",
+    "tool",
+)
+
 ProvenanceStatus = Literal["matched", "ambiguous", "unknown"]
 PROVENANCE_STATUS_VALUES: tuple[str, ...] = ("matched", "ambiguous", "unknown")
 
 ProvenanceCertainty = Literal["exact", "probable", "possible", "none"]
+AttributionScope = Literal["file"]
 """How much the correlator actually knows, as a word every surface must print.
 
 ``exact``     an anchor, not a guess: an explicit ``--session-id``, or a run
@@ -194,6 +222,18 @@ class ChangedFile:
 
     Appended after ``hunks`` on purpose: the ``--json`` payload pins keys in
     declaration order, so an appended field is additive (SS5.4)."""
+    diff_omitted_reason: str = ""
+    """Explicit per-file explanation when a size limit prevents showing a diff."""
+    old_mode: int = 0
+    """Git file mode on the old side: ``0o100644``, ``0o100755``, ``0o120000``
+    (symlink) or ``0o160000`` (gitlink).
+
+    ``0`` means *not recorded*: the side does not exist, the capture predates
+    this field, or the provider that produced the packet does not report modes.
+    It never means "not executable". Appended after ``diff_omitted_reason`` for
+    the same additive-key reason as ``submodule_pointer``."""
+    new_mode: int = 0
+    """Git file mode on the new side; ``0`` means not recorded (see ``old_mode``)."""
 
 
 @dataclass(frozen=True)
@@ -287,6 +327,41 @@ class EvidenceRecord:
 
 
 @dataclass(frozen=True)
+class ReviewJournalEntry:
+    """One bounded observable authoring fact frozen with a Review revision."""
+
+    id: str
+    kind: ReviewJournalKind
+    at: str
+    summary: str
+    detail: str = ""
+    path: str = ""
+    status: str = ""
+    source: str = "run_ledger"
+    host: str = ""
+    session_id: str = ""
+
+
+@dataclass(frozen=True)
+class ProvenanceAttribution:
+    """Exact author evidence for one changed source scope.
+
+    Revision-level provenance remains the compatibility primary-author view.
+    These rows preserve contributors instead of collapsing mixed authorship to
+    one session. Only evidence with ``certainty='exact'`` is eligible for
+    feedback routing.
+    """
+
+    scope: AttributionScope
+    scope_key: str
+    host: str
+    session_id: str
+    model: str = ""
+    certainty: ProvenanceCertainty = "exact"
+    method: str = "recorded_edit"
+
+
+@dataclass(frozen=True)
 class ProvenanceRecord:
     """Who generated the change, and what they looked at. Populated by PR-4.
 
@@ -355,6 +430,12 @@ class ReviewPacket:
     degraded: tuple[str, ...] = ()
     """Sorted names of the signals that fell back."""
     stats: dict[str, int] = field(default_factory=dict)
+    journal: tuple[ReviewJournalEntry, ...] = ()
+    """Observable author-session context; never hidden chain-of-thought."""
+    attributions: tuple[ProvenanceAttribution, ...] = ()
+    """Exact contributor evidence scoped to source paths; never heuristic routing hints."""
+    scope_paths: tuple[str, ...] = ()
+    """A scoped Review's repo-relative paths (one agent session's files); empty is the whole range."""
 
     def to_dict(self) -> dict[str, Any]:
         """Return the exact ``--json`` payload: asdict semantics, declaration order."""
@@ -368,8 +449,8 @@ def review_packet_from_dict(raw: Mapping[str, Any]) -> ReviewPacket:
     The packet is a public contract, but until hosted Review every producer and
     consumer lived in one Python process. Hosted capture needs the inverse of
     :meth:`ReviewPacket.to_dict`; keeping it here makes local and server-side
-    Review share one decoder instead of teaching the enterprise package a copy
-    of LemonCrow's packet schema.
+    Review share one decoder instead of duplicating LemonCrow's packet schema
+    in a second package.
 
     Unknown additive fields are ignored. Known fields are type-checked and
     enum-like values are validated so a malformed client packet cannot create
@@ -399,6 +480,12 @@ def review_packet_from_dict(raw: Mapping[str, Any]) -> ReviewPacket:
         if not isinstance(value, int) or isinstance(value, bool):
             raise ValueError(f"{field_name} must be an integer")
         return value
+
+    def file_mode(value: Any, field_name: str) -> int:
+        mode = integer(value, field_name)
+        if mode < 0 or mode > 0o177777:
+            raise ValueError(f"{field_name} must be a Git file mode")
+        return mode
 
     def number(value: Any, field_name: str, default: float = 0.0) -> float:
         if value is None:
@@ -472,6 +559,9 @@ def review_packet_from_dict(raw: Mapping[str, Any]) -> ReviewPacket:
                 category=category,
                 hunks=tuple(hunk(row, i) for i, row in enumerate(seq(item.get("hunks", ()), "file.hunks"))),
                 submodule_pointer=submodule,
+                diff_omitted_reason=text(item.get("diff_omitted_reason"), "file.diff_omitted_reason"),
+                old_mode=file_mode(item.get("old_mode"), "file.old_mode"),
+                new_mode=file_mode(item.get("new_mode"), "file.new_mode"),
             )
         )
 
@@ -603,6 +693,49 @@ def review_packet_from_dict(raw: Mapping[str, Any]) -> ReviewPacket:
 
     stats_raw = obj(raw.get("stats", {}), "stats")
     stats = {text(key, "stats key"): integer(value, f"stats.{key}") for key, value in stats_raw.items()}
+
+    journal: list[ReviewJournalEntry] = []
+    for index, value in enumerate(seq(raw.get("journal", ()), "journal")):
+        item = obj(value, f"journal[{index}]")
+        journal.append(
+            ReviewJournalEntry(
+                id=text(item.get("id"), "journal.id"),
+                kind=cast(
+                    ReviewJournalKind,
+                    one_of(item.get("kind"), "journal.kind", REVIEW_JOURNAL_KIND_VALUES, "message"),
+                ),
+                at=text(item.get("at"), "journal.at"),
+                summary=text(item.get("summary"), "journal.summary"),
+                detail=text(item.get("detail"), "journal.detail"),
+                path=text(item.get("path"), "journal.path"),
+                status=text(item.get("status"), "journal.status"),
+                source=text(item.get("source"), "journal.source", "run_ledger"),
+                host=text(item.get("host"), "journal.host"),
+                session_id=text(item.get("session_id"), "journal.session_id"),
+            )
+        )
+
+    attributions: list[ProvenanceAttribution] = []
+    for index, value in enumerate(seq(raw.get("attributions", ()), "attributions")):
+        item = obj(value, f"attributions[{index}]")
+        scope = text(item.get("scope"), "attribution.scope")
+        if scope != "file":
+            raise ValueError("attribution.scope must be file")
+        certainty = cast(
+            ProvenanceCertainty,
+            one_of(item.get("certainty"), "attribution.certainty", PROVENANCE_CERTAINTY_VALUES, "exact"),
+        )
+        attributions.append(
+            ProvenanceAttribution(
+                scope="file",
+                scope_key=text(item.get("scope_key"), "attribution.scope_key"),
+                host=text(item.get("host"), "attribution.host"),
+                session_id=text(item.get("session_id"), "attribution.session_id"),
+                model=text(item.get("model"), "attribution.model"),
+                certainty=certainty,
+                method=text(item.get("method"), "attribution.method", "recorded_edit"),
+            )
+        )
     schema_version = integer(raw.get("schema_version"), "schema_version")
     if schema_version != SCHEMA_VERSION:
         raise ValueError(f"unsupported review packet schema {schema_version}; expected {SCHEMA_VERSION}")
@@ -628,7 +761,21 @@ def review_packet_from_dict(raw: Mapping[str, Any]) -> ReviewPacket:
         index_status=cast(IndexStatus, one_of(raw.get("index_status"), "index_status", INDEX_STATUS_VALUES, "absent")),
         degraded=tuple(text(item, "degraded") for item in seq(raw.get("degraded", ()), "degraded")),
         stats=stats,
+        journal=tuple(journal),
+        attributions=tuple(attributions),
+        scope_paths=tuple(text(item, "scope_paths") for item in seq(raw.get("scope_paths", ()), "scope_paths")),
     )
+
+
+def oversized_diff_reason(limit: int) -> str:
+    amount = float(limit)
+    unit = "bytes"
+    for candidate in ("KiB", "MiB", "GiB", "TiB"):
+        if amount < 1024:
+            break
+        amount /= 1024
+        unit = candidate
+    return f"Diff omitted: file is larger than {amount:g} {unit} ({limit:,} bytes)."
 
 
 def empty_stats() -> dict[str, int]:
@@ -654,6 +801,7 @@ __all__ = [
     "PROVENANCE_CERTAINTY_VALUES",
     "PROVENANCE_STATUS_VALUES",
     "RANGE_MODE_VALUES",
+    "REVIEW_JOURNAL_KIND_VALUES",
     "SCHEMA_VERSION",
     "SYMBOL_CHANGE_VALUES",
     "SYMBOL_SOURCE_VALUES",
@@ -671,6 +819,8 @@ __all__ = [
     "ProvenanceRecord",
     "ProvenanceStatus",
     "RangeMode",
+    "ReviewJournalEntry",
+    "ReviewJournalKind",
     "ReviewOrderEntry",
     "ReviewPacket",
     "SymbolChange",

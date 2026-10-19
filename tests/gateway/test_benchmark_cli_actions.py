@@ -12,6 +12,7 @@ from click.testing import CliRunner
 
 from lemoncrow.gateway.cli import cli
 from lemoncrow.gateway.cli.commands import benchmark as benchmark_cmds
+from lemoncrow.gateway.cli.developer_tools import developer_tools
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -21,17 +22,8 @@ def test_benchmark_legacy_top_level_commands_are_removed(tmp_path: Path) -> None
     root = tmp_path / ".lemoncrow"
 
     assert runner.invoke(cli, ["--root", str(root), "benchmark-core", "--json"]).exit_code != 0
-    assert runner.invoke(cli, ["--root", str(root), "benchmark", "--prompt", "Fix PDP", "--json"]).exit_code != 0
-
-
-def test_help_command_shows_root_command_help(tmp_path: Path) -> None:
-    runner = CliRunner()
-    root = tmp_path / ".lemoncrow"
-
-    root_help = runner.invoke(cli, ["--root", str(root), "help"])
-    assert root_help.exit_code == 0, root_help.output
-    assert "Commands:" in root_help.output
-    assert "benchmark" in root_help.output
+    assert runner.invoke(cli, ["--root", str(root), "benchmark", "--help"]).exit_code == 2
+    assert runner.invoke(cli, ["--root", str(root), "runtime", "benchmark", "--help"]).exit_code == 0
 
 
 def test_benchmark_gate_command_reads_gate_and_optionally_fails(tmp_path: Path) -> None:
@@ -44,13 +36,13 @@ def test_benchmark_gate_command_reads_gate_and_optionally_fails(tmp_path: Path) 
         encoding="utf-8",
     )
 
-    ok = runner.invoke(cli, ["--root", str(root), "benchmark", "gate", "--run-dir", str(run_dir), "--json"])
+    ok = runner.invoke(cli, ["--root", str(root), "runtime", "benchmark", "gate", "--run-dir", str(run_dir), "--json"])
     assert ok.exit_code == 0, ok.output
     assert json.loads(ok.output)["suite"] == "terminalbench"
 
     failed = runner.invoke(
         cli,
-        ["--root", str(root), "benchmark", "gate", "--run-dir", str(run_dir), "--require-pass"],
+        ["--root", str(root), "runtime", "benchmark", "gate", "--run-dir", str(run_dir), "--require-pass"],
     )
     assert failed.exit_code != 0
     assert "candidate cost was higher" in failed.output
@@ -76,6 +68,7 @@ def test_benchmark_harbor_resume_uses_benchmarks_uv_project(monkeypatch, tmp_pat
         [
             "--root",
             str(root),
+            "runtime",
             "benchmark",
             "harbor",
             "--agent",
@@ -121,6 +114,7 @@ def test_benchmark_harbor_fresh_run_maps_attempts_to_n_attempts(monkeypatch, tmp
         [
             "--root",
             str(root),
+            "runtime",
             "benchmark",
             "harbor",
             "--agent",
@@ -148,6 +142,80 @@ def test_benchmark_harbor_fresh_run_maps_attempts_to_n_attempts(monkeypatch, tmp
     assert "-n" not in cmd
 
 
+def test_benchmark_harbor_named_task_set_expands_frozen_terminal_subset(monkeypatch, tmp_path: Path) -> None:
+    runner = CliRunner()
+    root = tmp_path / ".lemoncrow"
+    out_dir = tmp_path / "harbor-out"
+    calls: list[tuple[list[str], dict[str, str] | None]] = []
+
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+
+    def _fake_call(cmd, env=None):
+        calls.append((cmd, env))
+        return 0
+
+    monkeypatch.setattr(subprocess, "call", _fake_call)
+
+    result = runner.invoke(
+        cli,
+        [
+            "--root",
+            str(root),
+            "runtime",
+            "benchmark",
+            "harbor",
+            "--agent",
+            "lemoncrow",
+            "--task-set",
+            "mini-terminal-2.1",
+            "--model",
+            "claude-opus-5",
+            "--attempts",
+            "1",
+            "--output",
+            str(out_dir),
+            "-y",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "task-set         : mini-terminal-2.1 (25 frozen tasks)" in result.output
+    assert len(calls) == 1
+    cmd, _env = calls[0]
+    assert cmd[cmd.index("--dataset") + 1] == "terminal-bench/terminal-bench-2-1"
+    includes = [cmd[i + 1] for i, value in enumerate(cmd[:-1]) if value == "-i"]
+    assert len(includes) == 25
+    assert includes[0] == "terminal-bench/log-summary-date-ranges"
+    assert includes[-1] == "terminal-bench/cancel-async-tasks"
+    assert "terminal-bench/fix-git" in includes
+    assert cmd[cmd.index("--model") + 1] == "claude-opus-5"
+    assert cmd[cmd.index("-k") + 1] == "1"
+
+
+def test_benchmark_harbor_task_set_rejects_partial_overrides(tmp_path: Path) -> None:
+    runner = CliRunner()
+    root = tmp_path / ".lemoncrow"
+
+    result = runner.invoke(
+        cli,
+        [
+            "--root",
+            str(root),
+            "runtime",
+            "benchmark",
+            "harbor",
+            "--task-set",
+            "mini-terminal-2.1",
+            "--limit",
+            "3",
+            "-y",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "frozen task set runs exactly as declared" in result.output
+
+
 def test_benchmark_harbor_context_arm_is_recorded_in_agent_kwargs(monkeypatch, tmp_path: Path) -> None:
     runner = CliRunner()
     root = tmp_path / ".lemoncrow"
@@ -170,6 +238,7 @@ def test_benchmark_harbor_context_arm_is_recorded_in_agent_kwargs(monkeypatch, t
         [
             "--root",
             str(root),
+            "runtime",
             "benchmark",
             "harbor",
             "--agent",
@@ -213,6 +282,7 @@ def test_benchmark_harbor_baseline_alias_maps_to_raw_context_arm(monkeypatch, tm
         [
             "--root",
             str(root),
+            "runtime",
             "benchmark",
             "harbor",
             "--agent",
@@ -245,6 +315,7 @@ def test_benchmark_harbor_rejects_context_arm_for_non_claude_agent(monkeypatch, 
         [
             "--root",
             str(root),
+            "runtime",
             "benchmark",
             "harbor",
             "--agent",
@@ -288,6 +359,7 @@ def test_benchmark_codebench_wraps_runner(monkeypatch, tmp_path: Path) -> None:
         [
             "--root",
             str(root),
+            "runtime",
             "benchmark",
             "codebench",
             "--task-source-dir",
@@ -363,6 +435,7 @@ def test_benchmark_codebench_accepts_eval_arm_and_api_options(monkeypatch, tmp_p
         [
             "--root",
             str(root),
+            "runtime",
             "benchmark",
             "codebench",
             "--arm",
@@ -416,6 +489,7 @@ def test_benchmark_codebench_judge_defaults_to_runner_transport(monkeypatch, tmp
         [
             "--root",
             str(root),
+            "runtime",
             "benchmark",
             "codebench",
             "--model",
@@ -465,6 +539,7 @@ def test_benchmark_codebench_openrouter_claude_preset_passes_agent_env(monkeypat
         [
             "--root",
             str(root),
+            "runtime",
             "benchmark",
             "codebench",
             "--model",
@@ -519,6 +594,7 @@ def test_benchmark_codebench_generic_claude_provider_flags_pass_through(monkeypa
         [
             "--root",
             str(root),
+            "runtime",
             "benchmark",
             "codebench",
             "--model",
@@ -573,6 +649,7 @@ def test_benchmark_codebench_forwards_cli_driver_and_jobs(monkeypatch, tmp_path:
         [
             "--root",
             str(root),
+            "runtime",
             "benchmark",
             "codebench",
             "--cli-driver",
@@ -629,6 +706,7 @@ def test_benchmark_codebench_named_aws_claude_preset_passes_env(monkeypatch, tmp
         [
             "--root",
             str(root),
+            "runtime",
             "benchmark",
             "codebench",
             "--cli-driver",
@@ -665,6 +743,7 @@ def test_benchmark_codebench_rejects_claude_flags_for_non_claude_driver(monkeypa
         [
             "--root",
             str(root),
+            "runtime",
             "benchmark",
             "codebench",
             "--cli-driver",
@@ -693,7 +772,7 @@ def test_benchmark_mcp_defaults_jobs_to_auto(monkeypatch, tmp_path: Path) -> Non
         lambda cmd, cwd, label, env=None: calls.append((cmd, label, env)),
     )
 
-    result = runner.invoke(cli, ["--root", str(root), "eval", "mcp"])
+    result = runner.invoke(developer_tools, ["--root", str(root), "eval", "mcp"])
 
     assert result.exit_code == 0, result.output
     cmd, _label, _env = calls[0]
@@ -714,7 +793,7 @@ def test_benchmark_mcp_passes_parallel_jobs(monkeypatch, tmp_path: Path) -> None
         lambda cmd, cwd, label, env=None: calls.append((cmd, label, env)),
     )
 
-    result = runner.invoke(cli, ["--root", str(root), "eval", "mcp", "--jobs", "3"])
+    result = runner.invoke(developer_tools, ["--root", str(root), "eval", "mcp", "--jobs", "3"])
 
     assert result.exit_code == 0, result.output
     assert len(calls) == 1
@@ -751,6 +830,7 @@ def test_benchmark_swe_wraps_multiswe_runner(monkeypatch, tmp_path: Path) -> Non
         [
             "--root",
             str(root),
+            "runtime",
             "benchmark",
             "swe",
             "--language",
@@ -792,7 +872,7 @@ def test_benchmark_swe_defaults_to_grading(monkeypatch, tmp_path: Path) -> None:
         lambda cmd, cwd, label, env=None, check=True: calls.append(cmd) or 0,
     )
 
-    result = runner.invoke(cli, ["--root", str(root), "benchmark", "swe", "--limit", "1"])
+    result = runner.invoke(cli, ["--root", str(root), "runtime", "benchmark", "swe", "--limit", "1"])
 
     assert result.exit_code == 0, result.output
     cmd = calls[0]
@@ -816,13 +896,13 @@ def test_benchmark_swe_forwards_suite(monkeypatch, tmp_path: Path) -> None:
 
     result = runner.invoke(
         cli,
-        ["--root", str(root), "benchmark", "swe", "--suite", "swe-bench-verified", "--limit", "2"],
+        ["--root", str(root), "runtime", "benchmark", "swe", "--suite", "swe-bench-verified", "--limit", "2"],
     )
     assert result.exit_code == 0, result.output
     assert calls[0][calls[0].index("--suite") + 1] == "swe-bench-verified"
 
     calls.clear()
-    result = runner.invoke(cli, ["--root", str(root), "benchmark", "swe", "--limit", "1"])
+    result = runner.invoke(cli, ["--root", str(root), "runtime", "benchmark", "swe", "--limit", "1"])
     assert result.exit_code == 0, result.output
     assert calls[0][calls[0].index("--suite") + 1] == "multi-swe-bench"
 
@@ -844,7 +924,7 @@ def test_benchmark_swe_accepts_swe_lite_suite(monkeypatch, tmp_path: Path) -> No
         lambda cmd, cwd, label, env=None, check=True: calls.append(cmd) or 0,
     )
 
-    result = runner.invoke(cli, ["--root", str(root), "benchmark", "swe", "--suite", "swe-lite"])
+    result = runner.invoke(cli, ["--root", str(root), "runtime", "benchmark", "swe", "--suite", "swe-lite"])
 
     assert result.exit_code == 0, result.output
     cmd = calls[0]
@@ -852,7 +932,7 @@ def test_benchmark_swe_accepts_swe_lite_suite(monkeypatch, tmp_path: Path) -> No
     assert "--dataset" not in cmd
     assert "--instances" not in cmd
 
-    result = runner.invoke(cli, ["--root", str(root), "benchmark", "swe", "--suite", "bogus-suite"])
+    result = runner.invoke(cli, ["--root", str(root), "runtime", "benchmark", "swe", "--suite", "bogus-suite"])
     assert result.exit_code != 0
 
 
@@ -873,7 +953,7 @@ def test_benchmark_swe_accepts_swe_pro_suite(monkeypatch, tmp_path: Path) -> Non
         lambda cmd, cwd, label, env=None, check=True: calls.append(cmd) or 0,
     )
 
-    result = runner.invoke(cli, ["--root", str(root), "benchmark", "swe", "--suite", "swe-pro"])
+    result = runner.invoke(cli, ["--root", str(root), "runtime", "benchmark", "swe", "--suite", "swe-pro"])
 
     assert result.exit_code == 0, result.output
     cmd = calls[0]
@@ -921,6 +1001,7 @@ def test_benchmark_codebench_forwards_external_comparator(monkeypatch, tmp_path:
         [
             "--root",
             str(root),
+            "runtime",
             "benchmark",
             "codebench",
             "--competitor",
@@ -961,6 +1042,7 @@ def test_benchmark_protocol_validates_frozen_runtime_matrix_without_running_agen
         [
             "--root",
             str(root),
+            "runtime",
             "benchmark",
             "protocol",
             "--file",
@@ -1029,6 +1111,7 @@ def test_benchmark_protocol_output_root_and_verify_all_write_publication_artifac
         [
             "--root",
             str(root),
+            "runtime",
             "benchmark",
             "protocol",
             "--file",
@@ -1076,6 +1159,7 @@ def test_benchmark_protocol_verify_all_incomplete_bundle_writes_failed_readiness
         [
             "--root",
             str(root),
+            "runtime",
             "benchmark",
             "protocol",
             "--file",
@@ -1115,6 +1199,7 @@ def test_benchmark_protocol_host_preflight_matches_frozen_versions(monkeypatch, 
         [
             "--root",
             str(root),
+            "runtime",
             "benchmark",
             "protocol",
             "--file",
@@ -1146,6 +1231,7 @@ def test_benchmark_protocol_json_verify_run_exits_nonzero_on_failed_publication_
         [
             "--root",
             str(root),
+            "runtime",
             "benchmark",
             "protocol",
             "--file",

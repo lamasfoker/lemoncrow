@@ -1,3 +1,14 @@
+import { Button as UiButton } from "../components/ui/button";
+import { Textarea as UiTextarea } from "../components/ui/textarea";
+import {
+  Dialog,
+  DialogBody,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "../components/ui/dialog";
 import { useEffect, useMemo, useState } from "react";
 import { Hexagon } from "lucide-react";
 import {
@@ -7,7 +18,7 @@ import {
   type MemoryFact,
   type MemoryPassage,
   type MemoryRecallPassage,
-  type Trace,
+  type TraceSummary,
 } from "../api";
 import MemoryBlockCard from "../components/MemoryBlockCard";
 import ArchivalSearchBox from "../components/ArchivalSearchBox";
@@ -66,7 +77,7 @@ export default function Memory() {
   const [tab, setTab] = useState<"cross-vendor" | "knowledge">("cross-vendor");
   const [facts, setFacts] = useState<MemoryFact[] | null>(null);
   const [factsErr, setFactsErr] = useState<string | null>(null);
-  const [traces, setTraces] = useState<Trace[]>([]);
+  const [traces, setTraces] = useState<TraceSummary[]>([]);
   const [blocks, setBlocks] = useState<MemoryBlock[]>([]);
   const [recentPassages, setRecentPassages] = useState<MemoryPassage[]>([]);
   const [recallResults, setRecallResults] = useState<MemoryRecallPassage[]>([]);
@@ -287,10 +298,10 @@ export default function Memory() {
   };
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-4">
       <ToggleGroup
+        aria-label="Memory view"
         variant="underline"
-        tone="purple"
         size="sm"
         options={[
           { value: "cross-vendor", label: "Cross-vendor" },
@@ -304,8 +315,8 @@ export default function Memory() {
 
       {/* Cross-vendor tab */}
       {tab === "cross-vendor" && (
-        <div className="space-y-6">
-          {factsErr && <Alert tone="danger" description={factsErr} />}
+        <div className="space-y-4">
+          {factsErr && <Alert tone="destructive" description={factsErr} />}
           {facts === null && !factsErr && (
             <EmptyState title="Loading cross-vendor memory…" className="p-6" />
           )}
@@ -320,7 +331,7 @@ export default function Memory() {
             <Card key={vendor}>
               <div
                 className={cx(
-                  "border-b border-neutral-800 px-4 py-2 text-xs font-bold uppercase tracking-widest",
+                  "border-b border-border px-4 py-2 text-xs font-bold uppercase tracking-widest",
                   VENDOR_COLORS[vendor] ?? "text-neutral-400"
                 )}
               >
@@ -349,19 +360,19 @@ export default function Memory() {
 
       {/* Knowledge Blocks tab — existing content */}
       {tab === "knowledge" && (
-        <div className="space-y-6">
+        <div className="space-y-4">
       <section className="grid grid-cols-2 gap-3">
         <MetricCard
           label="Visible agents"
           value={String(visibleAgentIds.length)}
           detail="Aggregated across trace history plus shared archival agents."
-          tone="emerald"
+          tone="success"
         />
         <MetricCard
           label="Hosts"
           value={String(visibleHosts.length)}
           detail="Host tags derived from the merged agent set."
-          tone="amber"
+          tone="warning"
         />
       </section>
 
@@ -378,29 +389,29 @@ export default function Memory() {
           label="Recall hits"
           value={String(recallResults.length)}
           detail="Merged archival search result count across visible agents."
-          tone="cyan"
+          tone="info"
         />
         <MetricCard
           label="Archived passages"
           value={String(recentPassages.length)}
           detail="Recent long-term passages currently visible in the merged view."
-          tone="violet"
+          tone="neutral"
         />
       </section>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
-        <section className="border border-neutral-800 bg-neutral-950/70 p-5">
-          <div className="pb-3 border-b border-neutral-800">
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <section className="rounded-lg border border-border/70 bg-background/60 p-4">
+          <div className="pb-3 border-b border-border">
             <SectionHeader
               eyebrow="Static memory"
               title="Core blocks"
               description="These pinned and recent blocks are merged across the visible agents instead of hidden behind a single-agent selector."
             />
-            <div className="mt-3 flex flex-wrap gap-2 text-[10px] font-mono uppercase tracking-widest">
+            <div className="mt-3 flex flex-wrap gap-2 text-caption font-mono uppercase tracking-widest">
               {visibleAgentIds.map((agentId) => (
                 <span
                   key={agentId}
-                  className="px-2 py-1 border border-neutral-800 text-neutral-400"
+                  className="px-2 py-1 border border-border text-neutral-400"
                 >
                   {hostTag(agentId)} · {agentId}
                 </span>
@@ -417,7 +428,7 @@ export default function Memory() {
           {!loadingBlocks && (
             <div className="pt-3 space-y-4">
               <div>
-                <h3 className="text-[11px] uppercase tracking-widest text-neutral-400">
+                <h3 className="text-label uppercase tracking-widest text-neutral-400">
                   Pinned
                 </h3>
                 {pinnedBlocks.length === 0 ? (
@@ -437,7 +448,7 @@ export default function Memory() {
               </div>
 
               <div>
-                <h3 className="text-[11px] uppercase tracking-widest text-neutral-400">
+                <h3 className="text-label uppercase tracking-widest text-neutral-400">
                   Recent
                 </h3>
                 {recentBlocks.length === 0 ? (
@@ -460,8 +471,8 @@ export default function Memory() {
           )}
         </section>
 
-        <section className="border border-neutral-800 bg-neutral-950/70 p-5">
-          <div className="pb-3 border-b border-neutral-800">
+        <section className="rounded-lg border border-border/70 bg-background/60 p-4">
+          <div className="pb-3 border-b border-border">
             <SectionHeader
               eyebrow="Long-tail recall"
               title="Archived knowledge"
@@ -475,7 +486,7 @@ export default function Memory() {
 
           <div className="pt-3 space-y-5">
             <div>
-              <h3 className="text-[11px] uppercase tracking-widest text-neutral-400">
+              <h3 className="text-label uppercase tracking-widest text-neutral-400">
                 Recent archived passages
               </h3>
               {loadingPassages ? (
@@ -491,16 +502,16 @@ export default function Memory() {
                   {recentPassages.map((passage) => (
                     <li
                       key={passage.id}
-                      className="py-2 border-b border-neutral-800"
+                      className="py-2 border-b border-border"
                     >
-                      <div className="flex flex-wrap items-center gap-2 text-[10px] font-mono uppercase tracking-widest text-neutral-400">
-                        <span className="px-2 py-0.5 border border-neutral-800 text-cyan-300">
+                      <div className="flex flex-wrap items-center gap-2 text-caption font-mono uppercase tracking-widest text-neutral-400">
+                        <span className="px-2 py-0.5 border border-border text-cyan-300">
                           {hostTag(passage.agent_id)}
                         </span>
-                        <span className="px-2 py-0.5 border border-neutral-800 text-neutral-400">
+                        <span className="px-2 py-0.5 border border-border text-neutral-400">
                           {passage.agent_id}
                         </span>
-                        <span className="px-2 py-0.5 border border-neutral-800 text-neutral-400">
+                        <span className="px-2 py-0.5 border border-border text-neutral-400">
                           {passage.source}
                         </span>
                       </div>
@@ -514,7 +525,7 @@ export default function Memory() {
             </div>
 
             <div>
-              <h3 className="text-[11px] uppercase tracking-widest text-neutral-400">
+              <h3 className="text-label uppercase tracking-widest text-neutral-400">
                 Search results
               </h3>
               {recallResults.length === 0 ? (
@@ -526,21 +537,21 @@ export default function Memory() {
                   {recallResults.map((passage) => (
                     <li
                       key={passage.id}
-                      className="py-2 border-b border-neutral-800"
+                      className="py-2 border-b border-border"
                     >
-                      <div className="flex flex-wrap items-center gap-2 text-[10px] font-mono uppercase tracking-widest text-neutral-400">
+                      <div className="flex flex-wrap items-center gap-2 text-caption font-mono uppercase tracking-widest text-neutral-400">
                         {passage.agent_id && (
                           <>
-                            <span className="px-2 py-0.5 border border-neutral-800 text-cyan-300">
+                            <span className="px-2 py-0.5 border border-border text-cyan-300">
                               {hostTag(passage.agent_id)}
                             </span>
-                            <span className="px-2 py-0.5 border border-neutral-800 text-neutral-400">
+                            <span className="px-2 py-0.5 border border-border text-neutral-400">
                               {passage.agent_id}
                             </span>
                           </>
                         )}
                         {passage.source && (
-                          <span className="px-2 py-0.5 border border-neutral-800 text-neutral-400">
+                          <span className="px-2 py-0.5 border border-border text-neutral-400">
                             {passage.source}
                           </span>
                         )}
@@ -575,74 +586,76 @@ export default function Memory() {
       </div>
 
       {editDraft && (
-        <div
-          className="fixed inset-0 bg-black/60 z-40 flex items-center justify-center px-4"
-          role="dialog"
-          aria-modal="true"
-          aria-label="Memory block diff modal"
+        <Dialog
+          open
+          onOpenChange={(open) => {
+            if (!open) setEditDraft(null);
+          }}
         >
-          <div className="w-full max-w-3xl bg-neutral-950 border border-neutral-700 p-4">
-            <h2 className="text-sm font-bold text-neutral-200 font-mono">
-              Review memory block update
-            </h2>
-            <p className="text-xs text-neutral-400 mt-1">
-              Label: {editDraft.block.label}
-            </p>
-
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
-              <div>
-                <h3 className="text-[11px] uppercase tracking-widest text-neutral-400 mb-1">
-                  Current
-                </h3>
-                <pre className="text-xs text-neutral-300 border border-neutral-800 p-3 whitespace-pre-wrap min-h-40">
-                  {editDraft.block.value}
-                </pre>
+          <DialogContent className="max-w-3xl">
+            <DialogHeader>
+              <DialogTitle>Review memory block update</DialogTitle>
+              <DialogDescription>
+                Label: {editDraft.block.label}
+              </DialogDescription>
+            </DialogHeader>
+            <DialogBody>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <h3 className="text-label uppercase tracking-widest text-neutral-400 mb-1">
+                    Current
+                  </h3>
+                  <pre className="min-h-40 whitespace-pre-wrap rounded-md border border-border/70 bg-surface-code p-3 text-xs text-neutral-300">
+                    {editDraft.block.value}
+                  </pre>
+                </div>
+                <div>
+                  <label
+                    htmlFor="memory-next-value"
+                    className="text-label uppercase tracking-widest text-neutral-400 mb-1 block"
+                  >
+                    New
+                  </label>
+                  <UiTextarea
+                    id="memory-next-value"
+                    aria-label="Edit memory block value"
+                    value={editDraft.nextValue}
+                    onChange={(event) =>
+                      setEditDraft((prev) =>
+                        prev ? { ...prev, nextValue: event.target.value } : prev
+                      )
+                    }
+                    className="min-h-40 font-mono"
+                  />
+                </div>
               </div>
-              <div>
-                <label
-                  htmlFor="memory-next-value"
-                  className="text-[11px] uppercase tracking-widest text-neutral-400 mb-1 block"
-                >
-                  New
-                </label>
-                <textarea
-                  id="memory-next-value"
-                  aria-label="Edit memory block value"
-                  value={editDraft.nextValue}
-                  onChange={(event) =>
-                    setEditDraft((prev) =>
-                      prev ? { ...prev, nextValue: event.target.value } : prev
-                    )
-                  }
-                  className="w-full text-xs text-neutral-200 border border-neutral-800 bg-transparent p-3 min-h-40 focus:outline-none focus:border-amber-500/60"
-                />
-              </div>
-            </div>
 
-            {conflictMessage && (
-              <p className="text-xs text-red-300 mt-3">{conflictMessage}</p>
-            )}
-
-            <div className="mt-4 flex justify-end gap-2">
-              <button
+              {conflictMessage && (
+                <p className="text-xs text-red-300 mt-3">{conflictMessage}</p>
+              )}
+            </DialogBody>
+            <DialogFooter>
+              <UiButton
                 type="button"
                 aria-label="Cancel memory block edit"
                 onClick={() => setEditDraft(null)}
-                className="text-xs px-3 py-2 border border-neutral-700 text-neutral-300"
+                size="sm"
+                variant="outline"
               >
                 Cancel
-              </button>
-              <button
+              </UiButton>
+              <UiButton
                 type="button"
                 aria-label="Save memory block edit"
                 onClick={submitEdit}
-                className="text-xs px-3 py-2 border border-amber-500/50 text-amber-300"
+                size="sm"
+                variant="default"
               >
                 Save
-              </button>
-            </div>
-          </div>
-        </div>
+              </UiButton>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
       )}
         </div>
       )}

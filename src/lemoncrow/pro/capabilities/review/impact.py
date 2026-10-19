@@ -6,11 +6,12 @@ neither is usable raw. ``tool_supervision.edit_impact``'s four detectors find
 consumers that have no call-graph edge at all -- contract literals, removed
 module symbols, newly required parameters, stripped cache decorators -- but they
 are best-effort, Python-shaped, and depend on an ast-grep binary that may not
-exist. ``CodeContextEngine`` holds the persisted call graph that answers fan-out
-and centrality, but its index may be absent on a fresh clone, drifted against
-HEAD, or expensive to touch. This adapter is the one seam that turns both into
-the packet's ``ChangedSymbol[]`` / ``ImpactSite[]``, so no caller ever learns
-which signals happened to be available.
+exist. A capture-time compatibility graph adapter can enrich fan-out and
+centrality, but that mutable index may be absent on a fresh clone, drifted
+against HEAD, or expensive to touch. This module turns both into the packet's
+``ChangedSymbol[]`` / ``ImpactSite[]`` while keeping Snapshot target identity
+source-derived; Reader-time current intelligence uses the separate
+``CodeIntelligenceProvider`` seam.
 
 Two rules keep it honest. Every failure returns a value plus a name in
 ``degraded`` and never raises -- a packet must still build on a machine with no
@@ -23,13 +24,17 @@ Deliberately not consulted: ``semantic_file_memory`` / ``GraphAnalytics`` (one
 global 2000-entry LRU shared across every project, whose ``change_impact``
 returns empty lists for real files) and ``cross_lang_edges`` (query API complete,
 table empty, no writer). Either would return nothing while leaving the packet
-looking complete. Every graph signal here comes from ``CodeContextEngine``.
+looking complete. Capture-time graph signals here come through the explicitly
+named legacy compatibility adapter; they are enrichment, not Review target truth.
 """
 
 from __future__ import annotations
 
 import ast
+import hashlib
 import re
+import threading
+from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
@@ -59,7 +64,7 @@ _MAX_CALLER_QUERIES = 20
 _CALLERS_PER_SYMBOL = 20
 
 # Degradation names. The first two are what `render.py::_INDEX_SIGNALS` looks
-# for when deciding to print the ``run `lc code index``` hint, so the spelling
+# for when deciding to print the ``run `lc runtime index``` hint, so the spelling
 # is load-bearing.
 _SIGNAL_RELATIONS = "symbol_relations"
 _SIGNAL_CENTRALITY = "centrality"
@@ -523,7 +528,34 @@ def _python_definition_analysis(text: str, path: str) -> _DefinitionAnalysis:
     return _DefinitionAnalysis(definitions=kept, dropped=dropped, body_spans=tuple(spans))
 
 
+#: Parsed definitions per (path, content digest). Every capture of a live
+#: worktree re-derives units for every changed file; a 64-entry LRU keyed by the
+#: text thrashed on a 388-file change and skipped files over 64 KB entirely,
+#: so each new Snapshot re-parsed all of them (~5 s of tree-sitter per capture).
+_DEFINITION_CACHE_MAX = 4096
+_definition_cache: OrderedDict[tuple[str, bytes], _DefinitionAnalysis] = OrderedDict()
+_definition_cache_lock = threading.Lock()
+
+
 def _definition_analysis(text: str, path: str) -> _DefinitionAnalysis:
+    # Source identity includes path (language and tag filenames) and exact text;
+    # the digest keeps the cache from retaining the text itself.
+    key = (path, hashlib.blake2b(text.encode("utf-8", "surrogatepass"), digest_size=20).digest())
+    with _definition_cache_lock:
+        hit = _definition_cache.get(key)
+        if hit is not None:
+            _definition_cache.move_to_end(key)
+            return hit
+    analysis = _uncached_definition_analysis(text, path)
+    with _definition_cache_lock:
+        _definition_cache[key] = analysis
+        _definition_cache.move_to_end(key)
+        while len(_definition_cache) > _DEFINITION_CACHE_MAX:
+            _definition_cache.popitem(last=False)
+    return analysis
+
+
+def _uncached_definition_analysis(text: str, path: str) -> _DefinitionAnalysis:
     if not text:
         return _DefinitionAnalysis()
     if Path(path).suffix.lower() in _PYTHON_SUFFIXES:
@@ -576,19 +608,18 @@ def _overlaps(start: int, end: int, hunk: DiffHunk) -> bool:
 
 
 def _open_engine(repo_root: Path) -> Any:
-    """Return a non-autosyncing engine, or None when one cannot be built.
+    """Return the explicit capture-time compatibility adapter, or None.
 
-    ``autosync_enabled=False`` is mandatory: the default constructor starts a
-    background indexing worker and a filesystem watchdog, and a read-only review
-    command has no business leaving either behind.
+    Snapshot symbol identity/geometry is source-derived below. The compatibility
+    engine is retained only for capture-time enrichment whose qualified
+    caller/centrality semantics are not yet exposed by the native Review
+    provider; Reader-time current intelligence uses CodeIntelligenceProvider.
     """
 
     try:
-        from lemoncrow.pro.capabilities.code_context.engine import CodeContextEngine
-    except Exception:
-        return None
-    try:
-        return CodeContextEngine(repo_root, autosync_enabled=False)
+        from lemoncrow.core.service.review_code_intelligence import open_legacy_snapshot_impact_engine
+
+        return open_legacy_snapshot_impact_engine(repo_root)
     except Exception:
         return None
 
@@ -1962,7 +1993,8 @@ def _untouched_caller_sites(
 
     sites: list[ImpactSite] = []
     seen: set[tuple[str, str]] = set()
-    for symbol in candidates[:_MAX_CALLER_QUERIES]:
+    queried = candidates[:_MAX_CALLER_QUERIES]
+    for rank, symbol in enumerate(queried):
         resolution = cached.get(symbol.symbol_name) or _resolve_name(engine, symbol.symbol_name)
         if resolution is None:
             continue
@@ -1973,7 +2005,11 @@ def _untouched_caller_sites(
         related = resolution.payload.get("related")
         if not isinstance(related, list):
             continue
-        for node in related:
+        if len(related) >= _CALLERS_PER_SYMBOL and symbol.caller_count > len(related):
+            # The per-symbol query bound cut this symbol's callers: say so, never
+            # present the first page as the whole set.
+            degraded.add(_SIGNAL_CALLER_QUERIES_TRUNCATED)
+        for position, node in enumerate(related):
             if not isinstance(node, Mapping):
                 continue
             # MCP payloads ship field-name-shortened keys (file_path -> path,
@@ -2032,6 +2068,9 @@ def _untouched_caller_sites(
                 )
             )
             if len(sites) >= limit:
+                if position + 1 < len(related) or rank + 1 < len(queried):
+                    # Stopped at the site budget with callers left unexamined.
+                    degraded.add(_SIGNAL_SITE_CAP)
                 return sites, degraded
     return sites, degraded
 
@@ -2186,32 +2225,26 @@ def collect_changed_symbols(
 
     Review startup needs symbol identity to establish its target denominator, but
     it does not need detector sites, caller expansion, centrality, or impact
-    ranking before the human can read source. This uses the same index-backed
-    symbol extraction as :func:`collect_impact`; the later enrichment therefore
-    adds evidence to those symbols rather than inventing a second identity set.
+    ranking before the human can read source. Identity is therefore derived only
+    from the frozen old/new source blobs. Mutable current-index rows may enrich a
+    later impact pass, but they cannot decide which Review targets exist.
     """
 
+    del repo_root  # Snapshot target identity deliberately has no checkout/index dependency.
     text_files = [item for item in files if not item.is_binary]
     if not text_files:
         return ImpactResult()
-    engine = _open_engine(repo_root)
-    ready = _index_ready(engine)
-    symbols, drifted, degraded = _changed_symbols(
-        engine,
+    symbols, _drifted, degraded = _changed_symbols(
+        None,
         text_files,
-        ready=ready,
+        ready=False,
         old_blobs=old_blobs,
         new_blobs=new_blobs,
     )
-    index_status: IndexStatus = "absent"
-    if ready:
-        index_status = "stale" if drifted else "fresh"
-        if drifted:
-            degraded.add(_SIGNAL_LINE_RANGES)
     return ImpactResult(
         symbols=tuple(symbols),
         sites=(),
-        index_status=index_status,
+        index_status="absent",
         degraded=tuple(sorted(degraded)),
     )
 

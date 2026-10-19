@@ -71,12 +71,17 @@ from pathlib import Path
 from typing import Any, Final
 
 from ..errors import AgentAction, ErrorCode, ServerError
-from .contracts import AnalysisStore, ContentStore, ManifestEntry, sha256_hex, validate_path
+from .analysis import analyze_foreground
+from .contracts import AnalysisArtifact, AnalysisStore, ContentStore, ManifestEntry, sha256_hex, validate_path
 
 __all__ = ["LocalFsFill", "LocalFsGrant", "LocalFsSource", "OwnerOf", "write_proof"]
 
 _MAX_PROOF_BYTES: Final[int] = 512
 _MIN_PROOF_TOKEN: Final[int] = 16
+_FILL_ANALYSIS_FILES: Final[int] = 256
+_FILL_ANALYSIS_BYTES: Final[int] = 16 * 1024 * 1024
+_FILL_COMMIT_FILES: Final[int] = 64
+_FILL_COMMIT_BYTES: Final[int] = 4 * 1024 * 1024
 
 #: The proof file has to be a name in ``root`` itself, not a path under it.
 #: See the module docstring: a nested proof demonstrates write access to a
@@ -320,6 +325,7 @@ class LocalFsSource:
         content: ContentStore,
         analysis: AnalysisStore,
         needed: Collection[str] | None = None,
+        analyze_batch: Callable[[Sequence[tuple[str, str, bytes]]], Sequence[AnalysisArtifact]] | None = None,
     ) -> LocalFsFill:
         """Satisfy as many declared digests as the worktree still matches.
 
@@ -339,31 +345,81 @@ class LocalFsSource:
         rejected = 0
         skipped = 0
         seen: set[str] = set()
-        # Durable analysis exposes a re-entrant bulk transaction. Keep the
-        # capability optional so the in-memory/reference implementation and
-        # lightweight test doubles retain their existing behavior. Because the
-        # durable content and analysis stores share one _Db, content.put() and
-        # analysis.ensure() both join this outer transaction automatically.
         batch = getattr(analysis, "batch", None)
-        with batch() if callable(batch) else nullcontext():
-            for entry in entries:
-                if entry.content_digest not in missing or entry.content_digest in seen:
-                    skipped += 1
-                    continue
-                if entry.size > self._size_cap:
-                    # Manifested but not uploaded, by policy. Reading it from disk
-                    # would quietly undo the cap the upload path enforces.
-                    skipped += 1
-                    continue
-                data = self.read(grant, entry.path, entry.content_digest)
-                if data is None:
-                    rejected += 1
-                    continue
-                seen.add(entry.content_digest)
-                content.put(org_id, entry.content_digest, data)
-                analysis.ensure(org_id, entry.content_digest, entry.parser_profile, data)
-                filled.append(entry.content_digest)
-                total += len(data)
+        lookup = getattr(analysis, "get", None)
+        pending: list[tuple[ManifestEntry, bytes]] = []
+        pending_bytes = 0
+
+        def commit_group(group: Sequence[tuple[ManifestEntry, bytes, AnalysisArtifact]]) -> None:
+            # Keep durable SQLite/WAL transactions smaller than the CPU batch.
+            # Analysis has already completed, so the write lock is held only
+            # while immutable content/artifact rows are actually persisted.
+            with batch() if callable(batch) else nullcontext():
+                for entry, data, artifact in group:
+                    content.put(org_id, entry.content_digest, data)
+                    analysis.ensure(org_id, entry.content_digest, entry.parser_profile, data, artifact=artifact)
+                    filled.append(entry.content_digest)
+
+        def flush_pending() -> None:
+            nonlocal pending_bytes
+            if not pending:
+                return
+            artifacts: dict[tuple[str, str], AnalysisArtifact] = {}
+            derive: list[tuple[str, str, bytes]] = []
+            for entry, data in pending:
+                artifact = lookup(org_id, entry.content_digest, entry.parser_profile) if callable(lookup) else None
+                if artifact is None:
+                    derive.append((entry.content_digest, entry.parser_profile, data))
+                else:
+                    artifacts[(entry.content_digest, entry.parser_profile)] = artifact
+            if derive:
+                produced = (
+                    tuple(analyze_batch(derive))
+                    if analyze_batch is not None
+                    else tuple(analyze_foreground(digest, profile, data) for digest, profile, data in derive)
+                )
+                if len(produced) != len(derive):
+                    raise RuntimeError("analysis batch returned the wrong number of artifacts")
+                artifacts.update(
+                    ((digest, profile), artifact)
+                    for (digest, profile, _data), artifact in zip(derive, produced, strict=True)
+                )
+
+            commit: list[tuple[ManifestEntry, bytes, AnalysisArtifact]] = []
+            commit_bytes = 0
+            for entry, data in pending:
+                artifact = artifacts[(entry.content_digest, entry.parser_profile)]
+                if commit and (len(commit) >= _FILL_COMMIT_FILES or commit_bytes + len(data) > _FILL_COMMIT_BYTES):
+                    commit_group(commit)
+                    commit = []
+                    commit_bytes = 0
+                commit.append((entry, data, artifact))
+                commit_bytes += len(data)
+            if commit:
+                commit_group(commit)
+            pending.clear()
+            pending_bytes = 0
+
+        for entry in entries:
+            if entry.content_digest not in missing or entry.content_digest in seen:
+                skipped += 1
+                continue
+            if entry.size > self._size_cap:
+                # Manifested but not uploaded, by policy. Reading it from disk
+                # would quietly undo the cap the upload path enforces.
+                skipped += 1
+                continue
+            data = self.read(grant, entry.path, entry.content_digest)
+            if data is None:
+                rejected += 1
+                continue
+            seen.add(entry.content_digest)
+            if pending and (len(pending) >= _FILL_ANALYSIS_FILES or pending_bytes + len(data) > _FILL_ANALYSIS_BYTES):
+                flush_pending()
+            pending.append((entry, data))
+            pending_bytes += len(data)
+            total += len(data)
+        flush_pending()
         return LocalFsFill(filled=tuple(filled), bytes_read=total, rejected=rejected, skipped=skipped)
 
 

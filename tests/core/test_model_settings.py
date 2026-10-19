@@ -67,7 +67,7 @@ def test_host_auto_resolves_to_no_explicit_model(tmp_path: Path) -> None:
     assert resolve_runtime_model("code", workspace) == "claude-opus-4.8"
 
 
-def test_host_without_override_inherits_runtime_model(tmp_path: Path) -> None:
+def test_host_without_shipped_override_inherits_runtime_model(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     local_path = workspace_model_settings_path(workspace)
@@ -77,7 +77,7 @@ def test_host_without_override_inherits_runtime_model(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    assert resolve_host_model("opencode", "code", workspace_root=workspace) == "gpt-5.5"
+    assert resolve_host_model("cursor", "code", workspace_root=workspace) == "gpt-5.5"
 
 
 def test_legacy_all_auto_host_stub_inherits_runtime_model(tmp_path: Path) -> None:
@@ -117,8 +117,8 @@ def test_shipped_host_default_pins_explore_and_research_cheap(tmp_path: Path, mo
     workspace.mkdir()
     monkeypatch.setenv("LEMONCROW_ROOT", str(tmp_path / "global-root"))
 
-    assert resolve_explicit_host_model("claude", "explore", workspace_root=workspace) == "haiku"
-    assert resolve_explicit_host_model("claude", "research", workspace_root=workspace) == "haiku"
+    assert resolve_explicit_host_model("claude", "explore", workspace_root=workspace) == "sonnet"
+    assert resolve_explicit_host_model("claude", "research", workspace_root=workspace) == "sonnet"
     assert resolve_explicit_host_model("codex", "explore", workspace_root=workspace) == "gpt-5.4-mini"
     # Coding/judgment roles inherit the session model (no pin).
     assert resolve_explicit_host_model("claude", "code", workspace_root=workspace) is None

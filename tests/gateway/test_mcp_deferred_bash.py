@@ -10,6 +10,7 @@ touch real stdout.
 from __future__ import annotations
 
 import json
+import shlex
 import sys
 import threading
 import time
@@ -34,6 +35,23 @@ def _wait_for(predicate: Callable[[], bool], timeout: float = 5.0) -> bool:
     return predicate()
 
 
+#: A response-window regression that waited for the 30 s command budget fails;
+#: scheduler noise under parallel load does not.
+_RESPONSE_BOUND_S = 5.0
+
+
+def _gated(tmp: Path, name: str) -> tuple[str, Path]:
+    """A command that keeps running until the test opens its gate.
+
+    Racing a fixed ``sleep`` against the response window flakes under load: the
+    sleep can finish first. A gate makes "the response returned while the
+    command was still running" deterministic.
+    """
+
+    gate = tmp / f"{name}.gate"
+    return f"while [ ! -e {shlex.quote(str(gate))} ]; do sleep 0.02; done; echo done", gate
+
+
 def _bash_request(rid: Any, command: str, **args: Any) -> dict[str, Any]:
     return {
         "jsonrpc": "2.0",
@@ -43,11 +61,18 @@ def _bash_request(rid: Any, command: str, **args: Any) -> dict[str, Any]:
     }
 
 
-@pytest.fixture()
-def bash_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    root = tmp_path / ".lemoncrow"
+@pytest.fixture(scope="module")
+def _bash_store(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Initialize the shared persistent store once; tests do not inspect its contents."""
+
+    root = tmp_path_factory.mktemp("deferred-bash-store") / ".lemoncrow"
     init_store_at(str(root))
-    monkeypatch.setenv("LEMONCROW_ROOT", str(root))
+    return root
+
+
+@pytest.fixture()
+def bash_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _bash_store: Path) -> Path:
+    monkeypatch.setenv("LEMONCROW_ROOT", str(_bash_store))
     monkeypatch.setenv("CLAUDE_WORKSPACE_ROOT", str(tmp_path))
     monkeypatch.setenv("LEMONCROW_MEMORY_BACKEND", "sqlite")
     monkeypatch.delenv("LEMONCROW_SERVICE_URL", raising=False)
@@ -157,22 +182,26 @@ def test_full_mcp_foreground_call_releases_before_host_window(
     captured: list[dict[str, Any]] = []
     monkeypatch.setattr(mcp_server, "_write_jsonrpc", lambda msg: captured.append(msg))
 
-    started = time.monotonic()
-    mcp_server._handle_and_write(_bash_request(43, "sleep 0.3; echo done", timeout=30))
-    assert _wait_for(lambda: bool(captured), 1.0)
-    elapsed = time.monotonic() - started
+    command, gate = _gated(bash_env, "foreground")
+    try:
+        started = time.monotonic()
+        mcp_server._handle_and_write(_bash_request(43, command, timeout=30))
+        assert _wait_for(lambda: bool(captured), _RESPONSE_BOUND_S)
+        elapsed = time.monotonic() - started
 
-    assert elapsed < 0.25
-    text = captured[0]["result"]["content"][0]["text"]
-    assert "returned early to keep the tool call reliable" in text
-    assert "don't rerun it" in text
-    sid = text.split("id=", 1)[1].split(";", 1)[0]
-    with bx._MANAGED_COMMANDS_LOCK:
-        managed = bx._MANAGED_COMMANDS.get(sid)
-    assert managed is not None
-    assert managed.proc.poll() is None
+        assert elapsed < _RESPONSE_BOUND_S
+        text = captured[0]["result"]["content"][0]["text"]
+        assert "returned early to keep the tool call reliable" in text
+        assert "don't rerun it" in text
+        sid = text.split("id=", 1)[1].split(";", 1)[0]
+        with bx._MANAGED_COMMANDS_LOCK:
+            managed = bx._MANAGED_COMMANDS.get(sid)
+        assert managed is not None
+        assert managed.proc.poll() is None
+    finally:
+        gate.touch()
 
-    managed.proc.wait(timeout=2)
+    managed.proc.wait(timeout=5)
     terminal = bx.poll_managed_command(sid)
     assert terminal["stdout"] == "done"
     assert terminal["exit_code"] == 0
@@ -246,12 +275,12 @@ def test_deferred_soft_deadline_returns_running_without_killing(bash_env: Path) 
     keeps going underneath."""
     mcp_server._deferral_context.active = True
     try:
-        deferred = mcp_server._run_bash_tool("sleep 1.5; echo done", timeout=0)
+        deferred = mcp_server._run_bash_tool("sleep 0.3; echo done", timeout=0)
         assert isinstance(deferred, mcp_server._DeferredResult)
         done = threading.Event()
         armed = deferred.register(done.set)
         assert armed is True
-        assert done.wait(3.0)
+        assert done.wait(1.0)
         result = deferred.collect()
     finally:
         mcp_server._deferral_context.active = False
@@ -269,7 +298,7 @@ def test_deferred_soft_deadline_returns_running_without_killing(bash_env: Path) 
     assert managed.proc.poll() is None  # still alive -- the soft deadline did not kill it
 
     # Cleanup: let it finish and reap so no thread/temp file leaks past the test.
-    managed.proc.wait(timeout=5)
+    managed.proc.wait(timeout=2)
     bx.poll_managed_command(sid)
 
 
@@ -279,18 +308,19 @@ def test_deferred_mcp_response_window_returns_durable_handle_before_command_budg
 ) -> None:
     monkeypatch.setattr(mcp_bash, "_MCP_BASH_RESPONSE_WINDOW_S", 0.05)
     mcp_server._deferral_context.active = True
+    command, gate = _gated(bash_env, "deferred")
     sid = ""
     try:
         started = time.monotonic()
-        deferred = mcp_server._run_bash_tool("sleep 0.3; echo done", timeout=30)
+        deferred = mcp_server._run_bash_tool(command, timeout=30)
         assert isinstance(deferred, mcp_server._DeferredResult)
         ready = threading.Event()
         assert deferred.register(ready.set) is True
-        assert ready.wait(1.0)
+        assert ready.wait(_RESPONSE_BOUND_S)
         result = deferred.collect()
         elapsed = time.monotonic() - started
 
-        assert elapsed < 0.25
+        assert elapsed < _RESPONSE_BOUND_S
         assert result["status"] == "running"
         assert result["orchestration_return"] is True
         assert result["over_budget"] is False
@@ -300,9 +330,10 @@ def test_deferred_mcp_response_window_returns_durable_handle_before_command_budg
         assert "don't rerun it" in rendered
     finally:
         mcp_server._deferral_context.active = False
+        gate.touch()
 
     assert sid
-    finished = mcp_server._run_bash_tool(session_id=sid, action="poll", timeout=2)
+    finished = mcp_server._run_bash_tool(session_id=sid, action="poll", timeout=5)
     assert isinstance(finished, dict)
     assert finished["stdout"] == "done"
     assert finished["exit_code"] == 0
@@ -313,25 +344,34 @@ def test_existing_shell_poll_is_sliced_to_mcp_response_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(mcp_bash, "_MCP_BASH_RESPONSE_WINDOW_S", 0.05)
-    started = mcp_server._run_bash_tool("sleep 0.3; echo done", timeout=30, background=True)
-    assert isinstance(started, dict)
-    sid = str(started["session_id"])
-
-    mcp_server._deferral_context.active = True
+    command, gate = _gated(bash_env, "poll")
     try:
-        before = time.monotonic()
-        running = mcp_server._run_bash_tool(session_id=sid, action="poll")
-        elapsed = time.monotonic() - before
+        started = mcp_server._run_bash_tool(command, timeout=30, background=True)
+        assert isinstance(started, dict)
+        sid = str(started["session_id"])
+
+        mcp_server._deferral_context.active = True
+        # An unsliced poll would wait on the gate forever; opening it after the
+        # bound makes that regression fail on ``elapsed`` instead of hanging.
+        watchdog = threading.Timer(_RESPONSE_BOUND_S * 2, gate.touch)
+        watchdog.start()
+        try:
+            before = time.monotonic()
+            running = mcp_server._run_bash_tool(session_id=sid, action="poll")
+            elapsed = time.monotonic() - before
+        finally:
+            watchdog.cancel()
+            mcp_server._deferral_context.active = False
     finally:
-        mcp_server._deferral_context.active = False
+        gate.touch()
 
     assert isinstance(running, dict)
-    assert elapsed < 0.25
+    assert elapsed < _RESPONSE_BOUND_S
     assert running["status"] == "running"
     assert running["session_id"] == sid
     assert running["orchestration_return"] is True
 
-    finished = mcp_server._run_bash_tool(session_id=sid, action="poll", timeout=2)
+    finished = mcp_server._run_bash_tool(session_id=sid, action="poll", timeout=5)
     assert isinstance(finished, dict)
     assert finished["stdout"] == "done"
     assert finished["exit_code"] == 0

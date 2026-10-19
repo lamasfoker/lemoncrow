@@ -3,7 +3,11 @@ from __future__ import annotations
 import hashlib
 import http.cookiejar
 import json
+import socket
+import subprocess
+import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -13,7 +17,7 @@ from types import SimpleNamespace
 import pygit2
 import pytest
 
-from lemoncrow.pro.capabilities.review import web_preview
+from lemoncrow.pro.capabilities.review import sandbox_limits, web_preview
 from lemoncrow.pro.capabilities.review.gitdiff import resolve_rev_range
 from lemoncrow.pro.capabilities.review.packet import build_review_packet_with_blobs
 from lemoncrow.pro.capabilities.review.sources.local import open_or_create_session, record_revision
@@ -92,6 +96,35 @@ def test_vite_react_router_route_component_only_affects_its_static_route(
 
     assert overview is not None and overview.routes == ("/", "/overview")
     assert review is not None and review.routes == ("/review",)
+
+
+def test_every_changed_file_of_one_snapshot_shares_one_import_graph(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Surface discovery asks once per changed file; each ask re-scanned the
+    # whole project for imports (minutes of CPU on a ~400-file change).
+    files = _vite_files()
+    monkeypatch.setattr(web_preview, "_tree_files", lambda *_args, **_kwargs: files)
+    real = web_preview._import_graph
+    built: list[int] = []
+
+    def counting(sources: dict[str, str]) -> dict[str, tuple[str, ...]]:
+        built.append(len(sources))
+        return real(sources)
+
+    monkeypatch.setattr(web_preview, "_import_graph", counting)
+    paths = ["src/index.css", "src/pages/Overview.tsx", "src/review/ReviewReader.tsx", "src/pages/Sessions.tsx"]
+    first = [web_preview.infer_web_preview_descriptor(tmp_path, _revision(), path) for path in paths]
+    again = [web_preview.infer_web_preview_descriptor(tmp_path, _revision(), path) for path in paths]
+
+    assert len(built) == 2  # one per side (head and base), not one per side per changed file
+    assert [item.routes if item else None for item in first] == [
+        ("/", "/overview", "/sessions", "/review"),
+        ("/", "/overview"),
+        ("/review",),
+        ("/sessions",),
+    ]
+    assert again == first
 
 
 def test_tree_walk_skips_submodule_gitlinks_without_aborting_parent_preview() -> None:
@@ -317,7 +350,104 @@ def test_vite_live_preview_serves_browser_router_route_through_spa_fallback(
     )
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
     with opener.open(url, timeout=2) as response:
-        assert b"Vite route" in response.read()
+        html = response.read()
+    assert b"Vite route" in html
+    # The capability URL is /<secret>/review; the router must see /review, so the
+    # first head script drops the secret segment before any app script runs.
+    assert url.split("/", 3)[3].startswith(url.split("/")[3] + "/review")
+    assert html.index(b"data-lemoncrow-preview-path") < html.index(b"data-lemoncrow-preview-theme")
+    assert b"history.replaceState" in html
+    # Once the cookie authorizes the origin, /review is served as is, with nothing to strip.
+    origin = "/".join(url.split("/", 3)[:3])
+    with opener.open(origin + "/review", timeout=2) as response:
+        direct = response.read()
+    assert b"Vite route" in direct
+    assert b"data-lemoncrow-preview-path" not in direct
+
+
+def test_capture_server_serves_client_routes_of_a_spa_build(tmp_path: Path) -> None:
+    site = tmp_path / "dist"
+    (site / "assets").mkdir(parents=True)
+    (site / "index.html").write_text("<div id=root>spa shell</div>", encoding="utf-8")
+    (site / "assets" / "app.js").write_text("console.log(1)", encoding="utf-8")
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    command = web_preview._capture_server_command(str(site), spa_fallback=True, port=port)
+    server = subprocess.Popen(["sh", "-c", f"exec {command.replace('python3', sys.executable, 1)}"])
+    try:
+
+        def get(path: str) -> tuple[int, str]:
+            for _attempt in range(50):
+                try:
+                    with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=2) as response:
+                        return response.status, response.read().decode("utf-8")
+                except urllib.error.HTTPError as exc:
+                    return exc.code, ""
+                except OSError:
+                    time.sleep(0.05)
+            raise AssertionError("capture server did not start")
+
+        # A React Router page has no file of its own in the build; the router renders it from index.html.
+        assert get("/pricing") == (200, "<div id=root>spa shell</div>")
+        assert get("/pricing?tab=1")[1] == "<div id=root>spa shell</div>"
+        assert get("/assets/app.js") == (200, "console.log(1)")
+        # A missing asset stays a 404 instead of silently rendering the shell.
+        assert get("/assets/missing.js")[0] == 404
+    finally:
+        server.terminate()
+        server.wait(timeout=5)
+
+    plain = web_preview._capture_server_command("/workspace/dist", spa_fallback=False)
+    assert plain == "python3 -m http.server 8787 --bind 127.0.0.1 --directory /workspace/dist"
+
+
+def test_route_captures_leave_the_shared_build_dependency_facade_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sys, "platform", "linux")
+    # Every route of one side shares a content-keyed build workspace. Rebuilding
+    # its node_modules facade per capture deleted it under a concurrent capture
+    # of another route ("No such file or directory: .../node_modules").
+    descriptor = web_preview.WebPreviewDescriptor(
+        framework="vite", routes=("/", "/pricing"), default_route="/", root="frontend"
+    )
+    monkeypatch.setattr(web_preview, "infer_web_preview_descriptor", lambda *_args, **_kwargs: descriptor)
+    monkeypatch.setattr(web_preview, "_chrome_executable", lambda: "/usr/bin/google-chrome")
+
+    def fake_built(cache_root: Path, *_args: object, side: str, **_kwargs: object) -> Path:
+        output = cache_root / side / "workspace" / "frontend" / "dist"
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "index.html").write_text("<html></html>", encoding="utf-8")
+        return output
+
+    dependency_mounts: list[Path | None] = []
+    capture_dirs: list[Path] = []
+
+    def fake_prefix(_workspace: Path, live_node_modules: Path | None, **kwargs: object) -> list[str]:
+        dependency_mounts.append(live_node_modules)
+        capture_dirs.append(Path(str(kwargs["capture_dir"])))
+        capture_dirs[-1].mkdir(parents=True, exist_ok=True)
+        return ["bwrap"]
+
+    def fake_run(command: list[str], **_kwargs: object) -> SimpleNamespace:
+        name = command[-1].split("--screenshot=/capture/", 1)[1].split()[0]
+        (capture_dirs[-1] / name).write_bytes(b"png")
+        return SimpleNamespace(returncode=0, stdout="")
+
+    monkeypatch.setattr(web_preview, "_ensure_built", fake_built)
+    monkeypatch.setattr(web_preview, "_bubblewrap_prefix", fake_prefix)
+    monkeypatch.setattr(web_preview, "run_limited", fake_run)
+
+    shots = [
+        web_preview.render_web_preview(
+            tmp_path / "store", tmp_path, _revision(), path="frontend/src/App.jsx", route=route, side="new"
+        )
+        for route in ("/", "/pricing")
+    ]
+
+    assert all(shot.read_bytes() == b"png" for shot in shots)
+    assert dependency_mounts == [None, None]
 
 
 def test_node_modules_facade_keeps_dependencies_read_only_and_build_cache_writable(tmp_path: Path) -> None:
@@ -328,6 +458,7 @@ def test_node_modules_facade_keeps_dependencies_read_only_and_build_cache_writab
     (live_modules / "vite").mkdir(parents=True)
     (live_modules / ".bin").mkdir()
     (live_modules / ".vite").mkdir()
+    (live_modules / ".vite-temp").mkdir()  # left by any local `vite` run with a vite.config.*
 
     web_preview._prepare_node_modules_facade(workspace, live_modules, project_root="frontend")
 
@@ -336,13 +467,16 @@ def test_node_modules_facade_keeps_dependencies_read_only_and_build_cache_writab
     assert (facade / "vite").readlink().as_posix() == "/lemoncrow-deps/node_modules/vite"
     assert (facade / ".bin").is_symlink()
     assert not (facade / ".vite").exists()
+    assert not (facade / ".vite-temp").exists()
 
     # The facade itself belongs to the isolated build workspace, so Vite/Astro
     # can create caches there even though all borrowed dependencies resolve
     # through the read-only /lemoncrow-deps mount.
     (facade / ".vite").mkdir()
+    (facade / ".vite-temp").mkdir()
     (facade / ".astro").mkdir()
     assert (facade / ".vite").is_dir()
+    assert (facade / ".vite-temp").is_dir()
     assert (facade / ".astro").is_dir()
 
 
@@ -395,6 +529,7 @@ def test_preview_build_can_borrow_dependencies_from_a_separate_proven_checkout(
         (output / "index.html").write_text("<html></html>", encoding="utf-8")
         return SimpleNamespace(returncode=0, stdout="")
 
+    monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setattr(web_preview, "_materialize_review_side", fake_materialize)
     monkeypatch.setattr(web_preview, "_package_manager", lambda _root: "npm")
     monkeypatch.setattr(web_preview, "_bubblewrap_prefix", fake_prefix)
@@ -450,9 +585,15 @@ def test_preview_build_repairs_missing_checkout_dependencies_from_lockfile(
 
     commands: list[list[str]] = []
 
+    monkeypatch.setattr(sys, "platform", "linux")
+    limiter = sandbox_limits.limit_prefix()
+
     def fake_run(command: list[str], **_kwargs: object) -> SimpleNamespace:
+        # Every sandboxed job runs behind the host memory/task limiter.
+        assert command[: len(limiter)] == limiter
+        command = command[len(limiter) :]
         commands.append(command)
-        if command[:2] == ["npm", "ci"]:
+        if Path(command[0]).name == "npm" and command[1] == "ci":
             (dependency_project / "node_modules" / "vite").mkdir(parents=True)
             return SimpleNamespace(returncode=0, stdout="installed")
         output = cache_root / "new" / "workspace" / "frontend" / "dist"
@@ -486,7 +627,7 @@ def test_preview_build_repairs_missing_checkout_dependencies_from_lockfile(
     )
 
     assert output.name == "dist"
-    assert commands[0][:2] == ["npm", "ci"]
+    assert Path(commands[0][0]).name == "npm" and commands[0][1] == "ci"
     assert "--ignore-scripts" in commands[0]
 
 

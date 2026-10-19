@@ -271,7 +271,10 @@ function componentsFor(
     details: ({ node, className, ...props }) => <details {...props} {...attrs(node, className)} />,
     hr: ({ node, className, ...props }) => <hr {...props} {...attrs(node, className)} />,
     img: ({ node: _node, ...props }) => <MarkdownImage {...props} revisionId={revisionId} documentPath={documentPath} side={side} />,
-    a: ({ node: _node, onClick, ...props }) => (
+    // A `<picture><source srcset>` would have the browser fetch that URL itself,
+    // bypassing the Snapshot-bound image route; the proxied `<img>` fallback renders instead.
+    source: () => null,
+    a:({ node: _node, onClick, ...props }) => (
       <a
         {...props}
         target="_blank"

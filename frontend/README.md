@@ -8,8 +8,8 @@ runtime. Reads from `lemoncrow-api` (FastAPI HTTP wrapper) on port 8787.
 The dashboard is part of the native stack. From the repo root:
 
 ```bash
-make start          # brings up lemoncrow-api + lemoncrow-frontend
-open http://localhost:3125
+make oss-dev   # installs the local Review server into the sandbox (port 7428)
+make oss-ui    # Vite with hot reload against it
 ```
 
 ## Run (manual)

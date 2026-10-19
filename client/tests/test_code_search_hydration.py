@@ -54,6 +54,28 @@ def test_warm_navigation_skips_reads_with_identical_output(tmp_path, monkeypatch
     assert render_local_code_search("alpha", answer, repo_root=tmp_path) is None
 
 
+@pytest.mark.parametrize(
+    ("query", "name"),
+    [
+        ("def integrate(self, dim coord", "integrate"),
+        ("def proxy_headers get_auth_from_url prepend_scheme_if_needed usage", "proxy_headers"),
+    ],
+)
+def test_declaration_query_with_trailing_context_keeps_two_exact_hits_inline(query, name) -> None:
+    source = f"def {name}():\n    return 1\n".encode()
+    hits = [
+        {"path": "pkg/first.py", "detail": {"definitions": [{"name": name, "line": 1}]}},
+        {"path": "pkg/second.py", "detail": {"definitions": [{"name": name, "line": 1}]}},
+    ]
+
+    rendered = render_code_search_markdown(query, {"hits": hits}, load_source=lambda hit: source)
+
+    assert rendered.startswith("= exact")
+    assert f"## pkg/first.py:L1-L2 · {name}" in rendered
+    assert f"## pkg/second.py:L1-L2 · {name}" in rendered
+    assert "→ pkg/second.py" not in rendered
+
+
 def test_navigation_extent_cache_is_bounded(tmp_path, monkeypatch):
     from collections import OrderedDict
 
@@ -171,3 +193,44 @@ def test_session_retries_once_with_server_hydration_on_digest_mismatch(
     answer = bootstrapped.call_tool("code_search", {"query": "alpha"})
     assert [call.get("_client_hydrate") for call in calls] == [True, False]
     assert "server canonical" in str(answer.content[0]["text"])
+
+
+def test_python_extents_parse_once_for_multiple_symbols_and_changed_source(monkeypatch):
+    from collections import OrderedDict
+
+    monkeypatch.setattr(markdown, "_PYTHON_EXTENTS", OrderedDict())
+    parses = []
+    original = markdown.ast.parse
+
+    def counted(source):
+        parses.append(source)
+        return original(source)
+
+    monkeypatch.setattr(markdown.ast, "parse", counted)
+    source = b"class A:\n    def same(self):\n        return 1\nclass B:\n    async def same(self):\n        return 2\n"
+    assert markdown._definition_end_line("a.py", "same", source, 2) == 3
+    assert markdown._definition_end_line("a.py", "same", source, 5) == 6
+    assert markdown._definition_end_line("a.py", "A", source, 1) == 3
+    assert len(parses) == 1
+    changed = source.replace(b"        return 1\n", b"        value = 1\n        return value\n")
+    assert markdown._definition_end_line("a.py", "same", changed, 2) == 4
+    assert len(parses) == 2
+
+
+def test_python_extent_cache_bounds_source_count_and_symbol_count(monkeypatch):
+    from collections import OrderedDict
+
+    monkeypatch.setattr(markdown, "_PYTHON_EXTENTS", OrderedDict())
+    monkeypatch.setattr(markdown, "_MAX_PYTHON_SOURCES", 2)
+    monkeypatch.setattr(markdown, "_MAX_PYTHON_EXTENTS", 3)
+    for name in ("one", "two", "three"):
+        data = f"def {name}():\n    pass\n".encode()
+        markdown._definition_end_line("a.py", name, data, 1)
+    assert len(markdown._PYTHON_EXTENTS) == 2
+    data = b"def a(): pass\ndef b(): pass\ndef c(): pass\n"
+    markdown._definition_end_line("a.py", "a", data, 1)
+    assert sum(len(value) for value in markdown._PYTHON_EXTENTS.values()) == 3
+    assert len(markdown._PYTHON_EXTENTS) == 1
+    data += b"def d(): pass\n"
+    markdown._definition_end_line("a.py", "a", data, 1)
+    assert sha256_hex(data) not in markdown._PYTHON_EXTENTS

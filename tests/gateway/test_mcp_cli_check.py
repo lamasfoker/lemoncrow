@@ -74,6 +74,25 @@ def test_probe_stdio_server_accepts_initialized_core_surface(monkeypatch) -> Non
     assert result["server"] == "lc"
 
 
+def test_probe_stdio_server_accepts_runtime_lite(monkeypatch) -> None:
+    monkeypatch.setattr(mcp.shutil, "which", lambda _name: "/venv/bin/lemoncrow")
+    monkeypatch.setattr(
+        mcp.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0],
+            0,
+            stdout=_response(["read", "edit", "code_search", "bash"], server_name="lemoncrow-runtime-lite"),
+            stderr="",
+        ),
+    )
+
+    result = mcp.probe_stdio_server()
+
+    assert result["ok"] is True
+    assert result["server"] == "lemoncrow-runtime-lite"
+
+
 def test_probe_stdio_server_rejects_degraded_server(monkeypatch) -> None:
     monkeypatch.setattr(mcp.shutil, "which", lambda _name: "/venv/bin/lemoncrow")
     monkeypatch.setattr(

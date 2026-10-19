@@ -3,13 +3,26 @@
 from __future__ import annotations
 
 import ipaddress
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .errors import ErrorCode, ServerError
 from .limits import Limits
 
-__all__ = ["EngineServerConfig", "LocalServerConfig"]
+__all__ = ["LOCAL_PRODUCTS", "EngineServerConfig", "LocalServerConfig", "canonical_products"]
+
+#: Products the local server can compose. Runtime tools are not among them:
+#: Runtime Lite runs them in the agent's own MCP process.
+LOCAL_PRODUCTS: frozenset[str] = frozenset({"review", "dashboard"})
+# Before Runtime Lite the Dashboard shipped under the Runtime product's name.
+_LEGACY_PRODUCTS = {"runtime": "dashboard"}
+
+
+def canonical_products(names: Iterable[str]) -> frozenset[str]:
+    """Map legacy product names onto the products the local server composes."""
+
+    return frozenset(_LEGACY_PRODUCTS.get(name, name) for name in names)
 
 
 def _is_loopback(host: str) -> bool:
@@ -29,7 +42,13 @@ class EngineServerConfig:
     listen_port: int = 7420
     shutdown_timeout_s: float = 20.0
     session_ttl_s: float = 3600.0
-    view_lease_s: float = 86_400.0
+    # A View lives while its session is active: session activity renews its
+    # lease. An idle one lapses and its client reopens it on next use; a
+    # day-long lease only kept abandoned Views' index state (graphs, ANN) alive.
+    view_lease_s: float = 3600.0
+    # The longest lease a client may ask for, for a View nothing will renew: a
+    # Review snapshot is read long after the CLI that captured it has exited.
+    view_lease_max_s: float = 86_400.0
     allow_local_fs: bool = False
     blob_retention_s: float = 7 * 24 * 60 * 60.0
     maintenance_interval_s: float = 300.0
@@ -50,6 +69,8 @@ class EngineServerConfig:
             raise ServerError(ErrorCode.NOT_CONFIGURED, "shutdown timeout must be positive")
         if self.session_ttl_s <= 0 or self.view_lease_s <= 0:
             raise ServerError(ErrorCode.NOT_CONFIGURED, "session ttl and view lease must be positive")
+        if self.view_lease_max_s < self.view_lease_s:
+            raise ServerError(ErrorCode.NOT_CONFIGURED, "view lease ceiling must not be below the default lease")
         if self.blob_retention_s < 0 or self.maintenance_interval_s < 0:
             raise ServerError(
                 ErrorCode.NOT_CONFIGURED,
@@ -73,6 +94,13 @@ class LocalServerConfig(EngineServerConfig):
     # server remains durable SQLite by default; ephemeral mode selects the
     # contract-equivalent in-memory index and intentionally loses it on exit.
     ephemeral: bool = False
+    # Review and Dashboard run in worker processes of their own, so their CPU
+    # work never holds this process's GIL while a coding agent's call waits.
+    # Off by default (tests compose in-process); `up` turns it on.
+    isolate_services: bool = False
+    # Product composition for this process. Core session/view/blob routes are
+    # always present; Review and the Dashboard are independently optional.
+    products: frozenset[str] = LOCAL_PRODUCTS
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -80,6 +108,28 @@ class LocalServerConfig(EngineServerConfig):
             raise ServerError(ErrorCode.NOT_CONFIGURED, "the public local server may only bind loopback")
         if self.state_root is None:
             raise ServerError(ErrorCode.NOT_CONFIGURED, "the public local server requires a state root")
+        products = canonical_products(self.products)
+        if not products:
+            raise ServerError(
+                ErrorCode.NOT_CONFIGURED,
+                "local server requires at least one product: review or dashboard",
+            )
+        unknown = products - LOCAL_PRODUCTS
+        if unknown:
+            raise ServerError(
+                ErrorCode.NOT_CONFIGURED,
+                "local server products must be review and/or dashboard",
+                details={"unknown_products": sorted(unknown)},
+            )
+        object.__setattr__(self, "products", products)
+
+    @property
+    def review_enabled(self) -> bool:
+        return "review" in self.products
+
+    @property
+    def dashboard_enabled(self) -> bool:
+        return "dashboard" in self.products
 
     @property
     def resolved_index_path(self) -> Path | None:

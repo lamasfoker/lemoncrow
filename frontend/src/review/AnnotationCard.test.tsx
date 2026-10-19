@@ -10,7 +10,7 @@
  */
 
 import { describe, expect, it, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import AnnotationCard, { OrphanedComments } from "./AnnotationCard";
@@ -64,6 +64,53 @@ function mount(comments: Annotation[]) {
 }
 
 describe("AnnotationCard", () => {
+  function composer(onCancel = vi.fn(), draftBody = "") {
+    render(
+      <AnnotationCard
+        comments={[]}
+        all={[]}
+        label="New comment"
+        composing
+        busy={false}
+        draftBody={draftBody}
+        onSubmit={vi.fn()}
+        onCancel={onCancel}
+        onResolve={vi.fn()}
+        onReopen={vi.fn()}
+      />,
+    );
+    return { onCancel, input: screen.getByRole("textbox", { name: "Comment text" }) };
+  }
+
+  it("Escape during an IME composition never discards the draft", () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const { onCancel, input } = composer(vi.fn(), "変換中");
+    fireEvent.keyDown(input, { key: "Escape", isComposing: true });
+    expect(onCancel).not.toHaveBeenCalled();
+    expect(confirm).not.toHaveBeenCalled();
+    confirm.mockRestore();
+  });
+
+  it("Escape asks before discarding typed text and keeps it when the reviewer declines", () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValueOnce(false).mockReturnValueOnce(true);
+    const { onCancel, input } = composer(vi.fn(), "Keep invalid sessions visible");
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(onCancel).not.toHaveBeenCalled();
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(onCancel).toHaveBeenCalledTimes(1);
+    confirm.mockRestore();
+  });
+
+  it("Escape on an empty composer cancels without asking", () => {
+    const confirm = vi.spyOn(window, "confirm");
+    const { onCancel, input } = composer();
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(onCancel).toHaveBeenCalledTimes(1);
+    expect(confirm).not.toHaveBeenCalled();
+    confirm.mockRestore();
+  });
+
   it("offers Comment, Request change and Suggestion for new comments, not Looks good", () => {
     render(
       <AnnotationCard
@@ -217,12 +264,74 @@ describe("AnnotationCard", () => {
     expect(screen.getByRole("button", { name: "Request change" }).getAttribute("aria-pressed")).toBe("false");
   });
 
-  it("names the rung on a comment whose file never changed", () => {
-    mount([annotation()]);
-    expect(screen.getByText(/anchor: file unchanged since the comment/)).toBeTruthy();
+  it("gives AI findings bounded reviewer actions, requires a dismissal reason, and hides raw confidence by default", async () => {
+    const finding = annotation({
+      source: "ai_review",
+      created_by: "LemonCrow AI Review",
+      created_by_actor: "agent",
+      agent_host: "openai",
+      agent_model: "review-model",
+      title: "Null dereference",
+      confidence: 0.87,
+      finding_disposition: "open",
+    });
+    const onDisposition = vi.fn();
+    const onRequestChange = vi.fn();
+    const onFix = vi.fn();
+    const onAsk = vi.fn();
+    render(
+      <AnnotationCard
+        comments={[finding]}
+        all={[finding]}
+        label="Comment"
+        composing={false}
+        busy={false}
+        onSubmit={vi.fn()}
+        onCancel={vi.fn()}
+        onResolve={vi.fn()}
+        onReopen={vi.fn()}
+        onFindingDisposition={onDisposition}
+        onFindingRequestChange={onRequestChange}
+        onFindingFix={onFix}
+        onFindingAsk={onAsk}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Request change" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Dismiss" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Fix" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Ask" })).toBeTruthy();
+    expect(screen.queryByText("confidence 87%")).toBeNull();
+
+    await userEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+    expect(screen.getByRole("group", { name: "Dismiss finding reason" })).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: "Accepted risk" }));
+    expect(onDisposition).toHaveBeenCalledWith(finding.id, "dismissed", "accepted_risk");
+
+    await userEvent.click(screen.getByText("Run details"));
+    expect(screen.getByText("Internal confidence: 87%")).toBeTruthy();
   });
 
-  it("names the rung on a heuristic re-find, in words rather than a code", () => {
+  it("never calls an AI finding a human Review judgment", () => {
+    const finding = annotation({
+      source: "ai_review",
+      created_by: "LemonCrow AI Review",
+      created_by_actor: "agent",
+      finding_disposition: "confirmed_by_reviewer",
+      state: "open",
+    });
+    mount([finding]);
+    expect(screen.getByText("Confirmed")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Resolve" })).toBeNull();
+  });
+
+  it("does not show anchor provenance when the file is unchanged", () => {
+    mount([annotation()]);
+    expect(screen.queryByText(/file unchanged since the comment/)).toBeNull();
+    expect(screen.queryByText(/Re-anchored/)).toBeNull();
+  });
+
+  it("shows provenance only when a comment had to be re-anchored", () => {
     mount([
       annotation({
         anchor_method: "unique_text",
@@ -231,22 +340,12 @@ describe("AnnotationCard", () => {
         anchor_detail: "selected text occurs exactly once",
       }),
     ]);
-    const chip = screen.getByText(/anchor: re-found by its text alone/);
+    const chip = screen.getByText(/Re-anchored · re-found by its text alone/);
     expect(chip).toBeTruthy();
     // Never the identifier.
     expect(screen.queryByText(/unique_text/)).toBeNull();
-    // The full sentence stays reachable without spending a line on it.
+    // The full explanation stays reachable without spending another line on it.
     expect(chip.getAttribute("title")).toBe("selected text occurs exactly once");
-  });
-
-  it("gives the re-find a different weight from the untouched file", () => {
-    const { container: exact } = mount([annotation()]);
-    const { container: heuristic } = mount([
-      annotation({ anchor_method: "unique_text", anchor_method_label: "re-found by its text alone", anchor_exact: false }),
-    ]);
-    const className = (root: HTMLElement) =>
-      root.querySelector("[title]")?.getAttribute("class") ?? "";
-    expect(className(exact)).not.toBe(className(heuristic));
   });
 
   it("shows the definition the server re-derived, not the one it was written against", () => {
@@ -274,7 +373,7 @@ describe("AnnotationCard", () => {
     expect(screen.queryByRole("button", { name: "Reply" })).toBeNull();
   });
 
-  it("labels AI hypotheses and exposes evidence only as evidence", () => {
+  it("labels AI hypotheses, exposes evidence, and keeps raw confidence under Run details", async () => {
     mount([
       annotation({
         source: "ai_review",
@@ -287,8 +386,10 @@ describe("AnnotationCard", () => {
       }),
     ]);
     expect(screen.getByText("AI REVIEW")).toBeTruthy();
-    expect(screen.getByText(/confidence 72%/)).toBeTruthy();
+    expect(screen.queryByText(/confidence 72%/i)).toBeNull();
     expect(screen.getByText(/evidence · 1/)).toBeTruthy();
+    await userEvent.click(screen.getByText("Run details"));
+    expect(screen.getByText("Internal confidence: 72%")).toBeTruthy();
   });
 
   it("shows an author-addressed claim without resolving the human comment", () => {
@@ -371,6 +472,48 @@ describe("OrphanedComments", () => {
     render(<OrphanedComments comments={[orphan({ file_level: true, start_line: 0, end_line: 0 })]} />);
     expect(screen.getByText("file")).toBeTruthy();
     expect(screen.queryByText(/^L0$/)).toBeNull();
+  });
+
+  it("resolves and reopens an orphan while it stays listed as not anchored", async () => {
+    const onSetState = vi.fn();
+    const { rerender } = render(<OrphanedComments comments={[orphan({ state: "open" })]} onSetState={onSetState} />);
+    expect(screen.getByText("not anchored")).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: "Resolve" }));
+    expect(onSetState).toHaveBeenCalledWith("ann-1", "resolved");
+    rerender(<OrphanedComments comments={[orphan({ state: "resolved" })]} onSetState={onSetState} />);
+    expect(screen.getByText("not anchored")).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: "Reopen" }));
+    expect(onSetState).toHaveBeenLastCalledWith("ann-1", "open");
+  });
+
+  it("shows no state action without a handler", () => {
+    render(<OrphanedComments comments={[orphan()]} />);
+    expect(screen.queryByRole("button", { name: /Resolve|Reopen/ })).toBeNull();
+  });
+
+  it("folds a below-threshold finding behind one disclosure, its replies with it", async () => {
+    const shown = annotation({ id: "shown", body: "Surfaced finding", source: "ai_review" });
+    const hidden = annotation({ id: "hidden", body: "Low finding", source: "ai_review", below_threshold: true });
+    const reply = annotation({ id: "reply", parent_id: "hidden", body: "Agreed, minor" });
+    render(
+      <AnnotationCard
+        comments={[shown, hidden]}
+        all={[shown, hidden, reply]}
+        label="Comment"
+        composing={false}
+        busy={false}
+        onSubmit={vi.fn()}
+        onCancel={vi.fn()}
+        onResolve={vi.fn()}
+        onReopen={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("Surfaced finding")).toBeVisible();
+    expect(screen.getByText("Low finding")).not.toBeVisible();
+    expect(screen.getByText("Agreed, minor")).not.toBeVisible();
+    await userEvent.click(screen.getByText("1 below threshold"));
+    expect(screen.getByText("Low finding")).toBeVisible();
+    expect(screen.getByText("Agreed, minor")).toBeVisible();
   });
 
   it("agrees in number with the comments it lists", () => {

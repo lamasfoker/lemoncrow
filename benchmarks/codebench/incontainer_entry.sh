@@ -78,6 +78,10 @@ HOST="${CODEBENCH_HOST:-claude}"
 if [ "$DRIVER" = "claude" ]; then
   export CLAUDE_CONFIG_DIR=/tmp/codebench-claude-config
   mkdir -p "$CLAUDE_CONFIG_DIR"
+  if [ -f /mnt/claude-credentials.json ]; then
+    cp /mnt/claude-credentials.json "$CLAUDE_CONFIG_DIR/.credentials.json"
+    chmod 600 "$CLAUDE_CONFIG_DIR/.credentials.json"
+  fi
   if [ "$ARM" = "lemoncrow" ]; then
     printf '%s' '{"mcpServers":{"lc":{"type":"stdio","command":"lemoncrow","args":["mcp","--host","claude"],"alwaysLoad":true}}}' \
       >"$CLAUDE_CONFIG_DIR/.claude.json"
@@ -203,7 +207,7 @@ if [ "$DRIVER" = "lemoncode" ]; then
     # LemonCrow owns routing, tools, cache and output limits; it starts its own
     # gateway plus the managed LemonCode host (mounted at
     # /root/.lemoncrow/bin/lemoncode-host).
-    (cd "$REPO" && lemoncrow code --engine lemoncode --project-root "$REPO" --model "zen/$LC_MODEL" --optimization-mode enforce -p "$prompt") 2>&1 | tee /tmp/lemoncode-arm.log
+    (cd "$REPO" && LEMONCROW_INTERNAL_PRIVATE_RUNTIME=1 lemoncrow code --internal-private --engine lemoncode --project-root "$REPO" --model "zen/$LC_MODEL" --optimization-mode enforce -p "$prompt") 2>&1 | tee /tmp/lemoncode-arm.log
   else
     # Unmodified upstream OpenCode against Zen's keyless public tier.
     export OPENCODE_DISABLE_AUTOUPDATE=true

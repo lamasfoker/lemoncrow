@@ -21,12 +21,13 @@ required behaviours, and one boolean could not tell them apart.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Final
 
 from .manifest import ManifestEntry
-from .protocol import HEADER_REVISION, HEADER_SESSION, HEADER_VIEW
+from .protocol import HEADER_REVISION, HEADER_SESSION, HEADER_VIEW, ReviewManifest
 from .recovery import RecoveryEvent, RecoveryKind, RecoveryOutcome
 
 __all__ = ["SessionState"]
@@ -57,6 +58,11 @@ class SessionState:
     online: bool = False
     #: One line, shown to the developer when the server is not usable.
     reason: str = ""
+    #: The protocol version the handshake settled on (N or N-1); empty before it.
+    protocol_version: str = ""
+    #: The server's Review capability manifest, from the handshake or
+    #: ``GET /v1/reviews/manifest``; ``None`` until one of them is read.
+    review_manifest: ReviewManifest | None = None
 
     # -- server-declared limits, defaulted to this build's expectations ---- #
     content_size_cap: int = _MIB
@@ -83,6 +89,17 @@ class SessionState:
     #: Bounded, process-local recovery facts. No request/source payloads live
     #: here; this is only the automatic decision/outcome trail.
     recovery_events: list[RecoveryEvent] = field(default_factory=list)
+    #: Incremented each time the session is re-bound after a server restart.
+    generation: int = 0
+
+    def state_token(self) -> str:
+        """Opaque snapshot of what this client is bound to (RuntimeStateToken).
+
+        Comparing two tokens tells recovery whether a reconnect landed on the
+        same session/view/revision; nothing outside this client parses it.
+        """
+        raw = f"{self.session_id}|{self.view_id}|{self.view_revision}|{self.generation}"
+        return "st1." + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
     def record_recovery(
         self,
@@ -114,6 +131,11 @@ class SessionState:
     def next_seq(self) -> int:
         self.client_seq += 1
         return self.client_seq
+
+    @property
+    def server_digest_cache_capacity(self) -> int:
+        """Maximum acknowledged digests retained by this process."""
+        return _SERVER_DIGEST_CACHE_ENTRIES
 
     def remember_server_digests(self, digests: Any) -> None:
         for raw in digests:

@@ -74,9 +74,8 @@ def test_run_command_dedupes_repeated_output() -> None:
 # ── test-runner detection ───────────────────────────────────────────────
 
 
-@pytest.mark.parametrize(
-    "command",
-    [
+def test_test_cmd_re_matches_mainstream_runners() -> None:
+    for command in [
         "npx jest src/",
         "vitest run",
         "cargo test --workspace",
@@ -94,18 +93,13 @@ def test_run_command_dedupes_repeated_output() -> None:
         "mix test",
         "dotnet test",
         "ctest --output-on-failure",
-    ],
-)
-def test_test_cmd_re_matches_mainstream_runners(command: str) -> None:
-    assert TEST_CMD_RE.search(command)
+    ]:
+        assert TEST_CMD_RE.search(command)
 
 
-@pytest.mark.parametrize(
-    "command",
-    ["go build ./...", "npm install", "cargo build", "gofmt -l .", "make lint"],
-)
-def test_test_cmd_re_ignores_non_test_commands(command: str) -> None:
-    assert not TEST_CMD_RE.search(command)
+def test_test_cmd_re_ignores_non_test_commands() -> None:
+    for command in ["go build ./...", "npm install", "cargo build", "gofmt -l .", "make lint"]:
+        assert not TEST_CMD_RE.search(command)
 
 
 def test_extract_go_test_failure_keeps_fail_block() -> None:
@@ -164,26 +158,22 @@ def test_extract_cargo_failure_cuts_at_failures_section() -> None:
 # ── upstream flag injection ──────────────────────────────────────────────
 
 
-@pytest.mark.parametrize(
-    ("command", "expected"),
-    [
+def test_inject_stable_flags_appends() -> None:
+    for command, expected in [
         ("git status", "git status --porcelain=v1 -b"),
         ("cd /tmp/repo && git status", "cd /tmp/repo && git status --porcelain=v1 -b"),
         ("git log", "git log --oneline -n 50"),
         ("pytest tests/", "pytest tests/ -q --tb=short"),
         ("uv run pytest tests/foo.py -x", "uv run pytest tests/foo.py -x -q --tb=short"),
         ("python -m pytest tests/", "python -m pytest tests/ -q --tb=short"),
-    ],
-)
-def test_inject_stable_flags_appends(command: str, expected: str) -> None:
-    exec_command, note = inject_stable_flags(command)
-    assert exec_command == expected
-    assert expected in note
+    ]:
+        exec_command, note = inject_stable_flags(command)
+        assert exec_command == expected
+        assert expected in note
 
 
-@pytest.mark.parametrize(
-    "command",
-    [
+def test_inject_stable_flags_leaves_alone() -> None:
+    for command in [
         "git status -s",
         "git status --porcelain",
         "git log -p",
@@ -196,10 +186,8 @@ def test_inject_stable_flags_appends(command: str, expected: str) -> None:
         "pytest tests/ | tee out.log",
         "git status && git diff",
         "echo pytest",
-    ],
-)
-def test_inject_stable_flags_leaves_alone(command: str) -> None:
-    assert inject_stable_flags(command) == (command, "")
+    ]:
+        assert inject_stable_flags(command) == (command, "")
 
 
 def test_inject_stable_flags_kill_switch(monkeypatch: pytest.MonkeyPatch) -> None:

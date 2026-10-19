@@ -3,10 +3,9 @@
 The execution matrix decides *where* a tool runs; this package is the *here*
 side of it. Two rules shape every module in it:
 
-**Nothing in this package reaches the network.** Only
-:mod:`lemoncrow_client.transport` does. A local tool that wanted to fetch
-something would be a second egress path, and the audit test exists to catch
-exactly that.
+Product traffic goes through :mod:`lemoncrow_client.transport`.
+The explicit ``web_fetch`` executor uses :mod:`lemoncrow_client.webtransport`
+for public pages, without product credentials or server dependencies.
 
 **Nothing here downloads or installs a program.** A tool whose implementation
 is an external binary -- ``ast-grep`` for :mod:`.astgrep`, ``git`` for
@@ -26,16 +25,17 @@ absent from this package; the host gets exactly one LemonCrow stdio process.
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
-from ..config import ClientConfig
 from ..errors import AgentAction, ClientError, ErrorCode
 from ..kit.output_delta import RunHistory
 
 __all__ = [
+    "LocalConfig",
     "LocalContext",
     "LocalResult",
     "SessionMemory",
@@ -45,6 +45,13 @@ __all__ = [
     "remap_aliases",
     "text_result",
 ]
+
+
+class LocalConfig(Protocol):
+    """The tiny configuration surface local tools actually need."""
+
+    @property
+    def runtime_state_dir(self) -> Path: ...
 
 
 class SyncTarget(Protocol):
@@ -94,13 +101,22 @@ class SessionMemory:
     created_files: set[str] = field(default_factory=set)
     #: Output digests behind ``bash``'s ``unchanged`` rerun marker.
     command_runs: RunHistory = field(default_factory=RunHistory)
+    #: ``bash bg=true`` runs by id. They belong to this session: closing it (or
+    #: the process exiting) kills them, so nothing outlives the client.
+    background: dict[str, Any] = field(default_factory=dict)
+    #: Finished ``bg=true`` runs a poll already drained: id -> final state line.
+    retired_background: dict[str, str] = field(default_factory=dict)
+    background_lock: threading.Lock = field(default_factory=threading.Lock)
+    # Session-owned cache: five-minute TTL, 16 pages / 32 MB; PDFs excluded.
+    web_fetch_cache: dict[tuple[str, str], tuple[float, Any]] = field(default_factory=dict)
+    web_fetch_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 @dataclass(frozen=True, slots=True)
 class LocalContext:
     """Everything a local executor is allowed to see."""
 
-    config: ClientConfig
+    config: LocalConfig
     repo_root: Path
     sync: SyncTarget | None = None
     environment: Mapping[str, str] = field(default_factory=dict)
@@ -188,10 +204,11 @@ Executor = Callable[[LocalContext, Mapping[str, Any]], LocalResult]
 
 
 def _build() -> Mapping[str, Executor]:
-    from . import astgrep, editing, indexing, search, shell, sqltool, vcs
+    from . import astgrep, editing, indexing, search, shell, sqltool, vcs, web
 
     return {
         "bash": shell.run_bash,
+        "web_fetch": web.run_web_fetch,
         "edit": editing.run_edit,
         "grep": search.run_grep,
         "read_from_disk": search.read_from_disk,

@@ -133,6 +133,19 @@ describe("markers", () => {
     expect(marker).toEqual({ side: "additions", lineNumber: 10, metadata: { key: "additions:10" } });
   });
 
+  it("draws no marker for a finding below the finding threshold", () => {
+    const hidden = annotation({ id: "hidden", source: "ai_review", below_threshold: true });
+    expect(markerLines([hidden], "src/app.py", null)).toEqual([]);
+    // A surfaced comment on the same line keeps its marker; the card still lists both.
+    const shown = annotation({ id: "shown" });
+    expect(markerLines([hidden, shown], "src/app.py", null)).toHaveLength(1);
+    expect(commentsAt([hidden, shown], "src/app.py", "additions:10")).toHaveLength(2);
+    // Crossing the threshold changes the rendered markers, so the signature moves.
+    expect(markerSignature([hidden], "src/app.py", null)).not.toBe(
+      markerSignature([{ ...hidden, below_threshold: false }], "src/app.py", null),
+    );
+  });
+
   it("collapses two comments on one line into a single marker", () => {
     const markers = markerLines([annotation({ id: "a" }), annotation({ id: "b" })], "src/app.py", null);
     expect(markers).toHaveLength(1);
@@ -167,6 +180,23 @@ describe("markers", () => {
     ]);
     expect(commentsAt([ranged], "src/app.py", "additions:5")).toHaveLength(1);
     expect(commentsAt([ranged], "src/app.py", "additions:3")).toHaveLength(0);
+  });
+
+  it("draws a range whose last line the viewer hides under a line of that range it renders, keeping its own key", () => {
+    // The viewer renders lines 1-15 only.
+    const rendered = (_side: string, startLine: number, endLine: number) => (startLine <= 15 ? Math.min(endLine, 15) : 0);
+    const block = annotation({ id: "block", start_line: 4, end_line: 19 });
+    const tail = annotation({ id: "tail", start_line: 17, end_line: 19 });
+    expect(markerLines([block], "src/app.py", null, rendered)).toEqual([
+      { side: "additions", lineNumber: 15, metadata: { key: "additions:19" } },
+    ]);
+    // A card shared with a range that renders nothing never leaves that range.
+    expect(markerLines([block, tail], "src/app.py", null, rendered)).toEqual([
+      { side: "additions", lineNumber: 19, metadata: { key: "additions:19" } },
+    ]);
+    expect(markerLines([], "src/app.py", { path: "src/app.py", startLine: 4, endLine: 19, side: "additions" }, rendered)).toEqual([
+      { side: "additions", lineNumber: 15, metadata: { key: "additions:19" } },
+    ]);
   });
 
   it("does not add a second marker when the draft lands on an existing comment", () => {

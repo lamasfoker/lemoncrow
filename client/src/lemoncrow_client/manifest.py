@@ -35,13 +35,15 @@ import hashlib
 import os
 import re
 import stat
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
-from .config import LOCAL_FS_PROOF_PATH
-from .walkcache import WalkCache, WalkCacheStats
+from .workspace_paths import LOCAL_FS_PROOF_PATH, REVIEW_CONFIG_PATH
+
+if TYPE_CHECKING:
+    from .walkcache import WalkCache
 
 __all__ = [
     "DEFAULT_PARSER_PROFILE",
@@ -50,12 +52,14 @@ __all__ = [
     "GitIgnore",
     "ManifestChunk",
     "ManifestEntry",
+    "WalkCacheStats",
     "WalkResult",
     "WalkedFile",
     "canonical_rows",
     "chunk_manifest",
     "manifest_root",
     "profile_for_path",
+    "restore_cached_worktree",
     "sha256_hex",
     "walk_worktree",
 ]
@@ -68,23 +72,31 @@ DEFAULT_PARSER_PROFILE: Final[str] = "lexical-1"
 
 _ROW_SEPARATOR: Final[str] = "\x00"
 _DEFAULT_CHUNK_ROWS: Final[int] = 2_000
-_NEVER_WALK: Final[frozenset[str]] = frozenset({".git", ".lc-worktrees", ".lemoncrow"})
+_NEVER_WALK: Final[frozenset[str]] = frozenset({".git", ".claude", ".lc-worktrees", ".lemoncrow"})
 
 #: Extension to parser profile. A *hint*: the server derives Layer 1 under
 #: whatever profile the manifest row declares, because two repositories can
 #: legitimately read the same bytes as different languages. Mirrors the
 #: server's ``index.analysis.profile_for_path``.
 _PROFILE_BY_EXTENSION: Final[dict[str, str]] = {
-    ".py": "python-1",
-    ".pyi": "python-1",
-    ".ts": "typescript-1",
-    ".tsx": "typescript-1",
-    ".js": "typescript-1",
-    ".jsx": "typescript-1",
-    ".mjs": "typescript-1",
-    ".cjs": "typescript-1",
-    ".go": "go-1",
-    ".rs": "rust-1",
+    ".py": "python-3",
+    ".pyi": "python-3",
+    ".ts": "typescript-3",
+    ".tsx": "typescript-3",
+    ".js": "typescript-3",
+    ".jsx": "typescript-3",
+    ".mjs": "typescript-3",
+    ".cjs": "typescript-3",
+    ".go": "go-3",
+    ".rs": "rust-3",
+    ".c": "c-3",
+    ".h": "c-3",
+    ".cc": "cpp-3",
+    ".cpp": "cpp-3",
+    ".cxx": "cpp-3",
+    ".hpp": "cpp-3",
+    ".hh": "cpp-3",
+    ".hxx": "cpp-3",
 }
 
 
@@ -121,26 +133,35 @@ class ManifestEntry:
         }
 
 
-def canonical_rows(entries: Iterable[ManifestEntry]) -> tuple[str, ...]:
-    """Normalized, sorted, deduplicated rows. One row per path."""
+def _canonical_entries(entries: Iterable[ManifestEntry]) -> tuple[ManifestEntry, ...]:
+    """Canonical path order, preserving the public last-duplicate-wins rule."""
+    materialized = entries if isinstance(entries, tuple) else tuple(entries)
+    if all(materialized[index - 1].path < materialized[index].path for index in range(1, len(materialized))):
+        return materialized
     by_path: dict[str, ManifestEntry] = {}
-    for entry in entries:
+    for entry in materialized:
         by_path[entry.path] = entry
-    return tuple(
-        _ROW_SEPARATOR.join(
-            (
-                entry.path,
-                entry.content_digest,
-                entry.parser_profile,
-                format(entry.mode, "o"),
-                str(entry.size),
-            )
+    return tuple(by_path[path] for path in sorted(by_path))
+
+
+def _canonical_row(entry: ManifestEntry) -> str:
+    return _ROW_SEPARATOR.join(
+        (
+            entry.path,
+            entry.content_digest,
+            entry.parser_profile,
+            format(entry.mode, "o"),
+            str(entry.size),
         )
-        for _path, entry in sorted(by_path.items())
     )
 
 
-def _digest_rows(rows: Sequence[str]) -> str:
+def canonical_rows(entries: Iterable[ManifestEntry]) -> tuple[str, ...]:
+    """Normalized, sorted, deduplicated rows. One row per path."""
+    return tuple(_canonical_row(entry) for entry in _canonical_entries(entries))
+
+
+def _digest_rows(rows: Iterable[str]) -> str:
     hasher = hashlib.sha256()
     hasher.update(MANIFEST_FORMAT.encode("utf-8"))
     hasher.update(b"\n")
@@ -152,7 +173,7 @@ def _digest_rows(rows: Sequence[str]) -> str:
 
 def manifest_root(entries: Iterable[ManifestEntry]) -> str:
     """The canonical root digest over a complete manifest."""
-    return _digest_rows(canonical_rows(entries))
+    return _digest_rows(_canonical_row(entry) for entry in _canonical_entries(entries))
 
 
 #: A view that legitimately contains no files still has a verifiable root.
@@ -173,14 +194,18 @@ def chunk_manifest(
     """Split a manifest into content-identified chunks, in canonical order."""
     if max_rows < 1:
         raise ValueError("max_rows must be >= 1")
-    by_path = {entry.path: entry for entry in entries}
-    ordered = [by_path[path] for path in sorted(by_path)]
+    ordered = _canonical_entries(entries)
     if not ordered:
         return (ManifestChunk(chunk_id=_digest_rows(()), entries=()),)
     chunks: list[ManifestChunk] = []
     for start in range(0, len(ordered), max_rows):
-        piece = tuple(ordered[start : start + max_rows])
-        chunks.append(ManifestChunk(chunk_id=_digest_rows(canonical_rows(piece)), entries=piece))
+        piece = ordered[start : start + max_rows]
+        chunks.append(
+            ManifestChunk(
+                chunk_id=_digest_rows(_canonical_row(entry) for entry in piece),
+                entries=piece,
+            )
+        )
     return tuple(chunks)
 
 
@@ -329,25 +354,31 @@ class _IgnoreStack:
 
 
 @dataclass(frozen=True, slots=True)
-class WalkedFile:
-    """One file the walk produced."""
+class WalkCacheStats:
+    """Where one walk's digests came from."""
 
-    path: str
-    content_digest: str
-    size: int
-    mode: int
-    parser_profile: str
+    reused_by_path: int = 0
+    reused_by_blob: int = 0
+    hashed: int = 0
+
+    @property
+    def total(self) -> int:
+        return self.reused_by_path + self.reused_by_blob + self.hashed
+
+    @property
+    def reused(self) -> int:
+        return self.reused_by_path + self.reused_by_blob
+
+
+@dataclass(frozen=True, slots=True)
+class WalkedFile(ManifestEntry):
+    """One manifest row plus whether its bytes may be uploaded."""
+
     #: ``False`` when the file is over the size cap: manifested, not uploaded.
     uploadable: bool
 
     def entry(self) -> ManifestEntry:
-        return ManifestEntry(
-            path=self.path,
-            content_digest=self.content_digest,
-            parser_profile=self.parser_profile,
-            mode=self.mode,
-            size=self.size,
-        )
+        return self
 
 
 @dataclass(frozen=True, slots=True)
@@ -364,7 +395,10 @@ class WalkResult:
     digests: WalkCacheStats = field(default_factory=WalkCacheStats)
 
     def entries(self) -> tuple[ManifestEntry, ...]:
-        return tuple(walked.entry() for walked in self.files)
+        # WalkedFile is a ManifestEntry with one extra uploadability bit. Reuse
+        # the same immutable objects instead of allocating a second manifest
+        # object for every path on each session open.
+        return self.files
 
     def root(self) -> str:
         return manifest_root(self.entries())
@@ -374,6 +408,75 @@ class WalkResult:
         for walked in self.files:
             if walked.uploadable:
                 yield walked
+
+
+def restore_cached_worktree(
+    cache: WalkCache,
+    *,
+    workspace_fingerprint: str,
+    size_cap: int,
+    max_files: int = 200_000,
+) -> WalkResult | None:
+    """Restore canonical rows after an exact persisted workspace proof.
+
+    The persisted path cache already carries the digest and the stat identity
+    from the successful walk that produced it. A matching Git workspace
+    fingerprint proves the logical source state is unchanged, so re-running a
+    Python scandir/lstat over tens of thousands of paths would add no evidence.
+    Any malformed row declines atomically to :func:`walk_worktree`.
+    """
+    cached = cache.reuse_proven_paths(workspace_fingerprint)
+    if cached is None or len(cached) > max_files:
+        return None
+    files: list[WalkedFile] = []
+    oversize = 0
+    sorted_paths = True
+    previous_path = ""
+    for path, (identity, digest) in cached.items():
+        if previous_path and path <= previous_path:
+            sorted_paths = False
+        previous_path = path
+        fields = identity.split(" ")
+        if (
+            not path
+            or path.startswith("/")
+            or "\x00" in path
+            or "\n" in path
+            or ".." in path.split("/")
+            or len(fields) != 6
+            or len(digest) != 64
+        ):
+            return None
+        try:
+            int(digest, 16)
+            size = int(fields[0])
+            raw_mode = int(fields[5])
+        except ValueError:
+            return None
+        if size < 0 or not stat.S_ISREG(raw_mode):
+            return None
+        uploadable = size <= size_cap
+        oversize += int(not uploadable)
+        files.append(
+            WalkedFile(
+                path=path,
+                content_digest=digest,
+                size=size,
+                mode=_mode_of(raw_mode),
+                parser_profile=profile_for_path(path),
+                uploadable=uploadable,
+            )
+        )
+    if not sorted_paths:
+        files.sort(key=lambda walked: walked.path)
+    return WalkResult(
+        files=tuple(files),
+        ignored=0,
+        symlinks=0,
+        oversize=oversize,
+        unreadable=0,
+        digests=cache.stats,
+    )
 
 
 @dataclass
@@ -455,6 +558,15 @@ def _descend(
             if name in _NEVER_WALK or child_relative == LOCAL_FS_PROOF_PATH:
                 if child_relative == LOCAL_FS_PROOF_PATH:
                     counters.ignored += 1
+                elif child_relative == REVIEW_CONFIG_PATH.split("/", 1)[0] and _walk_review_config(
+                    child,
+                    counters,
+                    size_cap=size_cap,
+                    max_files=max_files,
+                    read_limit=read_limit,
+                    cache=cache,
+                ):
+                    return True
                 continue
             if child.is_symlink():
                 counters.symlinks += 1
@@ -468,6 +580,15 @@ def _descend(
                 counters.ignored += 1
                 continue
             if is_dir:
+                # A nested Git checkout (submodule, linked worktree, or independent
+                # repository) is a repository boundary, not a directory in this
+                # View. Descending into it turns every file behind a gitlink into a
+                # bogus parent-repository overlay and makes warm sync proportional
+                # to the nested repository size.
+                nested_git = Path(child.path) / ".git"
+                if nested_git.exists() or nested_git.is_symlink():
+                    counters.ignored += 1
+                    continue
                 if _descend(
                     Path(child.path),
                     child_relative,
@@ -512,6 +633,43 @@ def _descend(
     finally:
         if pushed:
             stack.pop()
+
+
+def _walk_review_config(
+    state_dir: os.DirEntry[str],
+    counters: _Counters,
+    *,
+    size_cap: int,
+    max_files: int,
+    read_limit: int,
+    cache: WalkCache | None,
+) -> bool:
+    """Walk the one committed file under ``.lemoncrow/``; True when the file cap is hit.
+
+    Ignore rules deliberately do not apply: a repository commonly ignores
+    ``.lemoncrow/`` and force-adds its Review config, and local Review reads that
+    file from disk either way. Symlinks stay outside the View, as everywhere.
+    """
+
+    try:
+        if not state_dir.is_dir(follow_symlinks=False):
+            return False
+        path = os.path.join(state_dir.path, REVIEW_CONFIG_PATH.split("/", 1)[1])
+        info = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return False
+    if not stat.S_ISREG(info.st_mode):
+        return False
+    if len(counters.files) >= max_files:
+        return True
+    walked = _walk_file(path, REVIEW_CONFIG_PATH, info, counters, size_cap=size_cap, read_limit=read_limit, cache=cache)
+    if walked is None:
+        counters.unreadable += 1
+        return False
+    if not walked.uploadable:
+        counters.oversize += 1
+    counters.files.append(walked)
+    return False
 
 
 def _walk_file(

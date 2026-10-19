@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
 from contextlib import AbstractContextManager
 from pathlib import Path
@@ -34,7 +35,7 @@ class RunFileLock(AbstractContextManager["RunFileLock"]):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         handle = self.path.open("a+b")
         self._handle = handle
-        if os.name == "nt":
+        if sys.platform == "win32":
             import msvcrt
 
             handle.seek(0, os.SEEK_END)
@@ -42,8 +43,7 @@ class RunFileLock(AbstractContextManager["RunFileLock"]):
                 handle.write(b"\0")
                 handle.flush()
             handle.seek(0)
-            locking = getattr(msvcrt, "locking")
-            locking(handle.fileno(), getattr(msvcrt, "LK_LOCK"), 1)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
         else:
             import fcntl
 
@@ -61,12 +61,11 @@ class RunFileLock(AbstractContextManager["RunFileLock"]):
         if handle is None:
             return
         try:
-            if os.name == "nt":
+            if sys.platform == "win32":
                 import msvcrt
 
                 handle.seek(0)
-                locking = getattr(msvcrt, "locking")
-                locking(handle.fileno(), getattr(msvcrt, "LK_UNLCK"), 1)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
             else:
                 import fcntl
 

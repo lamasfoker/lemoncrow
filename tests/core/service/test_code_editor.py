@@ -23,12 +23,21 @@ def test_editor_capability_prefers_explicit_allowlisted_editor(
     assert capability["available"] is True
     assert capability["preferred"] == {"id": "vscode", "label": "VS Code"}
     assert capability["editors"] == [
-        {"id": "cursor", "label": "Cursor"},
         {"id": "vscode", "label": "VS Code"},
+        {"id": "cursor", "label": "Cursor"},
     ]
 
 
-def test_open_in_editor_uses_fixed_argv_and_exact_location(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_editor_capability_defaults_to_vscode(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("LEMONCROW_CODE_EDITOR", raising=False)
+    monkeypatch.delenv("VISUAL", raising=False)
+    monkeypatch.delenv("EDITOR", raising=False)
+    monkeypatch.setattr(code_editor.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    assert code_editor.editor_capability()["preferred"] == {"id": "vscode", "label": "VS Code"}
+
+
+def test_open_in_editor_opens_project_and_exact_location(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("LEMONCROW_CODE_EDITOR", "cursor")
     monkeypatch.setattr(code_editor.shutil, "which", lambda name: f"/usr/bin/{name}")
     captured: dict[str, object] = {}
@@ -48,7 +57,7 @@ def test_open_in_editor_uses_fixed_argv_and_exact_location(monkeypatch: pytest.M
 
     result = code_editor.open_in_editor(path, line=12, column=3, repo_root=tmp_path)
 
-    assert captured["args"] == ["/usr/bin/cursor", "--goto", f"{path}:12:3"]
+    assert captured["args"] == ["/usr/bin/cursor", str(tmp_path), "--goto", f"{path}:12:3"]
     assert captured["kwargs"]["cwd"] == str(tmp_path)
     assert result == {
         "opened": True,
@@ -58,3 +67,6 @@ def test_open_in_editor_uses_fixed_argv_and_exact_location(monkeypatch: pytest.M
         "column": 3,
         "pid": 4242,
     }
+
+    code_editor.open_in_editor(path, line=2, repo_root=tmp_path, editor_id="vscode")
+    assert captured["args"] == ["/usr/bin/code", str(tmp_path), "--goto", f"{path}:2:1"]

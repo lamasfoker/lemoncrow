@@ -6,6 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pygit2
+
 ROOT = Path(__file__).resolve().parents[2]
 HOOK = ROOT / "integrations" / "claude" / "plugin" / "hooks" / "user_prompt.py"
 
@@ -40,6 +42,61 @@ def test_user_prompt_hook_persists_last_user_prompt(tmp_path: Path) -> None:
     session_state = workspace.resolve() / ".lemoncrow" / "workspace" / "session_state.json"
     data = json.loads(session_state.read_text(encoding="utf-8"))
     assert data["last_user_prompt"] == "fix the auth flow"
+
+
+def test_user_prompt_hook_rearms_live_review_watcher_after_lease_expiry(tmp_path: Path) -> None:
+    from lemoncrow.pro.capabilities.review import live_runtime
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    repo = pygit2.init_repository(str(workspace), initial_head="main")
+    repo.config["user.name"] = "Fixture Tester"
+    repo.config["user.email"] = "fixture@example.com"
+    (workspace / "app.py").write_text("def value():\n    return 1\n", encoding="utf-8")
+    repo.index.add_all()
+    repo.index.write()
+    tree = repo.index.write_tree()
+    sig = pygit2.Signature("Fixture Tester", "fixture@example.com", 1700000000, 0)
+    repo.create_commit("HEAD", sig, sig, "base", tree, [])
+    (workspace / "app.py").write_text("def value():\n    return 2\n", encoding="utf-8")
+
+    lemoncrow_root = tmp_path / ".lemoncrow"
+    env = os.environ.copy()
+    env.update(
+        {
+            "LEMONCROW_ROOT": str(lemoncrow_root),
+            "LEMONCROW_STORE_ROOT": str(lemoncrow_root),
+            "CLAUDE_WORKSPACE_ROOT": str(workspace),
+            "LEMONCROW_LIVE_REVIEW_REARM_MS": "5000",
+            "LEMONCROW_LIVE_REVIEW_PREPARE_CMD": "/bin/true",
+        }
+    )
+    base = {
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "claude-rearm",
+        "cwd": str(workspace),
+        "transcript_path": str(tmp_path / "transcript.jsonl"),
+    }
+
+    def invoke(prompt: str, now_ms: int) -> str:
+        subprocess.run(
+            [sys.executable, str(HOOK)],
+            input=json.dumps({**base, "prompt": prompt, "now_ms": now_ms}),
+            text=True,
+            capture_output=True,
+            check=True,
+            env=env,
+        )
+        request = live_runtime._read_request(lemoncrow_root, workspace)
+        assert request is not None
+        return request.request_id
+
+    first = invoke("inspect", 10_000)
+    second = invoke("continue", 14_999)
+    third = invoke("continue after lease", 15_000)
+
+    assert second == first
+    assert third != first
 
 
 def test_user_prompt_hook_bumps_session_turns_for_real_prompts(tmp_path: Path) -> None:
@@ -169,3 +226,63 @@ def test_user_prompt_hook_ignores_noop_continuation_for_turns(tmp_path: Path) ->
 
     stats_path = session_dir(lemoncrow_root, "claude", session_id) / "stats.json"
     assert not stats_path.exists()
+
+
+def _load_user_prompt_hook():  # type: ignore[no-untyped-def]
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("lemoncrow_user_prompt_hook_under_test", HOOK)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _indexed_workspace(tmp_path: Path) -> Path:
+    from lemoncrow.core.foundation.paths import resolve_workspace_store_dir
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    index_db = resolve_workspace_store_dir(workspace_root=workspace.resolve()) / "code_context.sqlite"
+    index_db.parent.mkdir(parents=True, exist_ok=True)
+    index_db.write_bytes(b"")
+    return workspace
+
+
+def test_frontload_reaches_the_engine_only_through_the_provider_seam(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from lemoncrow.core.capabilities import code_intelligence_provider as seam
+
+    workspace = _indexed_workspace(tmp_path)
+    created: list[tuple[str, dict[str, object]]] = []
+
+    class _Provider:
+        def tool_explore(self, prompt: str, **kwargs: object) -> dict[str, object]:
+            return {"files": [{"path": "src/auth.py"}], "query": prompt}
+
+    def _create(repo_root: str, **kwargs: object) -> _Provider:
+        created.append((repo_root, kwargs))
+        return _Provider()
+
+    monkeypatch.setenv("LEMONCROW_FRONTLOAD", "1")
+    monkeypatch.setattr(seam, "create_code_intelligence_provider", _create)
+    hook = _load_user_prompt_hook()
+
+    injected = hook._frontload_context("how does the auth flow work", {"cwd": str(workspace)})
+
+    assert injected is not None and "src/auth.py" in injected
+    assert created == [(str(workspace), {"autosync_enabled": False})]
+
+
+def test_frontload_fails_open_without_the_private_engine(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from lemoncrow.core.capabilities import code_intelligence_provider as seam
+
+    workspace = _indexed_workspace(tmp_path)
+
+    def _missing() -> object:
+        raise seam.ProEngineUnavailable(seam.PRO_ENGINE_UNAVAILABLE_MESSAGE)
+
+    monkeypatch.setenv("LEMONCROW_FRONTLOAD", "1")
+    monkeypatch.setattr(seam, "_private_provider", _missing)
+    hook = _load_user_prompt_hook()
+
+    assert hook._frontload_context("how does the auth flow work", {"cwd": str(workspace)}) is None

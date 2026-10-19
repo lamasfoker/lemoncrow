@@ -12,8 +12,8 @@ from lemoncrow.core.foundation.identity import config_dir
 BANNER_TEXT = (
     "LemonCrow collects anonymous usage telemetry, ON by default: counts and\n"
     "timings only -- never code, prompts, file paths, or symbol names.\n"
-    "Turn it off:    lc telemetry remote off   ·   or DO_NOT_TRACK=1\n"
-    "What it sends:  lc telemetry show        ·   see docs/privacy.md\n"
+    "Turn it off:    lc rt telemetry remote off   ·   or DO_NOT_TRACK=1\n"
+    "What it sends:  lc rt telemetry show        ·   see docs/privacy.md\n"
 )
 
 

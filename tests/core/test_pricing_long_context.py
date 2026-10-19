@@ -1,7 +1,7 @@
 """Long-context pricing matrix: which models bill the full 1M window at standard rates.
 
-Fable 5, Mythos 5, Mythos Preview, Opus 4.8/4.7/4.6, Sonnet 5, and Sonnet 4.6
-include the full 1M-token context window at standard per-token pricing — a
+Fable 5, Mythos 5, Mythos Preview, Opus 4.8/4.7/4.6, Sonnet 5.5/5,
+and Sonnet 4.6 include the full 1M-token context window at standard per-token
 900k-token request bills at the same per-token rate as a 9k one — so their
 pricing entries must never carry >200k premium tiers. Only the pre-4.6 1M-beta
 models (Sonnet 4.5 / Sonnet 4) reprice the whole request at premium rates past
@@ -29,22 +29,22 @@ _FULL_WINDOW_STANDARD: dict[str, tuple[float, float, float, float]] = {
     "claude-opus-4-6": (5.0, 25.0, 0.5, 6.25),
     "claude-opus-5-5": (4.0, 20.0, 0.2, 5.0),
     "claude-sonnet-5": _SONNET_5_RATES,
+    "claude-sonnet-5-5": _SONNET_5_RATES,
     "claude-sonnet-4-6": (3.0, 15.0, 0.3, 3.75),
 }
 
 
-@pytest.mark.parametrize(("model", "rates"), sorted(_FULL_WINDOW_STANDARD.items()))
-def test_full_window_models_have_no_long_context_premium(model: str, rates: tuple[float, float, float, float]) -> None:
-    pricing = get_model_pricing(model)
-    assert pricing is not None and pricing.known, f"{model} missing from pricing table"
-    assert (pricing.input, pricing.output, pricing.cache_read, pricing.cache_write) == rates
-    assert pricing.long_context_threshold() == 0
-    assert pricing.input_tiers == () and pricing.output_tiers == ()
-    assert pricing.cache_read_tiers == () and pricing.cache_write_tiers == ()
-    # A 900k-token request bills at the same per-token rate as a 9k one.
-    assert pricing.request_cost_usd(input_tokens=900_000, long_context=True) == pytest.approx(
-        100 * pricing.request_cost_usd(input_tokens=9_000)
-    )
+def test_full_window_models_have_no_long_context_premium() -> None:
+    for model, rates in sorted(_FULL_WINDOW_STANDARD.items()):
+        pricing = get_model_pricing(model)
+        assert pricing is not None and pricing.known, f"{model} missing from pricing table"
+        assert (pricing.input, pricing.output, pricing.cache_read, pricing.cache_write) == rates
+        assert pricing.long_context_threshold() == 0
+        assert pricing.input_tiers == () and pricing.output_tiers == ()
+        assert pricing.cache_read_tiers == () and pricing.cache_write_tiers == ()
+        assert pricing.request_cost_usd(input_tokens=900000, long_context=True) == pytest.approx(
+            100 * pricing.request_cost_usd(input_tokens=9000)
+        )
 
 
 def test_sonnet_4_5_keeps_200k_whole_request_premium() -> None:
@@ -74,6 +74,21 @@ def test_sonnet_5_keeps_launch_rates_as_standard() -> None:
         pricing.cache_write_1h,
         pricing.thinking,
     ) == (2.0, 10.0, 0.2, 2.5, 4.0, 10.0)
+
+
+def test_sonnet_5_5_uses_the_shipped_full_window_rates() -> None:
+    pricing = get_model_pricing("claude-sonnet-5-5")
+    assert pricing is not None and pricing.known
+    assert (
+        pricing.input,
+        pricing.output,
+        pricing.cache_read,
+        pricing.cache_write,
+        pricing.cache_write_1h,
+        pricing.thinking,
+        pricing.context_window,
+    ) == (2.0, 10.0, 0.2, 2.5, 4.0, 10.0, 1_000_000)
+    assert pricing.long_context_threshold() == 0
 
 
 def test_context_variant_tag_still_prices() -> None:

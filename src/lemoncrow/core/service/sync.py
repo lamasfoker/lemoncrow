@@ -33,11 +33,12 @@ def sync_usage(
     Large session lists are automatically chunked into multiple requests.
     Only successfully acknowledged chunks are marked as synced in the local DB.
     """
-    from lemoncrow.core.service.telemetry.config import remote_enabled
+    from lemoncrow.core.service.telemetry.config import lemoncrow_cloud_enabled
 
-    if not remote_enabled():
-        # User opted out of remote telemetry -- nothing leaves the machine.
-        _logger.debug("sync_usage skipped: remote telemetry disabled")
+    if not lemoncrow_cloud_enabled():
+        # Opted out, or telemetry goes to an enterprise/custom destination --
+        # LemonCrow's own sync endpoint receives nothing.
+        _logger.debug("sync_usage skipped: telemetry destination is not lemoncrow")
         return False
 
     url = os.environ.get("LEMONCROW_SYNC_URL", "https://lemoncrow.beseam.com/api/sync")

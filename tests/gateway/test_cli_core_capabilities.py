@@ -12,7 +12,8 @@ from lemoncrow.gateway.cli import cli
 
 def _invoke(root: Path, *args: str) -> tuple[int, str]:
     runner = CliRunner()
-    res = runner.invoke(cli, ["--root", str(root), *args])
+    argv = ["runtime", *args] if args and args[0] == "init" else list(args)
+    res = runner.invoke(cli, ["--root", str(root), *argv])
     return res.exit_code, res.output
 
 

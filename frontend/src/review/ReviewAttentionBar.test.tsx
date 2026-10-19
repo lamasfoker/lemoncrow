@@ -18,12 +18,16 @@ const progress = {
 const readiness: ReviewReadinessModel = {
   ready: false,
   label: "Not ready · 2",
-  detail: "2 targets need judgment",
+  detail: "2 review areas need judgment",
   blockers: [
-    { id: "unjudged", label: "2 targets need judgment", detail: "Current targets need judgment.", tone: "amber" },
-    { id: "changed", label: "1 target changed", detail: "Previous judgment is stale.", tone: "sky" },
+    { id: "unjudged", label: "2 review areas need judgment", detail: "Current review areas need judgment.", tone: "amber" },
+    { id: "changed", label: "1 review area changed", detail: "Previous judgment is stale.", tone: "sky" },
   ],
   evidenceFacts: [],
+  targetCount: 8,
+  reviewedTargets: 5,
+  changedSinceReview: 1,
+  needsChanges: 0,
   targetPending: 3,
   openComments: 1,
   failedChecks: 0,
@@ -32,6 +36,31 @@ const readiness: ReviewReadinessModel = {
 };
 
 describe("ReviewAttentionBar", () => {
+  it("talks about GitHub, not an author handoff, for a pull request Review", () => {
+    const bar = (github: { unpublished: number; published: number; in_flight: number }, pending = 0) => (
+      <ReviewAttentionBar
+        revisionNumber={1}
+        progress={{ ...progress, changed_since_review: 0, unreviewed: pending }}
+        openCommentCount={5}
+        feedbackStatus={{ open_total: 5, unpublished: 5, published: 0, in_flight: 0, addressed: 0, github }}
+        feedbackDelivery={null}
+        addressedNeedsRereview={0}
+        historical={false}
+        delivery={null}
+        readiness={readiness}
+        onShowComments={vi.fn()}
+        onShowReadiness={vi.fn()}
+      />
+    );
+    const { rerender } = render(bar({ unpublished: 5, published: 0, in_flight: 0 }, 2));
+    expect(screen.getByText("2 areas left · 5 comments not on GitHub yet.")).toBeTruthy();
+    expect(screen.queryByText(/send to author/)).toBeNull();
+
+    rerender(bar({ unpublished: 0, published: 5, in_flight: 0 }));
+    expect(screen.getByText("Published to GitHub")).toBeTruthy();
+    expect(screen.getByText(/5 comments on the pull request/)).toBeTruthy();
+  });
+
   it("shows ambiguous delivery as pending rather than implying it was sent", () => {
     render(
       <ReviewAttentionBar
@@ -90,6 +119,71 @@ describe("ReviewAttentionBar", () => {
     expect(screen.queryByText("Ready to finish")).toBeNull();
   });
 
+
+  it("does not flash a blocker count while landing readiness is still loading", () => {
+    render(
+      <ReviewAttentionBar
+        revisionNumber={0}
+        progress={{ ...progress, reviewed: 0, changed_since_review: 0, unreviewed: 2 }}
+        openCommentCount={0}
+        feedbackStatus={{ open_total: 0, unpublished: 0, published: 0, in_flight: 0, addressed: 0 }}
+        addressedNeedsRereview={0}
+        historical={false}
+        delivery={null}
+        readiness={{
+          ...readiness,
+          label: "Checking merge readiness",
+          detail: "Loading merge requirements for this Snapshot.",
+          blockers: [{
+            id: "landing-readiness",
+            label: "Checking merge readiness",
+            detail: "Merge requirements are still loading.",
+            tone: "amber",
+          }],
+          targetPending: 2,
+        }}
+        onShowComments={vi.fn()}
+        onShowReadiness={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("2 areas left.")).toBeTruthy();
+    expect(screen.getByText("Readiness")).toBeTruthy();
+    expect(screen.queryByText("1 blocker")).toBeNull();
+  });
+
+  it("does not present ordinary server-side coverage as an exceptional blocker", () => {
+    render(
+      <ReviewAttentionBar
+        revisionNumber={0}
+        progress={{ ...progress, reviewed: 0, changed_since_review: 0, unreviewed: 2 }}
+        openCommentCount={0}
+        feedbackStatus={{ open_total: 0, unpublished: 0, published: 0, in_flight: 0, addressed: 0 }}
+        addressedNeedsRereview={0}
+        historical={false}
+        delivery={null}
+        readiness={{
+          ...readiness,
+          label: "1 merge requirement unresolved",
+          detail: "Latest revision reviewed",
+          blockers: [{
+            id: "latest-snapshot-reviewed",
+            label: "Latest revision reviewed",
+            detail: "2 review areas still need human judgment or re-review.",
+            tone: "amber",
+          }],
+          targetPending: 2,
+        }}
+        onShowComments={vi.fn()}
+        onShowReadiness={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("2 areas left.")).toBeTruthy();
+    expect(screen.getByText("Readiness")).toBeTruthy();
+    expect(screen.queryByText("1 blocker")).toBeNull();
+  });
+
   it("keeps the strip action-oriented instead of repeating progress metrics", async () => {
     const onShowReadiness = vi.fn();
     render(
@@ -108,7 +202,8 @@ describe("ReviewAttentionBar", () => {
     );
 
     expect(screen.getByText("Re-review")).toBeTruthy();
-    expect(screen.getByText("2 blockers")).toBeTruthy();
+    expect(screen.getByText("1 changed area needs another look. 5 judgments preserved.")).toBeTruthy();
+    expect(screen.getByText("Readiness")).toBeTruthy();
     expect(screen.queryByText("5/8")).toBeNull();
 
     await userEvent.click(screen.getByRole("button", { name: /review readiness/i }));

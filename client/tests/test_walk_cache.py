@@ -40,8 +40,9 @@ from pathlib import Path
 from random import Random
 
 import pytest
-from lemoncrow_client.manifest import WalkResult, walk_worktree
-from lemoncrow_client.session import persist_walk_cache
+from lemoncrow_client.git_sync import committed_base
+from lemoncrow_client.manifest import WalkResult, chunk_manifest, manifest_root, restore_cached_worktree, walk_worktree
+from lemoncrow_client.session import persist_walk_cache, workspace_state_fingerprint
 from lemoncrow_client.walkcache import (
     MINIMUM_INDEX_MISSES,
     WalkCache,
@@ -580,6 +581,36 @@ def test_a_checkout_is_served_from_the_blob_map_rather_than_re_hashed(tmp_path: 
     )
 
 
+def test_a_new_linked_worktree_reuses_the_parent_blob_digest_map(tmp_path: Path) -> None:
+    """Hosted worktree bootstrap should be metadata-only for unchanged Git blobs."""
+
+    rng = Random(79)
+    root = tmp_path / "worktree"
+    linked = tmp_path / "linked-worktree"
+    state_dir = tmp_path / "home"
+    state_dir.mkdir()
+    files = MINIMUM_INDEX_MISSES * 4
+    build(root, rng, files=files)
+    shutil.rmtree(root / ".git")
+    assert run_git(root, "init", "--initial-branch=main").returncode == 0
+    assert run_git(root, "add", "-A").returncode == 0
+    assert run_git(root, "commit", "-m", "initial").returncode == 0
+    parent_cache = load_walk_cache(state_dir, root)
+    parent_cache.begin()
+    parent_base = committed_base(root, parent_cache, max_files=files * 2)
+    assert parent_base.hashed == files + 1  # source files plus the tracked .gitignore
+    persist_walk_cache(parent_cache, state_dir)
+
+    assert run_git(root, "worktree", "add", "-b", "feature", str(linked)).returncode == 0
+    cache = load_walk_cache(state_dir, linked)
+    assert cache.by_path == {}, "path stat proofs must never cross worktrees"
+    assert cache.by_blob, "the linked checkout should import the repository-safe blob digest map"
+
+    linked_base = committed_base(linked, cache, max_files=files * 2)
+    assert linked_base.entries == parent_base.entries
+    assert linked_base.hashed == 0, "Hosted child bootstrap re-read Git blobs already proved by its parent checkout"
+
+
 @pytest.mark.skipif(GIT is None, reason="git is not on PATH")
 def test_a_small_change_never_pays_to_parse_the_index(tmp_path: Path) -> None:
     """The cost gate: a two-file edit must not read a whole repository's index."""
@@ -603,7 +634,160 @@ def test_a_small_change_never_pays_to_parse_the_index(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# 4. The file on disk                                                         #
+# 4. Whole-walk reuse after an exact Git workspace proof                       #
+# --------------------------------------------------------------------------- #
+
+
+def test_exact_workspace_proof_restores_the_complete_manifest_without_a_walk(tmp_path: Path) -> None:
+    root = tmp_path / "worktree"
+    state_dir = tmp_path / "home"
+    state_dir.mkdir()
+    build(root, Random(90), files=80)
+    shutil.rmtree(root / ".git")
+    assert run_git(root, "init", "--initial-branch=main").returncode == 0
+    assert run_git(root, "add", "-A").returncode == 0
+    assert run_git(root, "commit", "-m", "initial").returncode == 0
+
+    cache = load_walk_cache(state_dir, root)
+    walked = walk_worktree(root, size_cap=CAP, cache=cache)
+    fingerprint = workspace_state_fingerprint(root)
+    assert persist_walk_cache(
+        cache,
+        state_dir,
+        workspace_fingerprint=fingerprint,
+        manifest_entry_count=len(walked.files),
+    )
+
+    reloaded = load_walk_cache(state_dir, root)
+    restored = restore_cached_worktree(
+        reloaded,
+        workspace_fingerprint=workspace_state_fingerprint(root),
+        size_cap=CAP,
+    )
+    assert restored is not None
+    assert rows(restored) == rows(walked)
+    assert restored.root() == walked.root()
+    assert restored.digests.reused_by_path == len(walked.files)
+    assert restored.digests.hashed == 0
+
+
+def test_exact_workspace_proof_can_carry_a_clean_generation_revision(tmp_path: Path) -> None:
+    root = tmp_path / "worktree"
+    state_dir = tmp_path / "home"
+    state_dir.mkdir()
+    build(root, Random(93), files=24)
+    shutil.rmtree(root / ".git")
+    assert run_git(root, "init", "--initial-branch=main").returncode == 0
+    assert run_git(root, "add", "-A").returncode == 0
+    assert run_git(root, "commit", "-m", "initial").returncode == 0
+    revision = run_git(root, "rev-parse", "HEAD").stdout.strip()
+
+    cache = load_walk_cache(state_dir, root)
+    walked = walk_worktree(root, size_cap=CAP, cache=cache)
+    fingerprint = workspace_state_fingerprint(root)
+    assert persist_walk_cache(
+        cache,
+        state_dir,
+        workspace_fingerprint=fingerprint,
+        manifest_entry_count=len(walked.files),
+        generation_revision=revision,
+    )
+
+    reloaded = load_walk_cache(state_dir, root)
+    assert reloaded.workspace_fingerprint == fingerprint
+    assert reloaded.generation_revision == revision
+
+
+def test_exact_workspace_proof_round_trips_manifest_metadata(tmp_path: Path) -> None:
+    root = tmp_path / "worktree"
+    state_dir = tmp_path / "home"
+    state_dir.mkdir()
+    build(root, Random(94), files=25)
+    shutil.rmtree(root / ".git")
+    assert run_git(root, "init", "--initial-branch=main").returncode == 0
+    assert run_git(root, "add", "-A").returncode == 0
+    assert run_git(root, "commit", "-m", "initial").returncode == 0
+    revision = run_git(root, "rev-parse", "HEAD").stdout.strip()
+
+    cache = load_walk_cache(state_dir, root)
+    walked = walk_worktree(root, size_cap=CAP, cache=cache)
+    entries = walked.entries()
+    chunks = chunk_manifest(entries, max_rows=7)
+    root_digest = manifest_root(entries)
+    fingerprint = workspace_state_fingerprint(root)
+    assert persist_walk_cache(
+        cache,
+        state_dir,
+        workspace_fingerprint=fingerprint,
+        manifest_entry_count=len(walked.files),
+        generation_revision=revision,
+        manifest_root_value=root_digest,
+        manifest_chunk_rows=7,
+        manifest_chunk_ids=tuple(chunk.chunk_id for chunk in chunks),
+    )
+
+    reloaded = load_walk_cache(state_dir, root)
+    assert reloaded.workspace_fingerprint == fingerprint
+    assert reloaded.generation_revision == revision
+    assert reloaded.manifest_root == root_digest
+    assert reloaded.manifest_chunk_rows == 7
+    assert reloaded.manifest_chunk_ids == tuple(chunk.chunk_id for chunk in chunks)
+
+
+def test_workspace_mutation_invalidates_the_whole_walk_proof(tmp_path: Path) -> None:
+    root = tmp_path / "worktree"
+    state_dir = tmp_path / "home"
+    state_dir.mkdir()
+    build(root, Random(91), files=20)
+    shutil.rmtree(root / ".git")
+    assert run_git(root, "init", "--initial-branch=main").returncode == 0
+    assert run_git(root, "add", "-A").returncode == 0
+    assert run_git(root, "commit", "-m", "initial").returncode == 0
+
+    cache = load_walk_cache(state_dir, root)
+    walked = walk_worktree(root, size_cap=CAP, cache=cache)
+    fingerprint = workspace_state_fingerprint(root)
+    assert persist_walk_cache(
+        cache,
+        state_dir,
+        workspace_fingerprint=fingerprint,
+        manifest_entry_count=len(walked.files),
+    )
+
+    (root / "pkg0/sub0/unit_0000.py").write_text("CHANGED = 1\n", encoding="utf-8")
+    reloaded = load_walk_cache(state_dir, root)
+    assert (
+        restore_cached_worktree(
+            reloaded,
+            workspace_fingerprint=workspace_state_fingerprint(root),
+            size_cap=CAP,
+        )
+        is None
+    )
+
+
+def test_incomplete_path_cache_never_persists_a_whole_workspace_proof(tmp_path: Path) -> None:
+    root = tmp_path / "worktree"
+    state_dir = tmp_path / "home"
+    state_dir.mkdir()
+    build(root, Random(92), files=8)
+
+    cache = load_walk_cache(state_dir, root)
+    walked = walk_worktree(root, size_cap=CAP, cache=cache)
+    assert persist_walk_cache(
+        cache,
+        state_dir,
+        workspace_fingerprint="a" * 64,
+        manifest_entry_count=len(walked.files) + 1,
+        generation_revision="b" * 40,
+    )
+    reloaded = load_walk_cache(state_dir, root)
+    assert reloaded.workspace_fingerprint == ""
+    assert reloaded.generation_revision == ""
+
+
+# --------------------------------------------------------------------------- #
+# 5. The file on disk                                                         #
 # --------------------------------------------------------------------------- #
 
 

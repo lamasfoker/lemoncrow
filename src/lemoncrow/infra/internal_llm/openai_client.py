@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+from collections.abc import Callable
 from typing import Any
 
 from lemoncrow.infra.internal_llm.exceptions import OpenAIClientUnavailable
@@ -146,6 +147,7 @@ def chat_with_result(
         content=content,
         parsed_json=parsed_json,
         model=chosen_model,
+        reported_model=reported if isinstance(reported := getattr(response, "model", ""), str) else "",
         request_id=str(getattr(response, "id", "") or ""),
         input_tokens=_token_value(usage, "prompt_tokens"),
         output_tokens=_token_value(usage, "completion_tokens"),
@@ -170,4 +172,41 @@ def chat(
     return dict(result.parsed_json or {})
 
 
-__all__ = ["OpenAIClientUnavailable", "chat", "chat_with_result", "summarize"]
+def chat_stream(
+    messages: list[dict[str, Any]],
+    *,
+    on_delta: Callable[[str], None],
+    model: str | None = None,
+    json_schema: dict[str, Any] | None = None,
+) -> str | dict[str, Any]:
+    """Stream Chat Completions text chunks and return the same parsed result as chat()."""
+    client = _resolve_client()
+    chosen_model = model or _resolve_model()
+    kwargs: dict[str, Any] = {"model": chosen_model, "messages": messages, "stream": True}
+    if json_schema is not None:
+        kwargs["response_format"] = {"type": "json_object"}
+    try:
+        response = client.chat.completions.create(**kwargs)
+        chunks: list[str] = []
+        for chunk in response:
+            try:
+                text = str(chunk.choices[0].delta.content or "")
+            except (AttributeError, IndexError, TypeError):
+                text = ""
+            if not text:
+                continue
+            chunks.append(text)
+            on_delta(text)
+    except Exception as exc:
+        raise OpenAIClientUnavailable(f"OpenAI-compatible API unavailable: {exc}") from exc
+    content = "".join(chunks)
+    if json_schema is None:
+        return content
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise OpenAIClientUnavailable(f"API returned invalid JSON: {exc}") from exc
+    return parsed if isinstance(parsed, dict) else {"value": parsed}
+
+
+__all__ = ["OpenAIClientUnavailable", "chat", "chat_stream", "chat_with_result", "summarize"]

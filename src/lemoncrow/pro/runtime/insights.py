@@ -1,4 +1,4 @@
-"""Spec 04 — ``lc insights``
+"""Session aggregation for dashboards and usage APIs.
 
 Aggregates ``SessionReport`` objects over a time window into an
 ``InsightsWindow`` with vendor/tool breakdowns, outcomes summary, and
@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import logging
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -24,7 +24,7 @@ from typing import Any
 from lemoncrow.infra.runtime.session_report import (
     SessionReport,
     _model_vendor,
-    list_run_files,
+    list_run_snapshots,
 )
 from lemoncrow.pro.runtime.outcome_capture import load_outcomes_from_state
 
@@ -82,6 +82,12 @@ class InsightsWindow:
     top_sessions: list[SessionSummary]
     outcomes_summary: OutcomesSummary
     opportunities: list[Opportunity]
+    cost_by_day: dict[str, float] = field(default_factory=dict)
+    """Local calendar day (ISO date) → cost; the days sum to ``total_cost_usd``.
+
+    A session's cost splits over its calls' days; one without per-call records
+    counts on the day it was last updated.
+    """
 
 
 # --------------------------------------------------------------------------- #
@@ -305,36 +311,48 @@ def build_insights(
 ) -> InsightsWindow:
     """Aggregate all sessions in ``[since, until)`` into an ``InsightsWindow``."""
     # Load raw snapshots and build reports in one pass.
-    files = list_run_files(root, since=since)
+    sessions = list_run_snapshots(root)
     snaps: list[dict[str, Any]] = []
     reports: list[SessionReport] = []
     # Parallel list: snap_by_index[i] is the raw snapshot for reports[i]
     snap_by_index: list[dict[str, Any]] = []
     outcomes_by_session: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    agg_by_day: dict[str, float] = defaultdict(float)
 
-    for f in files:
-        try:
-            snap: dict[str, Any] = json.loads(f.read_text(encoding="utf-8"))
-        except Exception:
-            logging.exception("Recovered from broad exception handler")
+    for _path, original in sessions:
+        from lemoncrow.infra.runtime.session_report import _parse_dt, build_report
+
+        snap = dict(original)
+        window_cost = dict(snap.get("cost") or {})
+        all_calls = window_cost.get("calls") or []
+        window_calls = [
+            call
+            for call in all_calls
+            if (at := _parse_dt(call.get("at") or snap.get("created_at"))) is not None and since <= at < until
+        ]
+        started = _parse_dt(snap.get("created_at"))
+        updated = _parse_dt(snap.get("updated_at")) or started
+        if not window_calls and not (
+            (started is not None and since <= started < until) or (updated is not None and since <= updated < until)
+        ):
             continue
-
-        from lemoncrow.infra.runtime.session_report import build_report
-
+        if all_calls:
+            window_cost["calls"] = window_calls
+            window_cost["total_cost_usd"] = sum(float(call.get("cost_usd") or 0) for call in window_calls)
+            snap["cost"] = window_cost
         try:
             report = build_report(snap, root)
         except Exception:
             logging.exception("Recovered from broad exception handler")
             continue
 
-        if report.started_at > until:
-            continue
-        if report.started_at < since:
-            continue
-
         snaps.append(snap)
         snap_by_index.append(snap)
         reports.append(report)
+        if report.total_cost_usd > 0:
+            fallback = min(max(updated or started or until, since), until)
+            for day, cost in _split_by_day(window_calls, snap, fallback, report.total_cost_usd).items():
+                agg_by_day[day] += cost
 
         # Use session_id from report; fall back to run_id from snapshot for outcomes lookup.
         sid = report.session_id or str(snap.get("run_id") or "")
@@ -427,7 +445,25 @@ def build_insights(
         top_sessions=top_sessions,
         outcomes_summary=outcomes_summary,
         opportunities=opportunities,
+        cost_by_day={day: round(cost, 4) for day, cost in sorted(agg_by_day.items())},
     )
+
+
+def _split_by_day(
+    calls: list[dict[str, Any]], snap: dict[str, Any], fallback: datetime, total: float
+) -> dict[str, float]:
+    """``total`` over the local days of ``calls``, in proportion to their cost; all on ``fallback``'s day without them."""
+    from lemoncrow.infra.runtime.session_report import _parse_dt
+
+    by_day: dict[str, float] = defaultdict(float)
+    for call in calls:
+        at = _parse_dt(call.get("at") or snap.get("created_at"))
+        if at is not None:
+            by_day[at.astimezone().date().isoformat()] += float(call.get("cost_usd") or 0.0)
+    priced = sum(by_day.values())
+    if priced <= 0:
+        return {fallback.astimezone().date().isoformat(): total}
+    return {day: total * cost / priced for day, cost in by_day.items()}
 
 
 # --------------------------------------------------------------------------- #

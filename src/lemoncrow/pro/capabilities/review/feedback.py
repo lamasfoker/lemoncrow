@@ -124,6 +124,8 @@ class FeedbackBundle:
     """Review context lines (impacted callers, verification), verbatim."""
     degraded: tuple[str, ...] = ()
     """Every reason this revision knows less than a perfect one would."""
+    request_summary: str = ""
+    """The reviewer's own "what still needs to change" for this Snapshot, verbatim."""
 
 
 def packet_context(packet: Mapping[str, object] | None) -> tuple[str, ...]:
@@ -271,7 +273,9 @@ def build_bundle(
     return FeedbackBundle(
         review_id=session.id,
         revision_id=revision.id,
-        revision_number=revision.revision_number,
+        # Public Review surfaces use the zero-based Snapshot number; persistence
+        # keeps its one-based ordinal internal.
+        revision_number=revision.revision_number - 1,
         title=title or session.title,
         range_mode=revision.range_mode,
         items=tuple(sorted(open_items, key=_sort_key)),
@@ -321,14 +325,20 @@ def render_markdown(bundle: FeedbackBundle) -> str:
     """
 
     lines: list[str] = ["## Review feedback", ""]
-    header = f"Revision {bundle.revision_number} · {bundle.range_mode}"
+    header = f"Snapshot {bundle.revision_number} · {bundle.range_mode}"
     if bundle.title:
         header = f"{bundle.title} — {header}"
     lines.append(header)
     lines.append("")
 
+    if bundle.request_summary.strip():
+        lines.append("### What still needs to change")
+        lines.append("")
+        lines.append(bundle.request_summary.strip())
+        lines.append("")
+
     if not bundle.items and not bundle.orphaned:
-        lines.append("No open comments on this revision.")
+        lines.append("No open comments on this Snapshot.")
         lines.append("")
     for item in bundle.items:
         lines.extend(_section(item))

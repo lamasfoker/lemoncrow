@@ -74,16 +74,6 @@ code(op="search", repo_root=".", query="publish_product")
 compact(session_id="run_123")
 ```
 
-### V2 Lesson pipeline tools [LemonCrow augmentation]
-
-```python
-# Review pending lesson candidates
-lc lesson inbox(domain="beseam.shopify.publish", limit=10)
-
-# Approve or reject a candidate (approved → Playbook)
-lc lesson decide(lesson_id="les_001", decision="approve", reviewer="lemoncrow:code", reason="...")
-```
-
 ## Domains
 
 | Domain                          | What it covers                                 |

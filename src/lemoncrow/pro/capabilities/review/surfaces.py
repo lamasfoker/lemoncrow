@@ -4,6 +4,11 @@ Surfaces answer *what* a human reviews (web route, API request, service, story,
 CLI command). Runtimes answer *how* an immutable review revision is executed.
 Those extension points are deliberately separate so the same surface provider can
 bind to Docker, a plain Python process, npm, or a third-party runner plugin.
+
+A surface may also carry a versioned :class:`PreviewDescriptor`: the provider's
+declaration of *what* can be previewed and how the Reader presents it. The
+renderer that produces old/new Snapshot artifacts for that descriptor lives in
+``previews.py`` and is a third, independent extension point.
 """
 
 from __future__ import annotations
@@ -19,11 +24,127 @@ import yaml
 from lemoncrow.pro.capabilities.review.session_models import ReviewRevision
 
 if TYPE_CHECKING:
+    from lemoncrow.pro.capabilities.review.hermetic import HermeticContext
     from lemoncrow.pro.capabilities.review.store import ReviewStore
 
 CONFIG_RELATIVE_PATH = Path(".lemoncrow/review.yaml")
 PROVIDER_ENTRYPOINT_GROUP = "lemoncrow.review_surface_providers"
-SURFACE_CAPABILITIES = frozenset({"preview", "compare", "source", "execute", "results"})
+SURFACE_CAPABILITIES = frozenset({"preview", "compare", "source", "execute", "results", "auto_compare"})
+
+# Versioned comparison contract. Preview plugins can inherit a host comparator
+# automatically; executable surfaces must opt into safe automatic comparison.
+COMPARISON_CONTRACT_VERSION = 1
+SUPPORTED_COMPARISON_CONTRACT_VERSIONS = frozenset({COMPARISON_CONTRACT_VERSION})
+COMPARISON_SOURCES = frozenset({"preview", "run", "web"})
+
+# Versioned preview contract. Bump only for incompatible descriptor/renderer
+# changes; the host refuses (with a specific reason) versions it cannot honor.
+PREVIEW_CONTRACT_VERSION = 1
+SUPPORTED_PREVIEW_CONTRACT_VERSIONS = frozenset({PREVIEW_CONTRACT_VERSION})
+# How the Reader presents an artifact. Anything else is refused host-side.
+PREVIEW_DISPLAYS = frozenset({"image", "html", "text", "json", "download"})
+
+
+@dataclass(frozen=True)
+class ComparisonDescriptor:
+    """How the host may automatically compare one surface across old/new sides.
+
+    ``source`` identifies where the comparable values come from: a preview
+    artifact, a runner result, or the built-in web capture compatibility path.
+    ``auto`` is an explicit side-effect-safety declaration for executable
+    surfaces. Preview artifacts are already produced through the preview sandbox
+    and may inherit a safe comparator without an explicit descriptor.
+    """
+
+    source: str = "preview"
+    comparator: str = "auto"
+    label: str = ""
+    auto: bool = True
+    options: Mapping[str, Any] = field(default_factory=dict)
+    version: int = COMPARISON_CONTRACT_VERSION
+
+    def problem(self) -> str:
+        if self.version not in SUPPORTED_COMPARISON_CONTRACT_VERSIONS:
+            supported = ", ".join(str(item) for item in sorted(SUPPORTED_COMPARISON_CONTRACT_VERSIONS))
+            return f"comparison contract version {self.version} is not supported (this LemonCrow supports {supported})"
+        if self.source not in COMPARISON_SOURCES:
+            return f"comparison source {self.source!r} is not supported"
+        if not str(self.comparator).strip():
+            return "comparison descriptor names no comparator"
+        return ""
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "version": self.version,
+            "source": self.source,
+            "comparator": self.comparator,
+            "label": self.label,
+            "auto": self.auto,
+            "options": dict(self.options),
+        }
+
+
+@dataclass(frozen=True)
+class PreviewDescriptor:
+    """A provider's declaration of one previewable artifact for a surface.
+
+    ``renderer`` names the preview renderer plugin that produces the old/new
+    Snapshot artifacts. ``display`` tells the Reader how to present them
+    without knowing the surface kind. ``scope`` is the repository-relative
+    subtree the host materializes for the renderer; ``options`` is opaque,
+    renderer-owned JSON (for example a Storybook story id).
+    """
+
+    renderer: str
+    display: str = "image"
+    media_type: str = "image/png"
+    label: str = ""
+    sides: tuple[str, ...] = ("old", "new")
+    scope: str = "."
+    options: Mapping[str, Any] = field(default_factory=dict)
+    version: int = PREVIEW_CONTRACT_VERSION
+
+    def problem(self) -> str:
+        """Return why the host cannot honor this descriptor, or ``""``."""
+
+        if self.version not in SUPPORTED_PREVIEW_CONTRACT_VERSIONS:
+            supported = ", ".join(str(item) for item in sorted(SUPPORTED_PREVIEW_CONTRACT_VERSIONS))
+            return f"preview contract version {self.version} is not supported (this LemonCrow supports {supported})"
+        if not str(self.renderer).strip():
+            return "preview descriptor names no renderer"
+        if self.display not in PREVIEW_DISPLAYS:
+            return f"preview display {self.display!r} is not supported"
+        if not self.sides or any(side not in {"old", "new"} for side in self.sides):
+            return "preview sides must be old and/or new"
+        try:
+            _safe_relative_path(self.scope, field_name="preview scope")
+        except ValueError as exc:
+            return str(exc)
+        return ""
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "version": self.version,
+            "renderer": self.renderer,
+            "display": self.display,
+            "media_type": self.media_type,
+            "label": self.label,
+            "sides": list(self.sides),
+            "scope": self.scope,
+            "options": dict(self.options),
+        }
+
+
+@dataclass(frozen=True)
+class PluginIssue:
+    """One extension that could not be loaded or failed while discovering."""
+
+    plugin: str
+    kind: str
+    reason: str
+
+    def to_payload(self) -> dict[str, str]:
+        return {"plugin": self.plugin, "kind": self.kind, "reason": self.reason}
 
 
 @dataclass(frozen=True)
@@ -39,6 +160,8 @@ class ReviewSurface:
     affected_paths: tuple[str, ...] = ()
     capabilities: tuple[str, ...] = ("source",)
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    preview: PreviewDescriptor | None = None
+    comparison: ComparisonDescriptor | None = None
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -51,6 +174,8 @@ class ReviewSurface:
             "affected_paths": list(self.affected_paths),
             "capabilities": list(self.capabilities),
             "metadata": dict(self.metadata),
+            "preview": self.preview.to_payload() if self.preview is not None else None,
+            "comparison": self.comparison.to_payload() if self.comparison is not None else None,
         }
 
 
@@ -117,6 +242,13 @@ class SurfaceContext:
     store: ReviewStore | None = None
     scratch_root: Path | None = None
     dependency_root: Path | None = None
+    # The git checkout a runner materializes a Snapshot side from when the
+    # Review holds no frozen tree for it. ``repo_root`` can itself be a
+    # materialized side (no git), which cannot.
+    source_root: Path | None = None
+    # Trusted-base hermetic execution policy and the dispatcher's executor
+    # class. Never derived from head content.
+    execution: HermeticContext | None = None
 
 
 @dataclass(frozen=True)
@@ -147,8 +279,14 @@ class ReviewSurfaceProvider(Protocol):
 
 
 class SurfaceRegistry:
-    def __init__(self, providers: Iterable[ReviewSurfaceProvider] = ()) -> None:
+    def __init__(
+        self,
+        providers: Iterable[ReviewSurfaceProvider] = (),
+        *,
+        issues: Iterable[PluginIssue] = (),
+    ) -> None:
         self._providers: dict[str, ReviewSurfaceProvider] = {}
+        self.issues: tuple[PluginIssue, ...] = tuple(issues)
         for provider in providers:
             self.register(provider)
 
@@ -167,10 +305,55 @@ class SurfaceRegistry:
         return self._providers.get(provider_id)
 
     def discover(self, context: SurfaceContext) -> tuple[ReviewSurface, ...]:
+        return self._discover(context, isolate=False)[0]
+
+    def discover_isolated(self, context: SurfaceContext) -> tuple[tuple[ReviewSurface, ...], tuple[PluginIssue, ...]]:
+        """Discover while containing each provider's failure to that provider.
+
+        A broken third-party provider must not hide the web/API/service
+        surfaces of healthy providers, and must never block source review; its
+        failure is returned as a specific issue instead.
+        """
+
+        return self._discover(context, isolate=True)
+
+    def _discover(
+        self, context: SurfaceContext, *, isolate: bool
+    ) -> tuple[tuple[ReviewSurface, ...], tuple[PluginIssue, ...]]:
         surfaces: list[ReviewSurface] = []
+        issues: list[PluginIssue] = list(self.issues)
         indexes: dict[tuple[str, str], int] = {}
-        for provider in self.providers():
-            for surface in provider.discover(context):
+        providers = tuple(self.providers())
+        # A configured provider that no installed plugin supplies would otherwise
+        # vanish silently; say so, and keep its files reviewable as source.
+        installed = {str(provider.provider_id) for provider in providers}
+        reported = {issue.plugin for issue in issues}
+        for name in dict.fromkeys(entry.provider for entry in context.config.surfaces):
+            if name not in installed and name not in reported:
+                issues.append(
+                    PluginIssue(
+                        plugin=name,
+                        kind="provider",
+                        reason=f"no installed surface provider is named {name!r}; install the plugin that provides it",
+                    )
+                )
+        for provider in providers:
+            try:
+                discovered = tuple(provider.discover(context))
+                if isolate and any(not isinstance(item, ReviewSurface) for item in discovered):
+                    raise TypeError("discover() must return ReviewSurface values")
+            except Exception as exc:
+                if not isolate:
+                    raise
+                issues.append(
+                    PluginIssue(
+                        plugin=str(provider.provider_id),
+                        kind="provider",
+                        reason=f"surface discovery failed: {type(exc).__name__}: {exc}",
+                    )
+                )
+                continue
+            for surface in discovered:
                 identity = (surface.provider, surface.id)
                 index = indexes.get(identity)
                 if index is None:
@@ -188,8 +371,10 @@ class SurfaceRegistry:
                     affected_paths=tuple(dict.fromkeys((*previous.affected_paths, *surface.affected_paths))),
                     capabilities=tuple(dict.fromkeys((*previous.capabilities, *surface.capabilities))),
                     metadata={**dict(previous.metadata), **dict(surface.metadata)},
+                    preview=previous.preview or surface.preview,
+                    comparison=previous.comparison or surface.comparison,
                 )
-        return tuple(surfaces)
+        return tuple(surfaces), tuple(issues)
 
     def setup_candidates(self, repo_root: Path) -> tuple[SetupCandidate, ...]:
         candidates: list[SetupCandidate] = []
@@ -301,13 +486,16 @@ def write_review_surface_config(
     return target
 
 
+def _entry_points(group: str) -> Sequence[Any]:
+    try:
+        return tuple(metadata.entry_points(group=group))
+    except TypeError:  # pragma: no cover
+        return tuple(metadata.entry_points().select(group=group))
+
+
 def load_entrypoint_providers() -> tuple[ReviewSurfaceProvider, ...]:
     found: list[ReviewSurfaceProvider] = []
-    try:
-        points = metadata.entry_points(group=PROVIDER_ENTRYPOINT_GROUP)
-    except TypeError:  # pragma: no cover
-        points = metadata.entry_points().select(group=PROVIDER_ENTRYPOINT_GROUP)
-    for point in points:
+    for point in _entry_points(PROVIDER_ENTRYPOINT_GROUP):
         candidate = point.load()
         provider = candidate() if isinstance(candidate, type) else candidate
         if not isinstance(provider, ReviewSurfaceProvider):
@@ -316,22 +504,63 @@ def load_entrypoint_providers() -> tuple[ReviewSurfaceProvider, ...]:
     return tuple(found)
 
 
+def load_entrypoint_providers_isolated() -> tuple[tuple[ReviewSurfaceProvider, ...], tuple[PluginIssue, ...]]:
+    """Load provider plugins, turning each broken one into a specific issue."""
+
+    found: list[ReviewSurfaceProvider] = []
+    issues: list[PluginIssue] = []
+    for point in _entry_points(PROVIDER_ENTRYPOINT_GROUP):
+        try:
+            candidate = point.load()
+            provider = candidate() if isinstance(candidate, type) else candidate
+        except Exception as exc:
+            issues.append(PluginIssue(point.name, "provider", f"plugin failed to load: {type(exc).__name__}: {exc}"))
+            continue
+        if not isinstance(provider, ReviewSurfaceProvider):
+            issues.append(PluginIssue(point.name, "provider", "entry point does not implement ReviewSurfaceProvider"))
+            continue
+        found.append(provider)
+    return tuple(found), tuple(issues)
+
+
 def built_in_registry(*, include_entrypoints: bool = True) -> SurfaceRegistry:
+    from lemoncrow.pro.capabilities.review.storybook_preview import StorybookSurfaceProvider
     from lemoncrow.pro.capabilities.review.surface_providers import (
         BrunoSurfaceProvider,
         ServiceSurfaceProvider,
         WebSurfaceProvider,
     )
 
-    providers: list[ReviewSurfaceProvider] = [WebSurfaceProvider(), ServiceSurfaceProvider(), BrunoSurfaceProvider()]
+    providers: list[ReviewSurfaceProvider] = [
+        WebSurfaceProvider(),
+        ServiceSurfaceProvider(),
+        BrunoSurfaceProvider(),
+        StorybookSurfaceProvider(),
+    ]
+    issues: list[PluginIssue] = []
     if include_entrypoints:
-        providers.extend(load_entrypoint_providers())
-    return SurfaceRegistry(providers)
+        plugins, issues_found = load_entrypoint_providers_isolated()
+        issues.extend(issues_found)
+        taken = {provider.provider_id for provider in providers}
+        for plugin in plugins:
+            plugin_id = str(getattr(plugin, "provider_id", "")).strip()
+            if not plugin_id or plugin_id in taken:
+                reason = "empty provider_id" if not plugin_id else f"provider id {plugin_id!r} is already registered"
+                issues.append(PluginIssue(plugin_id or "?", "provider", f"plugin ignored: {reason}"))
+                continue
+            taken.add(plugin_id)
+            providers.append(plugin)
+    return SurfaceRegistry(providers, issues=issues)
 
 
 __all__ = [
     "CONFIG_RELATIVE_PATH",
+    "PREVIEW_CONTRACT_VERSION",
+    "PREVIEW_DISPLAYS",
     "PROVIDER_ENTRYPOINT_GROUP",
+    "SUPPORTED_PREVIEW_CONTRACT_VERSIONS",
+    "PluginIssue",
+    "PreviewDescriptor",
     "ReviewSurface",
     "ReviewSurfaceConfig",
     "ReviewSurfaceProvider",
@@ -341,6 +570,8 @@ __all__ = [
     "SurfaceContext",
     "SurfaceRegistry",
     "built_in_registry",
+    "load_entrypoint_providers",
+    "load_entrypoint_providers_isolated",
     "load_review_surface_config",
     "write_review_surface_config",
 ]

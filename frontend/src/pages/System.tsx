@@ -1,7 +1,10 @@
+import { Button as UiButton } from "../components/ui/button";
 import { useEffect, useState } from "react";
-import { useParams } from "react-router-dom";
+import { agentColors } from "../lib/agentColors";
+import { Link, useParams } from "react-router-dom";
 import {
   Archive,
+  ArrowLeft,
   Bot,
   Brain,
   Circle,
@@ -54,6 +57,9 @@ function HostIcon({ id }: { id: string }) {
     codex: "/logos/hosts/codex.svg",
     opencode: "/logos/hosts/opencode.svg",
     copilot: "/logos/hosts/copilot.svg",
+    antigravity: "/logos/hosts/antigravity.png",
+    cursor: "/logos/hosts/cursor.svg",
+    hermes: "/logos/hosts/hermes.png",
   };
 
   const ALT_MAP: Record<string, string> = {
@@ -67,17 +73,11 @@ function HostIcon({ id }: { id: string }) {
     hermes: "Hermes Agent",
   };
 
-  const INITIALS: Record<string, string> = {
-    antigravity: "AG",
-    cursor: "CU",
-    hermes: "HE",
-  };
-
   const src = SRC_MAP[id];
   if (!src) {
     return (
-      <span className="inline-flex h-7 w-7 items-center justify-center border border-neutral-700 bg-neutral-900 text-[10px] font-bold text-neutral-300">
-        {INITIALS[id] ?? "◌"}
+      <span className="inline-flex h-7 w-7 items-center justify-center border border-neutral-700 bg-muted text-caption font-bold text-neutral-300">
+        ◌
       </span>
     );
   }
@@ -154,7 +154,7 @@ export function HostsSection() {
 
   return (
     <section className="space-y-3">
-      <h2 className="text-xs uppercase tracking-widest text-neutral-400 font-mono">
+      <h2 className="text-xs uppercase tracking-widest text-neutral-400">
         Hosts
       </h2>
       <p className="text-xs text-neutral-400">
@@ -171,23 +171,23 @@ export function HostsSection() {
       ) : (
         <div className="grid gap-3 sm:grid-cols-2">
           {orderedHosts.map((host) => (
-            <Card key={host.host_id} className="bg-neutral-950/80 p-4">
+            <Card key={host.host_id} className="bg-background/80 p-4">
               <div className="flex items-start gap-3">
                 <span className="shrink-0">
                   <HostIcon id={host.host_id} />
                 </span>
                 <div className="min-w-0 flex-1 space-y-3">
                   <div className="flex flex-wrap items-center gap-2">
-                    <div className="text-base font-semibold text-neutral-100">
+                    <div className="text-base font-semibold text-foreground">
                       {host.label}
                     </div>
                     <Chip
-                      tone={host.status === "active" ? "emerald" : "neutral"}
+                      tone={host.status === "active" ? "success" : "neutral"}
                     >
                       {host.status === "active" ? "detected" : "not detected"}
                     </Chip>
                     {HOST_SCOPE_BADGES[host.host_id] && (
-                      <Chip tone="amber">
+                      <Chip tone="warning">
                         {HOST_SCOPE_BADGES[host.host_id]}
                       </Chip>
                     )}
@@ -197,10 +197,10 @@ export function HostsSection() {
                   </p>
                   {host.install_command && (
                     <div className="space-y-1">
-                      <div className="text-[10px] uppercase tracking-widest text-neutral-400 font-mono">
+                      <div className="text-caption uppercase tracking-widest text-neutral-400 font-mono">
                         Install
                       </div>
-                      <code className="block break-all border border-neutral-800 bg-neutral-950 px-2 py-1 text-[10px] text-neutral-300">
+                      <code className="block break-all border border-border bg-background px-2 py-1 text-caption text-neutral-300">
                         {host.install_command}
                       </code>
                     </div>
@@ -227,24 +227,6 @@ const AGENT_ICON: Record<string, React.ElementType> = {
   research: Microscope,
 };
 
-const AGENT_BG: Record<string, string> = {
-  purple: "bg-brand-500/15",
-  cyan: "bg-cyan-500/15",
-  green: "bg-green-500/15",
-  red: "bg-red-500/15",
-  blue: "bg-blue-500/15",
-  yellow: "bg-yellow-500/15",
-};
-
-const AGENT_TEXT: Record<string, string> = {
-  purple: "text-brand-300",
-  cyan: "text-cyan-200",
-  green: "text-green-200",
-  red: "text-red-200",
-  blue: "text-blue-200",
-  yellow: "text-yellow-200",
-};
-
 export function AgentsSection() {
   const [agents, setAgents] = useState<Agent[] | null>(null);
   const [expandedId, setExpandedId] = useState<string | null>(null);
@@ -259,7 +241,7 @@ export function AgentsSection() {
   if (agents === null) {
     return (
       <section className="space-y-3">
-        <h2 className="text-xs uppercase tracking-widest text-neutral-400 font-mono">
+        <h2 className="text-xs uppercase tracking-widest text-neutral-400">
           Agents
         </h2>
         <p className="text-xs text-neutral-400">Loading…</p>
@@ -269,7 +251,7 @@ export function AgentsSection() {
 
   return (
     <section className="space-y-3">
-      <h2 className="text-xs uppercase tracking-widest text-neutral-400 font-mono">
+      <h2 className="text-xs uppercase tracking-widest text-neutral-400">
         Agents
       </h2>
       <div className="grid gap-2 sm:grid-cols-2">
@@ -297,8 +279,7 @@ function AgentCard({
   expanded: boolean;
   onToggle: () => void;
 }) {
-  const bg = AGENT_BG[agent.color] ?? "bg-neutral-800/40";
-  const color = AGENT_TEXT[agent.color] ?? "text-neutral-200";
+  const { background: bg, text: color } = agentColors(agent.id, agent.color);
   const Icon = AGENT_ICON[agent.id] ?? Bot;
   return (
     <DisclosureCard
@@ -326,7 +307,7 @@ function AgentCard({
               {agent.model && (
                 <Chip
                   tone="neutral"
-                  className="normal-case tracking-normal text-[10px]"
+                  className="normal-case tracking-normal text-caption"
                 >
                   {agent.model}
                 </Chip>
@@ -361,16 +342,16 @@ function AgentCard({
           <FieldLabel className="mb-2">
             <ChevronRight size={10} className="inline mr-1" /> instructions
           </FieldLabel>
-          <pre className="text-[10px] bg-neutral-950 px-2 py-2 text-neutral-400 font-mono border border-neutral-700 block overflow-auto max-h-48 whitespace-pre-wrap">
+          <pre className="text-caption bg-background px-2 py-2 text-neutral-400 font-mono border border-neutral-700 block overflow-auto max-h-48 whitespace-pre-wrap">
             {agent.content}
           </pre>
         </div>
       )}
 
       {/* Source */}
-      <div className="pt-2 border-t border-neutral-800">
+      <div className="pt-2 border-t border-border">
         <FieldLabel className="mb-2">Source</FieldLabel>
-        <code className="text-[10px] bg-neutral-950 px-2 py-1 text-neutral-400 font-mono border border-neutral-700 block break-all">
+        <code className="text-caption bg-background px-2 py-1 text-neutral-400 font-mono border border-neutral-700 block break-all">
           {agent.file}
         </code>
       </div>
@@ -398,7 +379,7 @@ export function SkillsSection() {
 
   return (
     <section className="space-y-3">
-      <h2 className="text-xs uppercase tracking-widest text-neutral-400 font-mono">
+      <h2 className="text-xs uppercase tracking-widest text-neutral-400">
         Skills
       </h2>
       <p className="text-xs text-neutral-400 mb-3">
@@ -462,8 +443,8 @@ function SkillCard({
   };
 
   return (
-    <Card className="flex flex-col gap-2 bg-neutral-900/30 p-2">
-      <button
+    <Card className="flex flex-col gap-2 bg-muted/30 p-2">
+      <UiButton unstyled
         onClick={toggle}
         className="flex items-start gap-2 w-full text-left"
       >
@@ -471,10 +452,10 @@ function SkillCard({
           <skill.icon size={14} className="text-emerald-300" />
         </span>
         <div className="min-w-0 flex-1">
-          <div className="text-[11px] font-mono font-medium text-neutral-200 truncate">
+          <div className="text-label font-mono font-medium text-neutral-200 truncate">
             {skill.name}
           </div>
-          <div className="text-[10px] text-neutral-400 leading-tight">
+          <div className="text-caption text-neutral-400 leading-tight">
             {skill.desc}
           </div>
         </div>
@@ -487,10 +468,10 @@ function SkillCard({
             <Plus size={14} />
           )}
         </span>
-      </button>
+      </UiButton>
       {isExpanded && content && (
-        <div className="mt-1 pt-2 border-t border-neutral-800">
-          <pre className="text-neutral-400 whitespace-pre-wrap font-mono max-h-60 overflow-y-auto bg-neutral-950/50 p-2 text-[10px]">
+        <div className="mt-1 pt-2 border-t border-border">
+          <pre className="text-neutral-400 whitespace-pre-wrap font-mono max-h-60 overflow-y-auto bg-background/50 p-2 text-caption">
             {content}
           </pre>
         </div>
@@ -594,11 +575,11 @@ export function ToolsSection() {
       .catch((e) => setErr(String(e)));
   }, []);
 
-  if (err) return <Alert tone="danger" description={err} />;
+  if (err) return <Alert tone="destructive" description={err} />;
 
   return (
     <section className="space-y-3">
-      <h2 className="text-xs uppercase tracking-widest text-neutral-400 font-mono">
+      <h2 className="text-xs uppercase tracking-widest text-neutral-400">
         Tools
       </h2>
       {!mcpTools && <EmptyState title="Loading tools…" className="p-4" />}
@@ -633,7 +614,7 @@ export function ToolsSection() {
 
           return (
             <div className="grid gap-5 sm:grid-cols-2">
-              <p className="text-[10px] font-mono text-neutral-400 sm:col-span-2">
+              <p className="text-caption font-mono text-neutral-400 sm:col-span-2">
                 {deduped.length} tools on stdio server: <code>lc mcp</code>
               </p>
               {nsOrder
@@ -643,17 +624,17 @@ export function ToolsSection() {
                     icon: Circle,
                     label: ns,
                     color:
-                      "text-neutral-400 border-neutral-800 bg-neutral-900/30",
+                      "text-neutral-400 border-border bg-muted/30",
                   };
                   const tools = groups[ns];
                   return (
                     <div key={ns}>
                       <div className="flex items-center gap-2 mb-2">
                         <meta.icon size={14} className="text-neutral-400" />
-                        <span className="text-[10px] uppercase tracking-widest font-mono text-neutral-400">
+                        <span className="text-caption uppercase tracking-widest font-mono text-neutral-400">
                           {meta.label}
                         </span>
-                        <span className="text-[10px] text-neutral-400 font-mono">
+                        <span className="text-caption text-neutral-400 font-mono">
                           ({tools.length})
                         </span>
                       </div>
@@ -685,7 +666,7 @@ export function ToolsSection() {
                                   {tool.tool_name}
                                 </span>
                                 {primaryEnum && (
-                                  <span className="text-[10px] font-bold text-cyan-300 border border-cyan-500/30 px-1 py-0.5 mr-2">
+                                  <span className="text-caption font-bold text-cyan-300 border border-cyan-500/30 px-1 py-0.5 mr-2">
                                     {primaryEnum.options.length}{" "}
                                     {primaryEnum.name}
                                     {primaryEnum.options.length === 1
@@ -694,12 +675,12 @@ export function ToolsSection() {
                                   </span>
                                 )}
                                 {isDev && (
-                                  <span className="text-[10px] font-bold text-amber-300 border border-amber-500/30 px-1 py-0.5 mr-2">
+                                  <span className="text-caption font-bold text-amber-300 border border-amber-500/30 px-1 py-0.5 mr-2">
                                     DEV
                                   </span>
                                 )}
                                 {isDev && tool.mode === "passive" && (
-                                  <span className="text-[10px] font-bold text-neutral-400 border border-neutral-700 px-1 py-0.5 mr-2">
+                                  <span className="text-caption font-bold text-neutral-400 border border-neutral-700 px-1 py-0.5 mr-2">
                                     PASSIVE
                                   </span>
                                 )}
@@ -712,7 +693,7 @@ export function ToolsSection() {
                                 </span>
                               </div>
                               {isExpanded && (
-                                <div className="px-4 pb-3 pt-1 border-t border-neutral-800/50">
+                                <div className="px-4 pb-3 pt-1 border-t border-border/50">
                                   {cleanDescription ? (
                                     <p className="text-xs text-neutral-300 leading-relaxed">
                                       {cleanDescription}
@@ -724,7 +705,7 @@ export function ToolsSection() {
                                   )}
                                   <div className="mt-2 flex items-center gap-3">
                                     <span
-                                      className={`text-[10px] font-mono px-2 py-0.5 ${tool.available ? "bg-emerald-900/30 text-emerald-300" : "bg-neutral-800 text-neutral-400"}`}
+                                      className={`text-caption font-mono px-2 py-0.5 ${tool.available ? "bg-emerald-900/30 text-emerald-300" : "bg-neutral-800 text-neutral-400"}`}
                                     >
                                       {tool.mode === "passive"
                                         ? "passive capture"
@@ -732,7 +713,7 @@ export function ToolsSection() {
                                           ? "available"
                                           : "unavailable"}
                                     </span>
-                                    <code className="text-[10px] font-mono text-neutral-400">
+                                    <code className="text-caption font-mono text-neutral-400">
                                       {tool.tool_name}
                                     </code>
                                   </div>
@@ -751,8 +732,8 @@ export function ToolsSection() {
                                             key={`${tool.tool_name}-${param.name}`}
                                             className="space-y-2"
                                           >
-                                            <div className="flex items-center gap-2 text-[10px] uppercase tracking-widest text-neutral-400 font-mono">
-                                              <code className="border border-neutral-700 bg-neutral-950 px-1.5 py-0.5 text-neutral-300 normal-case">
+                                            <div className="flex items-center gap-2 text-caption uppercase tracking-widest text-neutral-400 font-mono">
+                                              <code className="border border-neutral-700 bg-background px-1.5 py-0.5 text-neutral-300 normal-case">
                                                 {param.name}
                                               </code>
                                               <span>
@@ -760,7 +741,7 @@ export function ToolsSection() {
                                               </span>
                                             </div>
                                             {param.description && (
-                                              <p className="text-[10px] text-neutral-400">
+                                              <p className="text-caption text-neutral-400">
                                                 {param.description}
                                               </p>
                                             )}
@@ -818,7 +799,7 @@ function HealthSection() {
 
   return (
     <section className="space-y-3">
-      <h2 className="text-xs uppercase tracking-widest text-neutral-400 font-mono">
+      <h2 className="text-xs uppercase tracking-widest text-neutral-400">
         Health
       </h2>
       <p className="text-xs text-neutral-400">
@@ -832,13 +813,13 @@ function HealthSection() {
           value={health?.status ?? (healthErr ? "unreachable" : "…")}
           detail={health?.timestamp ? fmtDate(health.timestamp) : undefined}
           tone={
-            health?.status === "ok" ? "emerald" : healthErr ? "red" : "neutral"
+            health?.status === "ok" ? "success" : healthErr ? "destructive" : "neutral"
           }
         />
         <MetricCard
           label="Hosts reporting"
           value={hosts ? `${activeHosts.length}/${hosts.length}` : "…"}
-          tone="cyan"
+          tone="info"
         />
       </div>
       {hosts && hosts.length === 0 ? (
@@ -849,11 +830,11 @@ function HealthSection() {
             <Card key={host.host_id} className="p-3">
               <div className="flex items-center justify-between gap-2">
                 <span className="text-sm text-neutral-200">{host.label}</span>
-                <Chip tone={host.status === "active" ? "emerald" : "neutral"}>
+                <Chip tone={host.status === "active" ? "success" : "neutral"}>
                   {host.status}
                 </Chip>
               </div>
-              <div className="mt-1 text-[10px] text-neutral-400">
+              <div className="mt-1 text-caption text-neutral-400">
                 {host.last_import_at
                   ? `Last import: ${fmtDate(host.last_import_at)} · ${host.imported_session_count ?? 0} sessions`
                   : "No imports recorded yet."}
@@ -887,6 +868,11 @@ export default function System({ forcedSection }: { forcedSection?: Section }) {
 
   return (
     <PageFrame className="space-y-4 text-sm">
+      {!forcedSection && (
+        <UiButton asChild variant="ghost" size="sm" className="-ml-2 w-fit">
+          <Link to="/settings/advanced"><ArrowLeft size={14} />Back to Advanced</Link>
+        </UiButton>
+      )}
       {active === "health" && <HealthSection />}
       {active === "hosts" && <HostsSection />}
       {active === "agents" && <AgentsSection />}

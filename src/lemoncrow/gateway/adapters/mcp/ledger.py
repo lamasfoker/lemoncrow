@@ -310,10 +310,10 @@ def _get_claude_session_id() -> str:
     return _get_product_session_id()
 
 
-# Per-session paths served IN FULL via `read` (mode == "full"). Same session-
-# bucketing/time-window rationale as mcp_server's _RECENT_CODE_SEARCH_QUERIES
-# (HTTP: per client session; stdio: one process-wide "_global" bucket per host
-# window). Feeds _check_redundant_file_dump: a bash `cat`/`head`/`tail`/
+# Per-session paths served IN FULL via `read` (mode == "full"), bucketed per
+# session (HTTP: per client session; stdio: one process-wide "_global" bucket
+# per host window) and time-bounded, because a long-lived daemon's "_global"
+# bucket spans unrelated conversations. Feeds _check_redundant_file_dump: a bash `cat`/`head`/`tail`/
 # `sed -n ...p` of a path the model already has the complete content of (from
 # THIS session's `read` call) adds nothing -- confirmed in a 2026-07-25
 # debt-benchmark rep: `read debt.py:full`, then `sed -n '60,160p' debt.py` via
@@ -376,8 +376,8 @@ def _check_redundant_file_dump(command: str, cwd: str | None) -> str | None:
 
     A hard backstop for the tool-discipline guidance ("bash = execution only,
     never cat/sed a file already read") -- textual guidance alone did not stop
-    it under verification pressure (measured in the same debt-benchmark rep
-    that motivated _RECENT_CODE_SEARCH_QUERIES). Returns None when *command*
+    it under verification pressure (measured in the same 2026-07-25
+    debt-benchmark rep). Returns None when *command*
     doesn't match a bare dump, or the path wasn't recently read in full --
     never blocks a compound command (pipes/redirects/`&&`) or a fresh path.
     """

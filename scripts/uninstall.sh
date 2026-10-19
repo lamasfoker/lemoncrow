@@ -2,7 +2,7 @@
 # uninstall.sh — Remove LemonCrow and all agent-host integrations
 #
 # Usage:
-#   bash scripts/uninstall.sh [--dry-run] [--no-hosts] [--purge] [--workspace DIR]
+#   bash scripts/uninstall.sh [--dry-run] [--no-hosts] [--purge] [--profile-only] [--workspace DIR]
 #
 # Optional environment variables:
 #   LEMONCROW_BIN_DIR    Global bin dir for console scripts (default: ~/.local/bin)
@@ -32,27 +32,48 @@ else
     C_PURPLE=""
 fi
 C_FRAME="$C_DIM"
-LEMONCROW_BIN_DIR="${LEMONCROW_BIN_DIR:-${HOME}/.lemoncrow/bin}"
-LEMONCROW_TOOL_DIR="${LEMONCROW_TOOL_DIR:-${HOME}/.lemoncrow/uv-tools}"
+# Honor LEMONCROW_HOME so removing a sandbox install (make oss-dev) never touches
+# the live ~/.lemoncrow.
+LEMONCROW_STATE_ROOT="${LEMONCROW_HOME:-${HOME}/.lemoncrow}"
+LEMONCROW_STATE_ROOT="${LEMONCROW_STATE_ROOT%/}"
+LEMONCROW_BIN_DIR="${LEMONCROW_BIN_DIR:-${LEMONCROW_STATE_ROOT}/bin}"
+LEMONCROW_TOOL_DIR="${LEMONCROW_TOOL_DIR:-${LEMONCROW_STATE_ROOT}/uv-tools}"
 LEMONCROW_DRY_RUN="${LEMONCROW_DRY_RUN:-0}"
 LEMONCROW_NO_HOSTS="${LEMONCROW_NO_HOSTS:-0}"
-LEMONCROW_INSTALL_RECORD="${HOME}/.lemoncrow/install_dir"
-LEMONCROW_DEFAULT_INSTALL_DIR="${HOME}/.lemoncrow/install"
+LEMONCROW_INSTALL_RECORD="${LEMONCROW_STATE_ROOT}/install_dir"
+LEMONCROW_DEFAULT_INSTALL_DIR="${LEMONCROW_STATE_ROOT}/install"
 LEMONCROW_PROTECTED_SOURCE_ROOTS="${LEMONCROW_PROTECTED_SOURCE_ROOTS:-${HOME}/Projects}"
 PASSTHROUGH=()
 WORKSPACE_EXPLICIT=0
 PURGE=0
+PROFILE_ONLY=0
 DEFERRED_REMOVE_INSTALL_DIR=""
 
+print_usage() {
+    cat <<'EOF'
+Usage: bash scripts/uninstall.sh [OPTIONS]
+
+Remove LemonCrow and its managed host integrations.
+
+Options:
+  --dry-run         Print planned actions without changing anything.
+  --no-hosts        Leave agent-host integrations untouched.
+  --purge           Also remove LemonCrow state and data.
+  --profile-only    Remove only shell profile/PATH integration.
+  --workspace DIR   Scope workspace host cleanup to DIR.
+  -h, --help        Show this help and exit without making changes.
+EOF
+}
+
 # Read the memory sidecar that was selected at install time (if any).
-_MEMORY_BACKEND_FILE="${HOME}/.lemoncrow/memory_backend"
+_MEMORY_BACKEND_FILE="${LEMONCROW_STATE_ROOT}/memory_backend"
 LEMONCROW_MEMORY_BACKEND=""
 if [[ -f "$_MEMORY_BACKEND_FILE" ]]; then
     LEMONCROW_MEMORY_BACKEND="$(head -n 1 "$_MEMORY_BACKEND_FILE" 2>/dev/null | tr -d '[:space:]')"
 fi
 
 # Read the Zoekt selection that was persisted at install time (if any).
-_ZOEKT_ENABLED_FILE="${HOME}/.lemoncrow/zoekt_enabled"
+_ZOEKT_ENABLED_FILE="${LEMONCROW_STATE_ROOT}/zoekt_enabled"
 LEMONCROW_ZOEKT=""
 if [[ -f "$_ZOEKT_ENABLED_FILE" ]]; then
     LEMONCROW_ZOEKT="$(head -n 1 "$_ZOEKT_ENABLED_FILE" 2>/dev/null | tr -d '[:space:]')"
@@ -60,9 +81,11 @@ fi
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        -h|--help)  print_usage; exit 0 ;;
         --dry-run)  LEMONCROW_DRY_RUN=1; PASSTHROUGH+=("$1") ;;
         --no-hosts) LEMONCROW_NO_HOSTS=1 ;;
         --purge)    PURGE=1 ;;
+        --profile-only) PROFILE_ONLY=1 ;;
         --workspace)
             if [ $# -lt 2 ]; then echo "Missing value for --workspace" >&2; exit 1; fi
             PASSTHROUGH+=("$1" "$2"); WORKSPACE_EXPLICIT=1; shift ;;
@@ -139,15 +162,20 @@ is_protected_source_path() {
 }
 
 purge_leftovers() {
-    local repo_root install_dir
+    local repo_root install_dir script_root_real
+    # Capture the script/install root before removing ~/.lemoncrow. Packaged
+    # uninstalls execute this very script from ~/.lemoncrow/install/scripts, so
+    # resolving SCRIPT_DIR after the purge would fail because the directory has
+    # intentionally disappeared.
     repo_root="$(cd "${SCRIPT_DIR}/.." && pwd)"
+    script_root_real="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
     install_dir="${LEMONCROW_INSTALL_DIR:-$(install_dir_from_record)}"
     install_dir="${install_dir:-$LEMONCROW_DEFAULT_INSTALL_DIR}"
 
     printf "%b│%b\n" "$C_FRAME" "$C_RESET"
     remove_path "${LEMONCROW_TOOL_DIR}/lemoncrow"
     remove_path "${LEMONCROW_TOOL_DIR}/lemoncrow"
-    remove_path "${HOME}/.lemoncrow/uv-tools/lemoncrow"
+    remove_path "${LEMONCROW_STATE_ROOT}/uv-tools/lemoncrow"
     remove_path "${HOME}/.local/share/uv/tools/lemoncrow"
     remove_file_if_lemoncrow "${HOME}/.codex/AGENTS.md"
     remove_glob "${HOME}/.codex/AGENTS.md.lemoncrow-backup.*"
@@ -181,21 +209,20 @@ purge_leftovers() {
             ;;
         openmemory)
             info "Removing OpenMemory Docker state and checkout..."
-            local om_workdir="${HOME}/.lemoncrow/openmemory/mem0/openmemory"
+            local om_workdir="${LEMONCROW_STATE_ROOT}/openmemory/mem0/openmemory"
             if [[ -d "$om_workdir" ]] && command -v docker >/dev/null 2>&1; then
                 run "docker compose -C $(printf %q "$om_workdir") down -v --remove-orphans 2>/dev/null || true"
             fi
-            remove_path "${HOME}/.lemoncrow/openmemory"
+            remove_path "${LEMONCROW_STATE_ROOT}/openmemory"
             ;;
     esac
 
-    remove_path "${HOME}/.lemoncrow"
+    remove_path "${LEMONCROW_STATE_ROOT}"
     # Telemetry id + config live under XDG config, outside ~/.lemoncrow.
     remove_path "${XDG_CONFIG_HOME:-${HOME}/.config}/lemoncrow"
 
     if [ -n "$install_dir" ]; then
-        local script_root_real install_dir_real
-        script_root_real="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
+        local install_dir_real
         if [[ -d "$install_dir" ]]; then
             install_dir_real="$(cd "$install_dir" && pwd -P)"
         else
@@ -219,12 +246,19 @@ purge_leftovers() {
     fi
 }
 
+if [[ "$PROFILE_ONLY" != "1" ]]; then
 # ---- stop memory sidecar (before background controller) --------------------
 if command -v lc &>/dev/null && [[ -n "$LEMONCROW_MEMORY_BACKEND" ]]; then
     case "$LEMONCROW_MEMORY_BACKEND" in
         letta)
             info "Stopping Letta memory sidecar..."
-            run "lc letta down 2>/dev/null || true"
+            letta_compose="${LEMONCROW_INSTALL_DIR:-$(install_dir_from_record)}/deploy/letta/docker-compose.yml"
+            if [[ ! -f "$letta_compose" ]]; then
+                letta_compose="${SCRIPT_DIR}/../deploy/letta/docker-compose.yml"
+            fi
+            if [[ -f "$letta_compose" ]] && command -v docker >/dev/null 2>&1; then
+                run "docker compose -f $(printf %q "$letta_compose") down 2>/dev/null || true"
+            fi
             ;;
         openmemory)
             info "Stopping OpenMemory memory sidecar..."
@@ -244,15 +278,11 @@ fi
 # ---- stop running services --------------------------------------------------
 if command -v lc &>/dev/null; then
     case "$LEMONCROW_MEMORY_BACKEND" in
-        letta)
-            info "Stopping Letta memory sidecar..."
-            run "lc letta down 2>/dev/null || true"
-            ;;
         openmemory)
             info "Stopping OpenMemory memory sidecar..."
             run "lc openmemory down 2>/dev/null || true"
             ;;
-        "")
+        letta|"")
             ;;
         *)
             warn "Unknown memory backend '$LEMONCROW_MEMORY_BACKEND' in $_MEMORY_BACKEND_FILE — skipping sidecar teardown"
@@ -260,7 +290,7 @@ if command -v lc &>/dev/null; then
     esac
 
     info "Stopping persistent MCP tunnel..."
-    run "lc mcp service stop 2>/dev/null || true"
+    run "lc runtime mcp service stop 2>/dev/null || true"
     if [[ -x "${SCRIPT_DIR}/local_server.sh" ]]; then
         info "Stopping LemonCrow local loopback server..."
         run "bash '${SCRIPT_DIR}/local_server.sh' stop 2>/dev/null || true"
@@ -275,9 +305,31 @@ fi
 
 # ---- per-host uninstallers --------------------------------------------------
 if [[ "$LEMONCROW_NO_HOSTS" != "1" ]]; then
-    for host in claude codex opencode lemoncode copilot antigravity cursor hermes; do
+    # Per-product (split) installs register hosts through the Runtime client
+    # (`lc rt enable <host>`) and ship no uninstall_<host>.sh; remove those
+    # registrations with the same client before it is deleted.
+    runtime_client="${LEMONCROW_RUNTIME_INSTALL_ROOT:-${LEMONCROW_HOME:-${HOME}/.lemoncrow}/runtime/client}/bin/lemoncrow-client"
+    if [[ -x "$runtime_client" ]]; then
+        info "Removing Runtime host registrations (claude, codex, opencode, pi)..."
+        for runtime_host in claude codex opencode; do
+            run "$(printf %q "$runtime_client") runtime disable ${runtime_host} >/dev/null 2>&1 || true"
+        done
+        run "$(printf %q "$runtime_client") runtime host remove --engine pi --yes >/dev/null 2>&1 || true"
+    fi
+    # Warn about a missing per-host uninstaller only in a full-engine layout
+    # (at least one uninstall_<host>.sh present); split installs have none.
+    host_suite_present=0
+    for host_script in "${SCRIPT_DIR}"/uninstall_{claude,codex,opencode,pi,lemoncode,copilot,antigravity,cursor,hermes}.sh; do
+        if [[ -f "$host_script" ]]; then host_suite_present=1; break; fi
+    done
+    for host in claude codex opencode pi lemoncode copilot antigravity cursor hermes; do
         script="${SCRIPT_DIR}/uninstall_${host}.sh"
-        [ -f "$script" ] || continue
+        if [[ ! -f "$script" ]]; then
+            if [[ "$host_suite_present" == "1" ]]; then
+                warn "No uninstaller for ${host} at ${script} — its host integration was left in place"
+            fi
+            continue
+        fi
         printf "%b│%b\n" "$C_FRAME" "$C_RESET"
         printf "%b┌%b  Uninstalling LemonCrow ← %s\n" "$C_FRAME" "$C_RESET" "$host"
         printf "%b│%b\n" "$C_FRAME" "$C_RESET"
@@ -296,7 +348,7 @@ fi
 
 # ---- remove main bin commands ------------------------------------------------
 info "Removing LemonCrow bin commands from ${LEMONCROW_BIN_DIR}..."
-for cmd in lemoncrow lc lemoncode lemoncrowd lcd; do
+for cmd in lemoncrow lc lcr lemoncode lemoncrowd lcd pi-host; do
     target="${LEMONCROW_BIN_DIR}/${cmd}"
     if [ -f "$target" ] || [ -L "$target" ]; then
         run "rm -f $(printf %q "$target")"
@@ -308,7 +360,7 @@ done
 # remove a symlink that points into the LemonCrow tree -- never clobber an
 # remove a symlink that points into the LemonCrow tree -- never clobber an
 # unrelated binary a user placed there.
-for cmd in lemoncrow lc lemoncode lemoncrowd lcd; do
+for cmd in lemoncrow lc lcr lemoncode lemoncrowd lcd; do
     target="${HOME}/.local/bin/${cmd}"
     if [ -L "$target" ]; then
         link_dest="$(readlink "$target" 2>/dev/null || true)"
@@ -317,6 +369,7 @@ for cmd in lemoncrow lc lemoncode lemoncrowd lcd; do
         esac
     fi
 done
+fi
 
 # ---- remove PATH sentinel from shell profile --------------------------------
 _remove_path_sentinel() {
@@ -362,6 +415,7 @@ _remove_path_sentinel() {
     done
 }
 _remove_path_sentinel
+[[ "$PROFILE_ONLY" == "1" ]] && exit 0
 
 # ---- remove LemonCrow git attribution hook from the workspace ---------------
 _remove_attribution_hook() {
@@ -427,11 +481,11 @@ if [[ "$PURGE" == "1" ]]; then
             ;;
         openmemory)
             info "Removing OpenMemory Docker state and checkout..."
-            om_workdir="${HOME}/.lemoncrow/openmemory/mem0/openmemory"
+            om_workdir="${LEMONCROW_STATE_ROOT}/openmemory/mem0/openmemory"
             if [[ -d "$om_workdir" ]] && command -v docker >/dev/null 2>&1; then
                 run "docker compose --project-directory $(printf %q "$om_workdir") down -v --remove-orphans 2>/dev/null || true"
             fi
-            remove_path "${HOME}/.lemoncrow/openmemory"
+            remove_path "${LEMONCROW_STATE_ROOT}/openmemory"
             ;;
     esac
 

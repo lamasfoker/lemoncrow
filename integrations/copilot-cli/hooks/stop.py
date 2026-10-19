@@ -232,6 +232,44 @@ def _format_summary(stats: dict[str, Any], savings: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _workspace_state_path(workspace: str) -> Path:
+    return Path(workspace).expanduser().resolve() / ".lemoncrow" / "workspace" / "session_state.json"
+
+
+def _set_session_activity(workspace: str, session_id: str, activity: str) -> None:
+    if not session_id:
+        return
+    path = _workspace_state_path(workspace)
+    try:
+        state = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        if not isinstance(state, dict):
+            state = {}
+    except (OSError, json.JSONDecodeError):
+        state = {}
+    state.update({"host": "copilot", "session_id": session_id, "activity": activity})
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _review_feedback_continuation(payload: dict[str, Any], workspace: str) -> tuple[str, tuple[str, ...]]:
+    """Lease feedback only when this stop can force the exact-session continuation."""
+
+    del workspace
+    session_id = _session_id(payload)
+    if not session_id:
+        return "", ()
+    try:
+        from review_feedback import feedback_context, lease_feedback
+
+        messages, message_ids = lease_feedback(session_id)
+        return feedback_context(messages, continue_now=True), message_ids
+    except (ImportError, OSError, TypeError, ValueError):
+        return "", ()
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -251,14 +289,36 @@ def main() -> int:
         or os.getcwd()
     )
 
+    session_id = _session_id(payload)
     stats = _read_events_stats(transcript_path)
-    savings = _read_workspace_savings(_session_id(payload), workspace)
+    savings = _read_workspace_savings(session_id, workspace)
+    continuation, continuation_ids = _review_feedback_continuation(payload, workspace)
 
-    if stats["tool_calls"] == 0 and stats["output_tokens"] == 0:
-        return 0
+    output: dict[str, Any] = {}
+    if stats["tool_calls"] != 0 or stats["output_tokens"] != 0:
+        summary = _format_summary(stats, savings)
+        output["systemMessage"] = f"lemoncrow: session complete.\n{summary}"
 
-    summary = _format_summary(stats, savings)
-    sys.stdout.write(json.dumps({"systemMessage": f"lemoncrow: session complete.\n{summary}"}) + "\n")
+    if continuation:
+        # Copilot CLI queues `reason` as another user turn in this exact process.
+        # A forced continuation may block again only when this stop atomically
+        # claims genuinely newer feedback; an empty inbox terminates naturally.
+        _set_session_activity(workspace, session_id, "working")
+        output["decision"] = "block"
+        output["reason"] = continuation
+    else:
+        _set_session_activity(workspace, session_id, "idle")
+
+    if output:
+        sys.stdout.write(json.dumps(output) + "\n")
+        sys.stdout.flush()
+        if continuation and continuation_ids:
+            try:
+                from review_feedback import ack_feedback
+
+                ack_feedback(session_id, continuation_ids)
+            except (ImportError, OSError, TypeError, ValueError):
+                pass
     return 0
 
 

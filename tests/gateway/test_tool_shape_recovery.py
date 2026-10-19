@@ -46,10 +46,6 @@ def workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     mcp_server._ledger._realtime_ctx = None
     mcp_server._remote_client = MagicMock()
     mcp_server._remote_client.get_context.return_value = {"context": "", "run_ledger": []}
-    # The repeat-query bucket is process-wide ("_global" stdio bucket) --
-    # without clearing it, an earlier test's code_search query (e.g. the
-    # common "src.py" fixture file) can blank out a later, unrelated test.
-    mcp_server._RECENT_CODE_SEARCH_QUERIES.clear()
     # Same rationale, for the bash-cat/sed redundancy backstop's own
     # process-wide "_global" bucket (lives in mcp.ledger, not mcp_server).
     mcp_server._ledger._RECENT_FULL_READS.clear()
@@ -82,6 +78,16 @@ def test_read_files_entry_accepts_file_path_key(workspace: Path) -> None:
     text = _text(_call("read", {"files": [{"file_path": "entry.py"}]}))
 
     assert "MARKER_ENTRY" in text
+
+
+def test_read_paths_alias_recovers_host_batch_shape(workspace: Path) -> None:
+    (workspace / "one.py").write_text("ONE = 1\n", encoding="utf-8")
+    (workspace / "two.py").write_text("TWO = 2\n", encoding="utf-8")
+
+    text = _text(_call("read", {"paths": ["one.py", "two.py"]}))
+
+    assert "ONE = 1" in text and "TWO = 2" in text
+    assert "files must be a non-empty array" not in text
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +139,7 @@ def test_grep_pattern_alias_end_to_end(workspace: Path) -> None:
     assert "NEEDLE_TOKEN" in text
 
 
+@pytest.mark.private_engine
 def test_code_search_limit_param_end_to_end(workspace: Path) -> None:
     """code_search(..., limit=N) -- the common search-API kwarg name -- is the
     real parameter now (candidate_files cap), not an alias to anything."""
@@ -147,6 +154,7 @@ def test_code_search_limit_param_end_to_end(workspace: Path) -> None:
     assert "NEEDLE_TOKEN" in text
 
 
+@pytest.mark.private_engine
 @pytest.mark.parametrize("vanilla_name", ["max_files", "maxFiles", "max_results", "max_candidates"])
 def test_code_search_limit_vanilla_aliases_end_to_end(workspace: Path, vanilla_name: str) -> None:
     """Every legacy/vanilla-habit spelling for "how many results" resolves to
@@ -160,31 +168,61 @@ def test_code_search_limit_vanilla_aliases_end_to_end(workspace: Path, vanilla_n
     assert "NEEDLE_TOKEN" in text
 
 
-def test_code_search_blanks_near_duplicate_query_end_to_end(workspace: Path) -> None:
-    """Two identical code_search calls in a row -- the exact regression shape
-    from a real debt-benchmark rep (17+ near-duplicate calls, 2026-07-25) --
-    the SECOND call must return blank (no engine call, no explanatory text --
-    a prose hint was tried and measured to be skimmed past and ignored).
-    Fast-pathed query (a literal existing file path) so the first call's
-    content is deterministic, not dependent on background-index timing.
+def test_code_search_recovers_host_include_glob(workspace: Path) -> None:
+    client = workspace / "client"
+    client.mkdir()
+    (client / "needle.py").write_text("HOST_INCLUDE_MARKER = 1\n", encoding="utf-8")
+
+    text = _text(_call("code_search", {"query": "HOST_INCLUDE_MARKER", "include": "client/**", "max_results": 5}))
+
+    assert "unknown argument" not in text
+    assert "payload_invalid" not in text
+
+
+def test_code_search_accepts_host_mode_and_include_snippets(workspace: Path) -> None:
+    frontend = workspace / "frontend"
+    frontend.mkdir()
+    (frontend / "prep.py").write_text("PREPARATION_MARKER = 1\n", encoding="utf-8")
+
+    text = _text(
+        _call(
+            "code_search",
+            {"query": "PREPARATION_MARKER", "path": "frontend", "mode": "files", "include_snippets": True},
+        )
+    )
+
+    assert "unknown argument" not in text
+    assert "payload_invalid" not in text
+
+
+@pytest.mark.private_engine
+def test_code_search_repeats_exact_query_against_current_source(workspace: Path) -> None:
+    """An identical query must not be suppressed when the source changed.
+
+    Query-text similarity cannot prove the previous result is still current;
+    transport/content dedup may optimize identical bytes after execution, but
+    the search itself must observe the latest workspace state.
     """
-    mcp_server._RECENT_CODE_SEARCH_QUERIES.clear()
-    (workspace / "src.py").write_text("NEEDLE_TOKEN = 1\n", encoding="utf-8")
+    source = workspace / "src.py"
+    source.write_text("NEEDLE_TOKEN = 1\n", encoding="utf-8")
 
     first = _text(_call("code_search", {"query": "src.py"}))
+    source.write_text("NEEDLE_TOKEN = 2\n", encoding="utf-8")
     second = _text(_call("code_search", {"query": "src.py"}))
 
-    assert "NEEDLE_TOKEN" in first
-    assert second == "no exact match -- ranked candidates"
-    assert "[lc:" not in second
+    assert "NEEDLE_TOKEN = 1" in first
+    assert "NEEDLE_TOKEN = 2" in second
 
 
 def test_alias_registry_covers_vanilla_habits() -> None:
     tools = mcp_server.TOOLS
     assert tools["read"]["param_aliases"]["file_path"] == "path"
+    assert tools["read"]["param_aliases"]["paths"] == "files"
     assert tools["grep"]["param_aliases"]["pattern"] == "regex"
     assert tools["grep"]["param_aliases"]["-i"] == "i"
     assert tools["code_search"]["param_aliases"]["pattern"] == "query"
+    assert tools["code_search"]["param_aliases"]["include"] == "paths"
+    assert tools["code_search"]["param_aliases"]["include_snippets"] == "include_source"
     # code_search has exactly one agent-visible count knob (`limit`, a real
     # param, not aliased) -- every vanilla/legacy spelling for it redirects
     # here instead of landing on a separate, confusing second parameter.
@@ -257,6 +295,7 @@ def test_read_force_true_is_not_an_unknown_argument(workspace: Path) -> None:
     assert "VALUE = 1" in forced
 
 
+@pytest.mark.private_engine
 def test_code_search_force_true_is_not_an_unknown_argument(workspace: Path) -> None:
     (workspace / "needle.py").write_text("NEEDLE_TOKEN = 1\n", encoding="utf-8")
 

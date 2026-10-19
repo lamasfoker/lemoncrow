@@ -1,7 +1,6 @@
 """Lightweight metrics for the reasoning runtime.
 
-Intentionally minimal: we count things, not collect telemetry. Useful
-for the `lc list-playbooks` summary and tests.
+Counts knowledge-store contents for internal runtime summaries.
 """
 
 from __future__ import annotations

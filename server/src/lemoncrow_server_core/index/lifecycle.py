@@ -23,12 +23,14 @@ goodbye, and its derived layers go with it.
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Final, Protocol
 
 from .contracts import IndexBackend
+from .deferred import cancel_deferred_view
 
 __all__ = [
     "DEFAULT_RETENTION_S",
@@ -53,6 +55,8 @@ class ViewTreeStore(Protocol):
 
     def sweep(self) -> int: ...
 
+
+_LOG = logging.getLogger(__name__)
 
 #: How long a blob stays after the last view stopped referencing it.
 DEFAULT_RETENTION_S: Final[float] = 7 * 24 * 60 * 60.0
@@ -102,6 +106,7 @@ class StorageReport:
     analysis_artifacts: int
     manifest_bytes: int
     view_bytes: int
+    physical_index_bytes: int = 0
 
     @property
     def layer1_bytes(self) -> int:
@@ -126,6 +131,7 @@ class StorageReport:
             "view_bytes": self.view_bytes,
             "layer1_bytes": self.layer1_bytes,
             "per_view_bytes": self.per_view_bytes,
+            "physical_index_bytes": self.physical_index_bytes,
         }
 
 
@@ -141,7 +147,9 @@ class Maintenance:
         retention_s: float = DEFAULT_RETENTION_S,
         clock: Callable[[], float] = time.time,
         view_trees: ViewTreeStore | None = None,
-        reference_providers: Sequence[Callable[[], Mapping[str, frozenset[str]]]] = (),
+        reference_providers: Sequence[
+            Callable[[], Mapping[str, frozenset[str]]] | Callable[[], Mapping[tuple[str, str], frozenset[str]]]
+        ] = (),
         on_view_evicted: Callable[[str], None] | None = None,
     ) -> None:
         if retention_s < 0:
@@ -164,12 +172,69 @@ class Maintenance:
 
     def run_once(self) -> MaintenanceReport:
         now = float(self._clock())
+        partition_fn = self._backend.partitions
+        partitioned = partition_fn is not None
+        partitions = partition_fn() if partition_fn is not None else (self._backend,)
+        external_by_org: dict[str, set[str]] = {}
+        external_by_partition: dict[tuple[str, str], set[str]] = {}
+        references_known = True
+        for provider in self._reference_providers:
+            try:
+                provided = provider()
+            except Exception:
+                # What a failed provider would name is unknown, so no content is
+                # marked or swept this pass; the rest of maintenance still runs.
+                _LOG.exception("a retention reference provider failed; keeping all content this pass")
+                references_known = False
+                continue
+            for scope, digests in provided.items():
+                if isinstance(scope, tuple):
+                    if len(scope) != 2:
+                        raise RuntimeError("external reference partition keys must be (org_id, repo_id)")
+                    provider_key = (str(scope[0]), str(scope[1]))
+                    external_by_partition.setdefault(provider_key, set()).update(digests)
+                    if not partitioned:
+                        external_by_org.setdefault(provider_key[0], set()).update(digests)
+                    continue
+                if partitioned:
+                    raise RuntimeError(
+                        "repository-partitioned maintenance requires external references scoped by (org_id, repo_id)"
+                    )
+                external_by_org.setdefault(str(scope), set()).update(digests)
 
-        evicted = self._backend.views.evict_expired(now)
+        reports: list[MaintenanceReport] = []
+        for backend in partitions:
+            external = external_by_org
+            if partitioned:
+                partition_key = backend.partition_key
+                if partition_key is None:
+                    raise RuntimeError("repository partition is missing its (org_id, repo_id) identity")
+                retained_digests = external_by_partition.get(partition_key)
+                external = {} if not retained_digests else {partition_key[0]: set(retained_digests)}
+            reports.append(self._run_partition(backend, now, external, sweep_content=references_known))
+        trees_dropped = self._trees.sweep() if self._trees is not None else 0
+        self._backend.reclaim_storage()
+        self._last = MaintenanceReport(
+            ran_at=now,
+            views_evicted=sum(report.views_evicted for report in reports),
+            blobs_marked=sum(report.blobs_marked for report in reports),
+            blobs_swept=sum(report.blobs_swept for report in reports),
+            analysis_rows_dropped=sum(report.analysis_rows_dropped for report in reports),
+            bytes_reclaimed=sum(report.bytes_reclaimed for report in reports),
+            manifest_roots_swept=sum(report.manifest_roots_swept for report in reports),
+            view_trees_dropped=trees_dropped + sum(report.view_trees_dropped for report in reports),
+        )
+        return self._last
+
+    def _run_partition(
+        self, backend: IndexBackend, now: float, external: Mapping[str, set[str]], *, sweep_content: bool = True
+    ) -> MaintenanceReport:
+        evicted = backend.views.evict_expired(now)
         trees_dropped = 0
         for view_id in evicted:
-            self._backend.links.forget_view(view_id)
-            self._backend.semantic.forget_view(view_id)
+            cancel_deferred_view(backend, view_id, now=now)
+            backend.links.forget_view(view_id)
+            backend.semantic.forget_view(view_id)
             if self._trees is not None and self._trees.forget_view(view_id):
                 trees_dropped += 1
             # The view store owns lease expiry, but composition layers may hold
@@ -178,41 +243,53 @@ class Maintenance:
             # expired physical view cannot remain live in accounting forever.
             if self._on_view_evicted is not None:
                 self._on_view_evicted(view_id)
-        if self._trees is not None:
-            # Then the quota, so a process that has been serving many views for
-            # a long time reclaims on the same schedule as everything else
-            # rather than only when the next materialization happens to notice.
-            trees_dropped += self._trees.sweep()
+        # Explicit closes and expiries both leave generation ANNs behind until
+        # released here; this pass runs off the event loop. Looked up on the
+        # type so a routing proxy's __getattr__ never fabricates the method.
+        if callable(getattr(type(backend.semantic), "release_idle", None)):
+            backend.semantic.release_idle()
 
         # Manifest roots outlive their views on purpose -- that is what makes a
         # reopened worktree warm -- so they are reclaimed here, on the same
         # retention window as an unreferenced blob, and only once no live view
         # names them. This runs *before* reference counting so the digests a
         # swept root was keeping alive stop counting in the same pass.
-        roots_swept = self._backend.views.sweep_manifest_roots(now - self._retention_s)
+        roots_swept = backend.views.sweep_manifest_roots(now - self._retention_s)
+
+        if not sweep_content:
+            # A marked blob a failed provider still names would be swept below.
+            return MaintenanceReport(
+                ran_at=now,
+                views_evicted=len(evicted),
+                blobs_marked=0,
+                blobs_swept=0,
+                analysis_rows_dropped=0,
+                bytes_reclaimed=0,
+                manifest_roots_swept=roots_swept,
+                view_trees_dropped=trees_dropped,
+            )
 
         combined: dict[str, set[str]] = {
-            org_id: set(view_digests) for org_id, view_digests in self._backend.views.referenced_digests().items()
+            org_id: set(view_digests) for org_id, view_digests in backend.views.referenced_digests().items()
         }
-        for provider in self._reference_providers:
-            for org_id, provider_digests in provider().items():
-                combined.setdefault(org_id, set()).update(provider_digests)
+        for org_id, provider_digests in external.items():
+            combined.setdefault(org_id, set()).update(provider_digests)
         referenced: Mapping[str, frozenset[str]] = {
             org_id: frozenset(live_digests) for org_id, live_digests in combined.items()
         }
-        marked = self._backend.content.mark_unreferenced(referenced, now)
+        marked = backend.content.mark_unreferenced(referenced, now)
 
-        swept = self._backend.content.sweep_marked(now - self._retention_s)
+        swept = backend.content.sweep_marked(now - self._retention_s)
         analysis_dropped = 0
         for org_id, swept_digests in swept.dropped.items():
             # Derived rows follow their content out. Nothing keeps an analysis
             # artifact for bytes the tenant no longer has.
-            analysis_dropped += self._backend.analysis.sweep(org_id, swept_digests)
+            analysis_dropped += backend.analysis.sweep(org_id, swept_digests)
             # And so does the record of who demonstrated possession of them. A
             # possession row that outlived its bytes would make the same digest
             # addressable again the moment anybody re-uploaded it, to a scope
             # that had not demonstrated anything this time round.
-            self._backend.provenance.forget(org_id, swept_digests)
+            backend.provenance.forget(org_id, swept_digests)
 
         report = MaintenanceReport(
             ran_at=now,
@@ -224,7 +301,6 @@ class Maintenance:
             manifest_roots_swept=roots_swept,
             view_trees_dropped=trees_dropped,
         )
-        self._last = report
         return report
 
     def storage_report(self, org_id: str) -> StorageReport:
@@ -245,6 +321,7 @@ class Maintenance:
             analysis_artifacts=analysis.count(org_id),
             manifest_bytes=_int(views, "root_bytes", org_id),
             view_bytes=_int(views, "view_bytes", org_id),
+            physical_index_bytes=self._backend.disk_usage(org_id) if self._backend.disk_usage is not None else 0,
         )
 
 

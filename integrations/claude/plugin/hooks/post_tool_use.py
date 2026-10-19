@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """PostToolUse hook — capture file diffs into the active RunLedger.
 
-Fires after Edit, Write, or MultiEdit. Computes the diff and appends a
-``file_edit`` event to the session's ``run.json`` (see
+Fires after Edit, Write, MultiEdit, or LemonCrow's own MCP ``edit``. Computes
+the diff and appends a ``file_edit`` event to the session's ``run.json`` (see
 ``lemoncrow.core.foundation.paths.session_dir``) so it shows up in the LemonCrow
-traces dashboard.
+traces dashboard and counts as exact authorship evidence.
 
 Fail-open: any error exits silently (code 0) — never blocks the agent.
 """
@@ -15,10 +15,26 @@ import datetime
 import difflib
 import json
 import os
+import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
+
+# LemonCrow's MCP edit tool under every name an install mounts it as.
+_LEMONCROW_EDIT_TOOLS = frozenset(
+    {
+        "mcp__lc__edit",
+        "mcp__lemoncrow__edit",
+        "mcp__plugin_lemoncrow_lc__edit",
+        "mcp__plugin_lemoncrow_lemoncrow__edit",
+    }
+)
+_LC_PATH_SELECTOR_RE = re.compile(r":(?:minified|L\d+(?:-L?\d+)?)$")
+# A PostToolUse hook runs right after the write; anything older is not this edit.
+_LC_EDIT_FRESH_S = 120.0
+_LC_EDIT_MAX_VERIFY_BYTES = 4 * 1024 * 1024
 
 # ---------------------------------------------------------------------------
 # State helpers (mirrors pre_tool_use.py / stop.py)
@@ -59,7 +75,7 @@ def _lemoncrow_root() -> Path:
 # ---------------------------------------------------------------------------
 
 
-def _git_diff(file_path: str) -> str:
+def _git_diff(file_path: str, cwd: str | None = None) -> str:
     """Try git diff HEAD for a file. Returns empty string on any failure."""
     try:
         result = subprocess.run(
@@ -67,6 +83,7 @@ def _git_diff(file_path: str) -> str:
             capture_output=True,
             text=True,
             timeout=5,
+            cwd=cwd,
         )
         return result.stdout.strip()
     except (subprocess.SubprocessError, OSError):
@@ -122,6 +139,126 @@ def _compute_diff(tool_name: str, tool_input: dict) -> tuple[str, str]:  # type:
         diff = _git_diff(file_path)
 
     return file_path, diff
+
+
+# ---------------------------------------------------------------------------
+# LemonCrow MCP edit
+# ---------------------------------------------------------------------------
+#
+# ``mcp__lc__edit`` batches hunks across files as ``{"edits": [{path, old?, new,
+# replace?}]}`` and its paths are relative to whichever checkout the LemonCrow
+# client routed the call to -- possibly a linked worktree the hook cannot see.
+# Authorship must stay exact, so a path is recorded only when exactly one
+# checkout holds a file that was written moments ago and contains every new
+# hunk. Anything ambiguous records nothing rather than crediting the wrong file.
+
+
+def _undecorate_lc_path(raw: str) -> str:
+    text = raw.strip()
+    while True:
+        stripped = _LC_PATH_SELECTOR_RE.sub("", text)
+        if stripped == text:
+            return text
+        text = stripped
+
+
+def _checkout_roots(cwd: str) -> list[Path]:
+    """The workspace's checkout plus every linked worktree git reports."""
+    try:
+        result = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return [Path(cwd)]
+    roots = [Path(line[len("worktree ") :]) for line in result.stdout.splitlines() if line.startswith("worktree ")]
+    return roots or [Path(cwd)]
+
+
+def _lc_edit_groups(tool_input: dict[str, Any]) -> dict[str, list[tuple[str, str]]]:
+    """Undecorated path -> its (old, new) hunks, in first-seen order."""
+    groups: dict[str, list[tuple[str, str]]] = {}
+    edits = tool_input.get("edits")
+    if not isinstance(edits, list):
+        return groups
+    for entry in edits:
+        if not isinstance(entry, dict):
+            continue
+        path = _undecorate_lc_path(str(entry.get("path") or entry.get("file_path") or ""))
+        if not path:
+            continue
+        old = str(entry.get("old") or entry.get("old_string") or "")
+        new = str(entry.get("new") or entry.get("new_string") or "")
+        groups.setdefault(path, []).append((old, new))
+    return groups
+
+
+def _verified_target(path: str, hunks: list[tuple[str, str]], roots: list[Path], now: float) -> Path | None:
+    """The one file this edit wrote, or ``None`` when that is not certain."""
+    spelled = Path(path).expanduser()
+    candidates = [spelled] if spelled.is_absolute() else [root / spelled for root in roots]
+    news = [new for _old, new in hunks if new]
+    matches: list[Path] = []
+    for candidate in candidates:
+        try:
+            stat = candidate.stat()
+            if now - stat.st_mtime > _LC_EDIT_FRESH_S:
+                continue
+            if news and stat.st_size <= _LC_EDIT_MAX_VERIFY_BYTES:
+                text = candidate.read_text("utf-8", errors="replace")
+                if not all(new in text for new in news):
+                    continue
+        except OSError:
+            continue
+        matches.append(candidate.resolve())
+    unique = list(dict.fromkeys(matches))
+    return unique[0] if len(unique) == 1 else None
+
+
+def _checkout_of(target: Path, roots: list[Path]) -> Path | None:
+    owners = [root for root in roots if target == root or root in target.parents]
+    return max(owners, key=lambda root: len(root.parts)) if owners else None
+
+
+def _lc_edit_diff(target: Path, hunks: list[tuple[str, str]]) -> str:
+    parts = [_unified_diff(old, new, str(target)) for old, new in hunks if old]
+    diff = "\n".join(part for part in parts if part)
+    if not diff:
+        diff = _git_diff(str(target), cwd=str(target.parent))
+    if not diff:
+        # A new, untracked file or a range edit git cannot see: the new text is
+        # still exactly what this call wrote.
+        diff = "\n".join(part for part in (_unified_diff("", new, str(target)) for _old, new in hunks if new) if part)
+    return diff
+
+
+def _record_lemoncrow_edit(payload: dict[str, Any], session_id: str) -> list[Path]:
+    """Record each verified file of one ``mcp__*__edit`` call; return their checkouts."""
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return []
+    groups = _lc_edit_groups(tool_input)
+    if not groups:
+        return []
+    cwd = str(payload.get("cwd") or "").strip() or _workspace_root()
+    roots = [root.resolve() for root in _checkout_roots(cwd)]
+    now = time.time()
+    checkouts: list[Path] = []
+    for path, hunks in groups.items():
+        target = _verified_target(path, hunks, roots, now)
+        if target is None:
+            continue
+        diff = _lc_edit_diff(target, hunks)
+        if not diff:
+            continue
+        _append_file_edit_event(session_id, str(target), diff)
+        checkout = _checkout_of(target, roots)
+        if checkout is not None and checkout not in checkouts:
+            checkouts.append(checkout)
+    return checkouts
 
 
 # ---------------------------------------------------------------------------
@@ -268,16 +405,49 @@ def _jj_snapshot_nudge() -> None:
         pass
 
 
+def _nudge_lemoncrow_view(path: str) -> None:
+    """Wake LemonCrow clients serving this checkout so the edit reaches the index now.
+
+    Freshness never depends on it -- every index call syncs the tree first --
+    this only takes that work off the next call. Fail-open and non-blocking.
+    """
+    try:
+        from lemoncrow_client.autosync import nudge_for_path
+
+        nudge_for_path(Path(path) if path else Path(os.getcwd()))
+    except Exception:  # a hook must never block the agent
+        pass
+
+
 def main() -> int:
     try:
         payload = json.loads(sys.stdin.read() or "{}")
     except (json.JSONDecodeError, OSError):
         return 0
     tool_name: str = payload.get("tool_name", "") or ""
+    if tool_name in _LEMONCROW_EDIT_TOOLS:
+        _jj_snapshot_nudge()
+        session_id = str(payload.get("session_id") or "").strip()
+        if not session_id:
+            return 0
+        try:
+            checkouts = _record_lemoncrow_edit(payload, session_id)
+        except (OSError, TypeError, ValueError):
+            return 0  # fail-open: never block the agent
+        for checkout in checkouts:
+            try:
+                from lemoncrow.pro.capabilities.review.live_runtime import request_live_review_prepare
+
+                request_live_review_prepare(_lemoncrow_root(), checkout, host="claude", session_id=session_id)
+            except (ImportError, OSError, TypeError, ValueError):
+                pass
+        return 0
     if tool_name not in ("Edit", "Write", "MultiEdit"):
         return 0
     _jj_snapshot_nudge()
     tool_input: dict[str, Any] = payload.get("tool_input", {}) or {}
+    # LemonCrow's own ``edit`` pushes what it wrote; a host edit does not.
+    _nudge_lemoncrow_view(str(tool_input.get("file_path") or "") or str(payload.get("cwd") or ""))
     try:
         file_path, diff = _compute_diff(tool_name, tool_input)
         if not file_path or not diff:
@@ -288,6 +458,17 @@ def main() -> int:
             return 0
 
         _append_file_edit_event(session_id, file_path, diff)
+        try:
+            from lemoncrow.pro.capabilities.review.live_runtime import request_live_review_prepare
+
+            request_live_review_prepare(
+                _lemoncrow_root(),
+                _workspace_root(),
+                host="claude",
+                session_id=session_id,
+            )
+        except (ImportError, OSError, TypeError, ValueError):
+            pass
     except (OSError, TypeError, ValueError):
         pass  # fail-open: never block the agent
 

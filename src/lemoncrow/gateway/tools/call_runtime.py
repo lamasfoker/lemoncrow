@@ -1,109 +1,66 @@
-"""Transport-neutral orchestration for one prepared LemonCrow tool call."""
+"""JSON-RPC ``tools/call`` adapter over :class:`ToolCallRuntime`.
+
+The runtime itself (:mod:`lemoncrow.gateway.tools.runtime_call`) knows nothing
+about JSON-RPC.  This module owns the translation from a ``tools/call``
+``params`` object into a :class:`RuntimeCall`, plus the process-default runtime
+used by host surfaces that are not the stdio composition root.
+"""
 
 from __future__ import annotations
 
-import time
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
 from typing import Any
 
-from lemoncrow.gateway.tools.errors import ToolArgumentError, ToolProtocolError
-from lemoncrow.gateway.tools.execution import execute_prepared_tool_call
-from lemoncrow.gateway.tools.invocation import ToolCallPreparationError, prepare_tool_call
-from lemoncrow.gateway.tools.lifecycle import ToolCallLifecycle, ToolLifecycleHooks
-from lemoncrow.gateway.tools.state import tool_call_images
-from lemoncrow.gateway.tools.workspace import clear_request_project, extract_request_project, set_request_project
+from lemoncrow.core.foundation.runtime_trace import is_trace_id, new_trace_id
+from lemoncrow.gateway.tools.errors import ToolProtocolError
+from lemoncrow.gateway.tools.invocation import _normalized_arguments
+from lemoncrow.gateway.tools.runtime_call import (
+    RuntimeCall,
+    RuntimeResult,
+    ToolCallRun,
+    ToolCallRuntime,
+    ToolCallRuntimeHooks,
+    commit_run_trace,
+    finalize_run_payload,
+)
+
+#: ``_meta`` key a caller uses to hand its trace id to the runtime.
+META_CALL_ID = "lemoncrow-call-id"
+_META_PROJECT_ID_KEYS = ("lemoncrow-project-id", "projectId", "project_id", "workspaceId", "workspace_id")
+_META_PROJECT_PATH_KEYS = ("mcp-project-path", "projectPath", "project_path", "projectRoot", "project_root")
 
 
-@dataclass(frozen=True, slots=True)
-class ToolCallRuntimeHooks:
-    broker_spec: dict[str, Any]
-    remote_tools: frozenset[str]
-    dispatch_remote: Callable[[str, dict[str, Any]], Any]
-    get_ledger: Callable[[], Any]
-    prepare_model_recommendation: Callable[..., Any]
-    finalize_model_recommendation: Callable[..., Any]
-    lifecycle_hooks: Callable[[], ToolLifecycleHooks]
-    record_session_cwd: Callable[[str, dict[str, Any]], None]
-    is_deferred_result: Callable[[Any], bool]
+def _meta_workspace(meta: Mapping[str, Any]) -> str | None:
+    for key in (*_META_PROJECT_ID_KEYS, *_META_PROJECT_PATH_KEYS):
+        value = meta.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
 
 
-@dataclass(slots=True)
-class ToolCallRun:
-    lifecycle: ToolCallLifecycle
-    result: Any = None
-    error: Exception | None = None
-    deferred: bool = False
+def runtime_call_from_jsonrpc(params: Any) -> RuntimeCall:
+    """Translate a JSON-RPC ``tools/call`` params object into a RuntimeCall."""
+    if not isinstance(params, Mapping):
+        params = {}
+    meta = params.get("_meta")
+    meta = meta if isinstance(meta, Mapping) else {}
+    call_id = meta.get(META_CALL_ID)
+    return RuntimeCall(
+        tool=str(params.get("name") or ""),
+        arguments=_normalized_arguments(params),
+        call_id=call_id if isinstance(call_id, str) and is_trace_id(call_id) else new_trace_id(),
+        workspace_id=_meta_workspace(meta),
+    )
 
 
 def run_tool_call(rid: Any, params: Any, *, hooks: ToolCallRuntimeHooks) -> ToolCallRun:
-    """Prepare and execute one tool call without choosing transport framing.
-
-    Request-shape/project binding faults raise :class:`ToolProtocolError` before
-    a lifecycle exists, matching the historical dispatcher behavior. Handler
-    failures are returned with the lifecycle so each host can apply the same
-    payload/error finalization policy. Deferred results are identified by an
-    injected predicate so this generic runtime never imports the MCP deferral
-    implementation.
-    """
-    tool_call_images.value = []
-    try:
-        prepared = prepare_tool_call(
-            params,
-            broker_spec=hooks.broker_spec,
-            remote_tools=hooks.remote_tools,
-        )
-    except ToolCallPreparationError as exc:
-        raise ToolProtocolError(exc.code, str(exc)) from exc
-
-    name = prepared.name
-    args = prepared.args
-    try:
-        prior_project = set_request_project(extract_request_project(params, args))
-    except ToolArgumentError as exc:
-        raise ToolProtocolError(-32602, str(exc)) from exc
-
-    hooks.record_session_cwd(name, args)
-    lifecycle = ToolCallLifecycle(
-        rid=rid,
-        name=name,
-        args=args,
-        remote_routed=prepared.remote_routed,
-        call_started=time.perf_counter(),
-        hooks=hooks.lifecycle_hooks(),
-    )
-    try:
-        try:
-            outcome = execute_prepared_tool_call(
-                prepared,
-                dispatch_remote=hooks.dispatch_remote,
-                get_ledger=hooks.get_ledger,
-                prepare_model_recommendation=hooks.prepare_model_recommendation,
-                finalize_model_recommendation=hooks.finalize_model_recommendation,
-            )
-        except Exception as exc:
-            return ToolCallRun(lifecycle=lifecycle, error=exc)
-
-        lifecycle.duration_ms = outcome.duration_ms
-        lifecycle.ledger = outcome.ledger
-        return ToolCallRun(
-            lifecycle=lifecycle,
-            result=outcome.result,
-            deferred=hooks.is_deferred_result(outcome.result),
-        )
-    finally:
-        clear_request_project(prior_project)
+    """Compatibility wrapper: JSON-RPC params -> :meth:`ToolCallRuntime.run`."""
+    return ToolCallRuntime(hooks).run(runtime_call_from_jsonrpc(params), correlation=rid)
 
 
 def finalize_tool_payload(run: ToolCallRun) -> dict[str, Any]:
     """Finalize one synchronous run into host-neutral tool content."""
-    if run.error is not None:
-        return run.lifecycle.finalize_error_payload(run.error)
-    if run.deferred:
-        return run.lifecycle.finalize_error_payload(
-            RuntimeError("deferred tool result is unsupported by synchronous payload execution")
-        )
-    return run.lifecycle.finalize_payload(run.result)
+    return finalize_run_payload(run)
 
 
 _DefaultHooksFactory = Callable[[], ToolCallRuntimeHooks]
@@ -124,20 +81,38 @@ def default_tool_runtime_configured() -> bool:
     return _default_hooks_factory is not None
 
 
-def execute_default_tool_payload(rid: Any, params: Any) -> dict[str, Any]:
-    """Execute and finalize one synchronous tool call via the configured runtime."""
+def default_tool_runtime() -> ToolCallRuntime:
     factory = _default_hooks_factory
     if factory is None:
         raise RuntimeError("default tool runtime is not configured")
-    return finalize_tool_payload(run_tool_call(rid, params, hooks=factory()))
+    return ToolCallRuntime(factory())
+
+
+def invoke_default_runtime(call: RuntimeCall, *, correlation: Any = None) -> RuntimeResult:
+    """Execute one typed call via the configured process-default runtime."""
+    return default_tool_runtime().invoke(call, correlation=correlation)
+
+
+def execute_default_tool_payload(rid: Any, params: Any) -> dict[str, Any]:
+    """Execute and finalize one JSON-RPC ``tools/call`` via the configured runtime."""
+    return invoke_default_runtime(runtime_call_from_jsonrpc(params), correlation=rid).payload
 
 
 __all__ = [
+    "META_CALL_ID",
+    "RuntimeCall",
+    "RuntimeResult",
     "ToolCallRun",
+    "ToolCallRuntime",
     "ToolCallRuntimeHooks",
+    "ToolProtocolError",
+    "commit_run_trace",
     "configure_default_tool_runtime",
+    "default_tool_runtime",
     "default_tool_runtime_configured",
     "execute_default_tool_payload",
     "finalize_tool_payload",
+    "invoke_default_runtime",
     "run_tool_call",
+    "runtime_call_from_jsonrpc",
 ]

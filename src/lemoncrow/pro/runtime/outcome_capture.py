@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -241,6 +242,7 @@ def advance(
         is_error=is_error,
         is_env_error=is_env_error,
         is_read_tool=is_read_tool,
+        writer=writer,
     )
     _advance_compacts(session_id, is_error=is_error, is_read_tool=is_read_tool, errors_total=errors_total)
     _flush_commit(session_id, writer=writer)
@@ -253,7 +255,7 @@ def close_session(
     writer: _StateWriter | None = None,
 ) -> None:
     """Finalise all still-pending outcomes at session close."""
-    _finalise_routes(session_id)
+    _finalise_routes(session_id, writer=writer)
     _finalise_compacts(session_id, errors_total=errors_total)
     _flush_commit(session_id, writer=writer)
 
@@ -365,6 +367,7 @@ def _advance_routes(
     is_error: bool,
     is_env_error: bool,
     is_read_tool: bool,
+    writer: _StateWriter | None = None,
 ) -> None:
     _READ_TOOLS = {"Read", "View", "cat", "view", "read_file", "search_read"}
     pending = _pending_route.get(session_id, [])
@@ -382,6 +385,7 @@ def _advance_routes(
             entry._extra_reads += 1
         if entry._turns_observed >= _ROUTE_WINDOW:
             _fill_route_window(entry)
+            _route_closed(session_id, entry, writer)
 
 
 def _advance_compacts(
@@ -404,10 +408,21 @@ def _advance_compacts(
             _fill_compact_window(entry, errors_total=errors_total)
 
 
-def _finalise_routes(session_id: str) -> None:
+def _finalise_routes(session_id: str, *, writer: _StateWriter | None = None) -> None:
     for entry in _pending_route.get(session_id, []):
         if entry.outcome_window is None:
             _fill_route_window(entry)
+            _route_closed(session_id, entry, writer)
+
+
+def _route_closed(session_id: str, entry: RouteOutcome, writer: _StateWriter | None) -> None:
+    """Hand a just-closed route window to the writer exactly once (fail-open)."""
+    if writer is None:
+        return
+    try:
+        writer.record_closed_route(session_id, entry.to_dict())
+    except Exception:
+        logging.debug("route outcome sink failed", exc_info=True)
 
 
 def _finalise_compacts(session_id: str, *, errors_total: int) -> None:
@@ -468,6 +483,9 @@ class _StateWriter:
         """Drain any buffered writes to the store. No-op for writers that
         persist eagerly in ``write()``."""
 
+    def record_closed_route(self, session_id: str, outcome: dict[str, Any]) -> None:
+        """Receive one route outcome at the moment its window closes. No-op by default."""
+
 
 # In-process cache of parsed outcome-state files, keyed by resolved path.
 # Maps path -> ((st_mtime_ns, st_size), parsed_full_state_dict). This collapses
@@ -518,9 +536,19 @@ _write_buffer: dict[str, dict[str, Any]] = {}
 class FileStateWriter(_StateWriter):
     """Write outcomes directly to a session_state.json file."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        route_sink: Callable[[str, dict[str, Any]], None] | None = None,
+    ) -> None:
         self._path = path
         self._key = str(path)
+        self._route_sink = route_sink
+
+    def record_closed_route(self, session_id: str, outcome: dict[str, Any]) -> None:
+        if self._route_sink is not None:
+            self._route_sink(session_id, outcome)
 
     def write(self, updates: dict[str, Any]) -> None:
         """Buffer updates in memory; call commit() to flush to disk."""

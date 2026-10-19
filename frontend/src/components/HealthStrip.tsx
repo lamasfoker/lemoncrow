@@ -35,7 +35,7 @@ export function HealthStrip({ compact = false }: { compact?: boolean }) {
           : "flex flex-wrap items-center gap-3"
       }
     >
-      <div className="flex items-center gap-2 border border-neutral-800 bg-neutral-950/60 px-3 py-2">
+      <div className="flex items-center gap-2 border border-border bg-background/60 px-3 py-2">
         <span
           className={`h-2 w-2 rounded-full ${
             daemonOk
@@ -50,7 +50,7 @@ export function HealthStrip({ compact = false }: { compact?: boolean }) {
         </span>
         {health?.timestamp && (
           <span
-            className="text-[10px] text-neutral-400"
+            className="text-caption text-neutral-400"
             title={health.timestamp}
           >
             {fmtDate(health.timestamp)}
@@ -60,7 +60,7 @@ export function HealthStrip({ compact = false }: { compact?: boolean }) {
       {(hosts ?? []).map((host) => (
         <div
           key={host.host_id}
-          className="flex items-center gap-2 border border-neutral-800 bg-neutral-950/60 px-3 py-2"
+          className="flex items-center gap-2 border border-border bg-background/60 px-3 py-2"
         >
           <span
             className={`h-2 w-2 rounded-full ${
@@ -71,7 +71,7 @@ export function HealthStrip({ compact = false }: { compact?: boolean }) {
             {host.label}
           </span>
           <span
-            className="text-[10px] text-neutral-400"
+            className="text-caption text-neutral-400"
             title={host.last_import_at ?? undefined}
           >
             {host.last_import_at

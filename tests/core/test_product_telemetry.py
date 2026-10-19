@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import re
+import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -168,7 +169,14 @@ def test_public_rollup_is_gated_by_remote_opt_in(
     they have."""
     calls: list[dict[str, Any]] = []
 
-    def fake_post(endpoint: str, payload: dict[str, Any], *, timeout_s: float, attempts: int = 1) -> bool:
+    def fake_post(
+        endpoint: str,
+        payload: dict[str, Any],
+        *,
+        timeout_s: float,
+        attempts: int = 1,
+        headers: dict[str, str] | None = None,
+    ) -> bool:
         calls.append(payload)
         return True
 
@@ -214,7 +222,14 @@ def test_public_rollup_posts_correct_payload(
 ) -> None:
     calls: list[tuple[str, dict[str, Any], float]] = []
 
-    def fake_post(endpoint: str, payload: dict[str, Any], *, timeout_s: float, attempts: int = 1) -> bool:
+    def fake_post(
+        endpoint: str,
+        payload: dict[str, Any],
+        *,
+        timeout_s: float,
+        attempts: int = 1,
+        headers: dict[str, str] | None = None,
+    ) -> bool:
         calls.append((endpoint, payload, timeout_s))
         return True
 
@@ -443,6 +458,42 @@ def test_telemetry_summary_reports_cache_hit_rate(telemetry_env: Path) -> None:
     assert summary["value_estimate"]["cache_hit_rate"] == 0.2
 
 
+def test_telemetry_summary_window_resolves_hosts_from_earlier_session_starts(tmp_path: Path) -> None:
+    store = LocalTelemetryStore(tmp_path / "telemetry.db")
+    rows: list[tuple[float, str, dict[str, Any]]] = [
+        (1000.0, "session_start", {"session_id": "s1", "agent_host": "claude"}),
+        (1001.0, "session_start", {"session_id": "s2", "agent_host": "codex"}),
+        (2000.0, "cli_command_invoked", {"session_id": "s1", "command_name": "search"}),
+        (2001.0, "code_symbol_retrieved", {"session_id": "s1"}),
+        (2002.0, "code_symbol_retrieved", {"session_id": "s2"}),
+        (2003.0, "session_end", {"session_id": "s2", "agent_host": "cli"}),
+        (2004.0, "code_symbol_retrieved", {}),
+    ]
+    for ts, event, props in rows:
+        store.write_event(event=event, props=props, exported=False, ts=ts)
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            "INSERT INTO events (ts, event, session_id, props_json, exported)"
+            " VALUES (2005.0, 'code_symbol_retrieved', 's1', '{not json', 0)"
+        )
+
+    summary = store.summary(since=1500.0)
+
+    assert summary["events_total"] == 6
+    assert summary["event_counts"] == {"code_symbol_retrieved": 4, "session_end": 1, "cli_command_invoked": 1}
+    assert summary["active_sessions"] == 2
+    assert (summary["first_event_ts"], summary["last_event_ts"]) == (2000.0, 2005.0)
+    # Session hosts come from session_start rows before the window; a row's own
+    # agent_host wins; count ties rank the most recent host first.
+    assert summary["agent_hosts"] == [
+        {"name": "claude", "count": 3},
+        {"name": "cli", "count": 1},
+        {"name": "codex", "count": 1},
+    ]
+    assert summary["top_commands"] == [{"name": "search", "count": 1}]
+    assert [entry["count"] for entry in summary["commands_by_day"]] == [1]
+
+
 def _is_emit_product_call(node: ast.Call) -> bool:
     return isinstance(node.func, ast.Name) and node.func.id == "emit_product"
 
@@ -493,7 +544,14 @@ def test_daily_flush_stamps_each_day_and_reports_its_own_real_totals(
 
     posts: list[tuple[dict[str, Any], float, int]] = []
 
-    def fake_post(endpoint: str, payload: dict[str, Any], *, timeout_s: float, attempts: int = 1) -> bool:
+    def fake_post(
+        endpoint: str,
+        payload: dict[str, Any],
+        *,
+        timeout_s: float,
+        attempts: int = 1,
+        headers: dict[str, str] | None = None,
+    ) -> bool:
         posts.append((payload, timeout_s, attempts))
         return True
 
@@ -662,6 +720,66 @@ def test_post_json_retries_transient_failures_but_not_a_rejected_payload(
     assert public_rollup_mod._post_json("https://example.test/rollup", {}, timeout_s=1.0, attempts=3) is False
     # 4xx is a verdict on the bytes; resending them is pointless.
     assert len(rejected) == 1
+
+
+def test_code_events_inherit_the_scoped_or_process_session(
+    telemetry_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from lemoncrow.core.service.telemetry import emit as emit_mod
+    from lemoncrow.core.service.telemetry import (
+        emit_product_local,
+        set_process_telemetry_session,
+        telemetry_session,
+    )
+
+    monkeypatch.setattr(emit_mod, "_process_session", "")
+    emit_product_local("code_symbol_retrieved", repo_id="r", kind="function")
+    set_process_telemetry_session("process-session")
+    emit_product_local("code_symbol_retrieved", repo_id="r", kind="function")
+    with telemetry_session("host-session"):
+        emit_product_local("code_context_retrieved", repo_id="r", operation="search", result_count=2)
+        # An explicit session is never overridden.
+        emit_product_local("code_index_completed", repo_id="r", files_indexed=1, symbols_indexed=2, session_id="own")
+    # Events whose schema has no session_id are left alone.
+    emit_product_local("api_request", endpoint="/x", method="GET", status_code=200, duration_ms_bucket="<100")
+
+    events = LocalTelemetryStore(telemetry_env).list_events(limit=10)
+    sessions = [(e["event"], e["session_id"]) for e in reversed(events)]
+    assert sessions == [
+        ("code_symbol_retrieved", None),
+        ("code_symbol_retrieved", "process-session"),
+        ("code_context_retrieved", "host-session"),
+        ("code_index_completed", "own"),
+        ("api_request", None),
+    ]
+
+
+def test_local_store_prune_caps_rows_and_is_throttled_across_processes(
+    telemetry_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import time
+
+    from lemoncrow.core.service.telemetry import local_store
+
+    monkeypatch.setattr(local_store, "MAX_EVENTS", 5)
+    monkeypatch.setattr(local_store, "_last_prune_ts", {})
+    store = LocalTelemetryStore(telemetry_env)
+    now = time.time()
+    store.write_events(
+        [{"event": "session_end", "props": {"session_id": f"s{i}"}, "exported": False, "ts": now + i} for i in range(8)]
+    )
+    # A second process: its in-memory throttle is empty, but the meta row says
+    # a prune just ran, so nothing is deleted yet.
+    monkeypatch.setattr(local_store, "_last_prune_ts", {})
+    store.write_event(event="session_end", props={"session_id": "s8"}, exported=False, ts=now + 8)
+    assert len(store.list_events(limit=100)) == 9
+
+    monkeypatch.setattr(local_store, "_last_prune_ts", {})
+    later = now + local_store._PRUNE_INTERVAL_S + 1
+    store.write_event(event="session_end", props={"session_id": "s9"}, exported=False, ts=later)
+    kept = [e["session_id"] for e in store.list_events(limit=100)]
+    # Pruned to the cap before the new row went in: the newest 5 plus s9.
+    assert kept == ["s9", "s8", "s7", "s6", "s5", "s4"]
 
 
 def test_codex_stop_hook_does_not_publish_its_own_public_rollup() -> None:

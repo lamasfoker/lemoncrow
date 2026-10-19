@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
@@ -8,6 +7,7 @@ import pytest
 
 from lemoncrow.core.foundation.memory_models import ArchivalPassage
 from lemoncrow.gateway.adapters.mcp_server import _handle
+from lemoncrow.gateway.tools.state import tool_call_raw_result
 from lemoncrow.infra.storage.sqlite_memory_store import SqliteMemoryStore
 
 
@@ -22,8 +22,8 @@ def _call_context(args: dict[str, Any]) -> dict[str, Any]:
     )
     assert response is not None
     assert "result" in response, response
-    payload = json.loads(response["result"]["content"][0]["text"])
-    assert isinstance(payload, dict)
+    payload = getattr(tool_call_raw_result, "value", None)
+    assert isinstance(payload, dict), response
     return payload
 
 

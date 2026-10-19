@@ -13,7 +13,8 @@
 set -euo pipefail
 
 REPO_DIR="${1:-.}"
-TRAILER="Co-Authored-By: lemoncrow <302591943+lemoncrow-agent[bot]@users.noreply.github.com>"
+NAME="lemoncrow"
+EMAIL="302591943+lemoncrow-agent[bot]@users.noreply.github.com"
 MARKER="# >>> lemoncrow attribution >>>"
 END_MARKER="# <<< lemoncrow attribution <<<"
 
@@ -34,31 +35,46 @@ emit_block() {
 # Managed by LemonCrow (install_attribution_hook.sh). Appends the co-author
 # trailer unless already present. Skips merge/squash commit messages.
 #
-# LemonCrow-Session / LemonCrow-Model make a committed range an exact join with
-# the session that authored it, instead of a wall-clock guess. Both are read
-# from the session state SessionStart already wrote, and are omitted entirely
-# when unknown -- an absent trailer is honest, an invented one is not.
+# The committing session's own model is folded into the co-author name --
+# lemoncrow+<model> -- so a single trailer says both who and which model. The
+# session is the one whose id the host exports to this commit (e.g.
+# CLAUDE_CODE_SESSION_ID); its model is read from that session's own
+# sessions/<date>/<host>/<id>/stats.json, never from state other sessions share.
+# The bot email is what GitHub links, so it is also the dedupe key. Without the
+# session's own model the name is plain lemoncrow.
 BODY
-  echo "LEMONCROW_TRAILER=\"$TRAILER\""
+  echo "LEMONCROW_NAME=\"$NAME\""
+  echo "LEMONCROW_EMAIL=\"$EMAIL\""
   cat <<'BODY'
-LEMONCROW_STATE="$(git rev-parse --show-toplevel 2>/dev/null)/.lemoncrow/workspace/session_state.json"
-lemoncrow_state_value() {
-  [ -f "$LEMONCROW_STATE" ] || return 0
-  sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$LEMONCROW_STATE" 2>/dev/null | head -n 1
+lemoncrow_json_value() {
+  [ -f "$2" ] || return 0
+  sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$2" 2>/dev/null | head -n 1
+}
+lemoncrow_own_model() {
+  for LEMONCROW_PASS in agent any; do
+    for LEMONCROW_PAIR in CLAUDE_CODE_SESSION_ID:claude ANTIGRAVITY_SESSION_ID:antigravity AGY_SESSION_ID:antigravity CODEX_SESSION_ID:codex LEMONCODE_SESSION_ID:lemoncode OPENCODE_SESSION_ID:opencode CURSOR_SESSION_ID:cursor HERMES_SESSION_ID:hermes GITHUB_COPILOT_SESSION_ID:copilot; do
+      LEMONCROW_HOST="${LEMONCROW_PAIR#*:}"
+      if [ "$LEMONCROW_PASS" = agent ] && [ "$LEMONCROW_HOST" != "${LEMONCROW_AGENT:-}" ]; then continue; fi
+      eval "LEMONCROW_SID=\"\${${LEMONCROW_PAIR%%:*}:-}\""
+      [ -n "$LEMONCROW_SID" ] || continue
+      case "$LEMONCROW_SID" in .*|*[!A-Za-z0-9._-]*) return 0 ;; esac
+      for LEMONCROW_STATS in "${LEMONCROW_ROOT:-$HOME/.lemoncrow}"/sessions/*/*/*/"$LEMONCROW_HOST"/"$LEMONCROW_SID"/stats.json; do
+        LEMONCROW_M="$(lemoncrow_json_value last_model "$LEMONCROW_STATS")"
+        [ -n "$LEMONCROW_M" ] || LEMONCROW_M="$(lemoncrow_json_value model "$LEMONCROW_STATS")"
+        if [ -n "$LEMONCROW_M" ]; then printf %s "$LEMONCROW_M"; return 0; fi
+      done
+      return 0
+    done
+  done
 }
 case "$2" in
   merge|squash) ;;
   *)
-    if ! grep -qF "$LEMONCROW_TRAILER" "$1" 2>/dev/null; then
-      printf '\n%s\n' "$LEMONCROW_TRAILER" >> "$1"
-    fi
-    LEMONCROW_SID="$(lemoncrow_state_value session_id)"
-    if [ -n "$LEMONCROW_SID" ] && ! grep -q '^LemonCrow-Session:' "$1" 2>/dev/null; then
-      printf 'LemonCrow-Session: %s\n' "$LEMONCROW_SID" >> "$1"
-    fi
-    LEMONCROW_MODEL="$(lemoncrow_state_value model)"
-    if [ -n "$LEMONCROW_MODEL" ] && ! grep -q '^LemonCrow-Model:' "$1" 2>/dev/null; then
-      printf 'LemonCrow-Model: %s\n' "$LEMONCROW_MODEL" >> "$1"
+    if ! grep -qF "<$LEMONCROW_EMAIL>" "$1" 2>/dev/null; then
+      LEMONCROW_MODEL="$(printf %s "$(lemoncrow_own_model)" | tr -c 'A-Za-z0-9._:/-' '-' | sed 's/^-*//; s/-*$//')"
+      LEMONCROW_WHO="$LEMONCROW_NAME"
+      if [ -n "$LEMONCROW_MODEL" ]; then LEMONCROW_WHO="$LEMONCROW_NAME+$LEMONCROW_MODEL"; fi
+      printf '\nCo-Authored-By: %s <%s>\n' "$LEMONCROW_WHO" "$LEMONCROW_EMAIL" >> "$1"
     fi
     ;;
 esac

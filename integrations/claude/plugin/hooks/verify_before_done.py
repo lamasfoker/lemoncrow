@@ -18,13 +18,19 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from lemoncrow.pro.capabilities.verify_gate import (
-    VerifySignals,
-    disabled,
-    is_code_path,
-    is_verifiable_path,
-)
-from lemoncrow.pro.capabilities.verify_gate import decide as decide_signals
+try:
+    from lemoncrow.pro.capabilities.verify_gate import (
+        VerifySignals,
+        disabled,
+        is_code_path,
+        is_verifiable_path,
+    )
+    from lemoncrow.pro.capabilities.verify_gate import decide as decide_signals
+except ImportError:
+    # Runtime Lite / Review-only install: no verify gate ships, so fail open.
+    if __name__ == "__main__":
+        sys.exit(0)
+    raise
 
 
 def _is_edit_tool(name: str) -> bool:

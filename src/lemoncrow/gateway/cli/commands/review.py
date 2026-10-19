@@ -22,13 +22,15 @@ import json
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import quote
 
 import click
 
 from lemoncrow.gateway.cli.commands._shared import _emit
+from lemoncrow.gateway.cli.commands.review_record_cli import ReviewCommand
 
 if TYPE_CHECKING:  # `from __future__ import annotations` keeps this import out of the runtime path.
-    from collections.abc import Sequence
+    from collections.abc import Callable, Mapping, Sequence
 
     from lemoncrow.pro.capabilities.review.gitdiff import RevRange
     from lemoncrow.pro.capabilities.review.models import ReviewPacket
@@ -46,6 +48,15 @@ if TYPE_CHECKING:  # `from __future__ import annotations` keeps this import out 
     from lemoncrow.pro.capabilities.review.targets import ReviewTarget
 
 _CLEAN_TREE_NOTICE = "working tree clean — reviewing the last commit instead"
+
+
+def _review_scope_label(rng: Any) -> str:
+    if rng.mode == "working_tree":
+        return f"{rng.base_rev or 'HEAD'} → working tree"
+    if rng.mode == "staged":
+        return f"{rng.base_rev or 'HEAD'} → staged index"
+    return f"{rng.base_rev} → {rng.head_rev}"
+
 
 # Mirrors ``session_models.MARK_STATES``. Restated rather than imported because
 # ``click.Choice`` needs the values at decoration time, and this module's whole
@@ -65,12 +76,84 @@ class _ReviewCliProgress:
 
     _DONE_SUFFIX = "_done"
 
-    def __init__(self, *, enabled: bool) -> None:
+    def __init__(self, *, enabled: bool, config: Any = None) -> None:
         self.enabled = enabled
         self._started: dict[str, float] = {}
         self._announced = False
+        self._remote: Any = None
+        self.browser_opened = False
+        self._job_id = ""
+        self._feedback_failed = False
+        self.preparation_url = ""
+        if enabled and config is not None and not config.hosted:
+            from lemoncrow_client.errors import ClientError
+            from lemoncrow_client.session import RemoteSession
+
+            self._remote = RemoteSession(config)
+            try:
+                row = self._remote.review_reader_request("POST", "/api/review-preparations", body={}, timeout_s=2.0)
+                self._job_id = str(row["id"])
+                self.preparation_url = config.endpoint(f"/reviews/preparing/{self._job_id}")
+            except (ClientError, KeyError, OSError, TypeError, ValueError):
+                # Older/unavailable servers keep the existing capture-and-open path.
+                self._remote.close()
+                self._remote = None
+
+    def open_browser(self, config: Any) -> None:
+        if not self.preparation_url or self.browser_opened:
+            return
+        from urllib.parse import urlsplit
+
+        from lemoncrow_client.errors import ClientError
+
+        self("browser", "Opening Review Reader")
+        try:
+            if config.token:
+                self._remote.pair_local_review_browser(urlsplit(self.preparation_url).path, timeout_s=2.0)
+            if not _launch_browser_url(self.preparation_url):
+                click.echo(f"(could not open a browser; open {self.preparation_url} manually.)", err=True)
+            self.browser_opened = True
+            self("browser_done", "Review Reader opened; preparation continues")
+        except ClientError as exc:
+            click.echo(f"  ! {_review_server_click_error(exc, hosted=False)}", err=True)
+
+    def __enter__(self) -> _ReviewCliProgress:
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        self._publish("failed" if exc_type else "ready", str(exc) if exc else "Review ready")
+        if self._remote is not None:
+            self._remote.close()
+
+    def _publish(self, stage: str, detail: str, review_url: str = "") -> bool:
+        if not self._job_id or self._remote is None:
+            return False
+        if self._feedback_failed and stage not in {"", "ready", "failed"}:
+            return False
+        from lemoncrow_client.errors import ClientError
+
+        try:
+            self._remote.review_reader_request(
+                "POST",
+                f"/api/review-preparations/{self._job_id}",
+                body={"stage": stage, "detail": detail[:2048], "review_url": review_url},
+                timeout_s=2.0,
+            )
+        except (ClientError, OSError, TypeError, ValueError):
+            # Feedback cannot abort source capture or repeatedly wait on a busy server.
+            self._feedback_failed = True
+            return False
+        self._feedback_failed = False
+        return True
+
+    def source_ready(self, url: str) -> bool:
+        from urllib.parse import urlsplit
+
+        parsed = urlsplit(url)
+        return self._publish("", "", parsed.path + (f"#{parsed.fragment}" if parsed.fragment else ""))
 
     def __call__(self, stage: str, detail: str) -> None:
+        self._publish(stage, detail)
         if not self.enabled:
             return
         if not self._announced:
@@ -82,14 +165,56 @@ class _ReviewCliProgress:
             elapsed = "" if started is None else f" · {time.monotonic() - started:.1f}s"
             click.echo(f"  ✓ {detail}{elapsed}", err=True)
             return
-        self._started[stage] = time.monotonic()
-        click.echo(f"  → {detail}…", err=True)
+        if stage not in self._started:
+            self._started[stage] = time.monotonic()
+            click.echo(f"  → {detail}…", err=True)
 
 
-@click.command("review")
+@click.command("review", cls=ReviewCommand)
 @click.argument("rev", required=False, default=None)
 @click.option("--base", "base_rev", default=None, help="Explicit base revision (overrides REV).")
 @click.option("--head", "head_rev", default=None, help="Explicit head revision. Default: HEAD.")
+@click.option(
+    "--pr",
+    "pr_spec",
+    default=None,
+    metavar="NUMBER|URL",
+    help=(
+        "Review a GitHub pull request (NUMBER, OWNER/REPO#NUMBER or URL) from inside a clone of its "
+        "repository. Rerun after new pushes: the same Review gets a new Revision."
+    ),
+)
+@click.option(
+    "--publish",
+    "publish_pr",
+    is_flag=True,
+    help="With --pr, post your comments and verdict to the pull request as one GitHub review via your `gh` login.",
+)
+@click.option("--dry-run", "dry_run", is_flag=True, help="With --publish, show what would be posted and post nothing.")
+@click.option(
+    "--title",
+    "snapshot_title",
+    default=None,
+    metavar="TITLE",
+    help="Title this Snapshot for the reviewer; a hosted server applies it only to a new Review.",
+)
+@click.option(
+    "--intent",
+    "intent_specs",
+    multiple=True,
+    metavar="KIND:REF",
+    help=(
+        "Link an intent source (issue, spec, plan or incident) for pre-merge checks, e.g. spec:docs/auth.md "
+        "or issue:#12. A repository file is captured as text; links are recorded as references. Repeatable."
+    ),
+)
+@click.option(
+    "--description-file",
+    "description_file",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Record this file as the Change description for pre-merge checks (first line is the title).",
+)
 @click.option("--staged", is_flag=True, help="Review the staged index against HEAD.")
 @click.option(
     "--working-tree",
@@ -223,27 +348,115 @@ class _ReviewCliProgress:
     help="Undo --finish: put the review back in the open state.",
 )
 @click.option(
+    "--check",
+    "check_name",
+    default=None,
+    metavar="NAME",
+    help=(
+        "Run --run COMMAND in this checkout and record its result as check NAME on the exact Snapshot it ran "
+        "against: PASS on exit 0, FAIL otherwise, UNKNOWN if the checkout changed while it ran. Exits with the "
+        "command's status, so local git or agent hooks can call it."
+    ),
+)
+@click.option(
+    "--run",
+    "check_command",
+    default=None,
+    metavar="COMMAND",
+    help="The command --check runs, split like a shell command line and run without a shell.",
+)
+@click.option(
+    "--reproduce",
+    "reproduce_target",
+    default=None,
+    metavar="EVIDENCE_ID|RECORD.json",
+    help=(
+        "Replay one hermetic execution result from this checkout in the same offline sandbox and compare its "
+        "outcome and environment fingerprint. Exits 0 only when the recorded source and stage outcomes reproduce. "
+        "A preview result compares its source and dependency stages; its render is labelled not compared."
+    ),
+)
+@click.option(
+    "--trusted-base",
+    "trusted_base_ref",
+    default=None,
+    metavar="REF",
+    help=(
+        "With --reproduce: the commit whose .lemoncrow/review.yaml supplies the execution policy "
+        "(default: origin/HEAD, else HEAD). The record's own policy is only compared."
+    ),
+)
+@click.option(
+    "--use-recorded-policy",
+    is_flag=True,
+    default=False,
+    help="With --reproduce: replay under the record's policy when it differs from the trusted base's (warns).",
+)
+@click.option(
     "--discard-review",
     "discard_review",
     is_flag=True,
     help="Make this review read-only and disposable; retention may permanently delete it and its evidence.",
 )
 @click.option(
+    "--new",
+    "new_review",
+    is_flag=True,
+    help="Start a new Review from origin/<branch> (or its default-branch fork point). Use --base COMMIT to choose the start.",
+)
+@click.option(
+    "--continue",
+    "continue_review",
+    metavar="REVIEW_ID",
+    default=None,
+    help="Attach the current branch to an existing open Review.",
+)
+@click.option(
+    "--current",
+    "show_current",
+    is_flag=True,
+    help="Show this workspace's currently bound Review, author session, and feedback state without capturing.",
+)
+@click.option(
+    "--resume-author",
+    is_flag=True,
+    help="Continue the exact author session bound to this workspace's current Review without creating a new session.",
+)
+@click.option(
     "--list-reviews",
     is_flag=True,
-    help="List existing durable reviews without capturing a new revision.",
+    help="List existing durable reviews without capturing a new Revision.",
 )
 @click.option(
     "--show-review",
     metavar="REVIEW_ID",
     default=None,
-    help="Show one existing review without capturing a new revision.",
+    help="Show one existing review without capturing a new Revision.",
 )
 @click.option(
     "--open-review",
     metavar="REVIEW_ID",
     default=None,
-    help="Open one existing review by ID without capturing a new revision.",
+    help="Open one existing review by ID without capturing a new Revision.",
+)
+@click.option(
+    "--fix",
+    "fix_snapshot",
+    metavar="REVIEW.N",
+    default=None,
+    help="Create or reuse a local fix worktree for Snapshot N of an existing Review.",
+)
+@click.option(
+    "--apply-fix",
+    "apply_fix_snapshot",
+    metavar="REVIEW.N",
+    default=None,
+    help="Apply the latest captured fix for Snapshot N back to the main worktree.",
+)
+@click.option(
+    "--with-conflict-markers",
+    is_flag=True,
+    help="With --apply-fix, write Git conflict markers instead of stopping on text conflicts.",
 )
 @click.option(
     "--review-status",
@@ -266,6 +479,12 @@ def review_cmd(
     rev: str | None,
     base_rev: str | None,
     head_rev: str | None,
+    pr_spec: str | None,
+    publish_pr: bool,
+    dry_run: bool,
+    snapshot_title: str | None,
+    intent_specs: tuple[str, ...],
+    description_file: Path | None,
     staged: bool,
     working_tree: bool,
     repo_root: Path | None,
@@ -293,10 +512,22 @@ def review_cmd(
     send_feedback: bool,
     finish_review: bool,
     reopen_review: bool,
+    check_name: str | None,
+    check_command: str | None,
+    reproduce_target: str | None,
+    trusted_base_ref: str | None,
+    use_recorded_policy: bool,
     discard_review: bool,
+    new_review: bool,
+    continue_review: str | None,
+    show_current: bool,
+    resume_author: bool,
     list_reviews: bool,
     show_review: str | None,
     open_review: str | None,
+    fix_snapshot: str | None,
+    apply_fix_snapshot: str | None,
+    with_conflict_markers: bool,
     review_status: str,
     show_all: bool,
     no_color: bool,
@@ -320,12 +551,11 @@ def review_cmd(
 
     The browser Reader is optimized for the human loop: read the diff, leave
     feedback, rerun after fixes, and return to the same URL to review only what
-    changed.
+    changed. ``--current`` reports that same Review/agent binding in the terminal;
+    ``--resume-author`` continues its exact author session without copying IDs.
     """
     from lemoncrow.core.foundation.paths import default_store_root
     from lemoncrow.pro.capabilities.review.gitdiff import detect_repo_root, resolve_rev_range
-    from lemoncrow.pro.capabilities.review.packet import build_review_packet
-    from lemoncrow.pro.capabilities.review.render import render_review
 
     obj = ctx.obj or {}
     store_root = Path(obj.get("root") or default_store_root())
@@ -336,9 +566,122 @@ def review_cmd(
         client_config = load_client_config(cwd=repo_root or Path.cwd())
     except ClientError as exc:
         raise click.ClickException(exc.message) from exc
-    management_actions = int(list_reviews) + int(bool(show_review)) + int(bool(open_review))
+    if snapshot_title is not None:
+        snapshot_title = snapshot_title.strip()
+        if not snapshot_title or len(snapshot_title) > 120 or any(ord(char) < 32 for char in snapshot_title):
+            raise click.ClickException("--title must be 1-120 characters on one line")
+    management_actions = (
+        int(list_reviews) + int(bool(show_review)) + int(bool(open_review)) + int(show_current) + int(resume_author)
+    )
+    fix_actions = int(bool(fix_snapshot)) + int(bool(apply_fix_snapshot))
+    if fix_actions > 1:
+        raise click.ClickException("--fix and --apply-fix are mutually exclusive")
+    if with_conflict_markers and not apply_fix_snapshot:
+        raise click.ClickException("--with-conflict-markers requires --apply-fix")
+    if snapshot_title is not None and (
+        management_actions or fix_actions or setup_mode or write_review_config or publish_pr
+    ):
+        raise click.ClickException("--title requires a Snapshot capture")
+    if (intent_specs or description_file is not None) and (
+        management_actions or fix_actions or setup_mode or write_review_config or publish_pr or check_name
+    ):
+        raise click.ClickException("--intent and --description-file require a Snapshot capture")
     if management_actions > 1:
-        raise click.ClickException("--list-reviews, --show-review and --open-review are mutually exclusive")
+        raise click.ClickException(
+            "--current, --resume-author, --list-reviews, --show-review and --open-review are mutually exclusive"
+        )
+    if management_actions and fix_actions:
+        raise click.ClickException("--fix/--apply-fix cannot be combined with other Review management actions")
+    if new_review and continue_review:
+        raise click.ClickException("--new and --continue are mutually exclusive")
+    if (new_review or continue_review) and (management_actions or fix_actions):
+        raise click.ClickException("--new/--continue cannot be combined with Review management-only actions")
+    if reproduce_target is None and (trusted_base_ref is not None or use_recorded_policy):
+        raise click.ClickException("--trusted-base and --use-recorded-policy go with --reproduce")
+    if reproduce_target is not None:
+        ctx.exit(
+            _reproduce_execution(
+                client_config,
+                reproduce_target,
+                repo_root=repo_root or detect_repo_root(Path.cwd()),
+                store_root=store_root,
+                as_json=as_json,
+                trusted_base=trusted_base_ref,
+                use_recorded_policy=use_recorded_policy,
+            )
+        )
+    if (check_name is None) != (check_command is None):
+        raise click.ClickException("--check NAME and --run COMMAND go together")
+    if check_name is not None:
+        combined = [
+            flag
+            for flag, used in (
+                ("--current/--resume-author/--list-reviews/--show-review/--open-review", bool(management_actions)),
+                ("--fix/--apply-fix", bool(fix_actions)),
+                ("--setup/--write-review-config", setup_mode or write_review_config),
+                ("--publish", publish_pr),
+                ("--html", html_path is not None),
+                ("--units", show_units),
+                ("--mark", bool(mark_targets)),
+                ("--marks", show_marks),
+                ("--comment", comment_body is not None),
+                ("--comments", show_comments),
+                ("--since-my-review", since_my_review),
+                ("--feedback", send_feedback),
+                ("--finish", finish_review),
+                ("--reopen-review", reopen_review),
+                ("--discard-review", discard_review),
+            )
+            if used
+        ]
+        if combined:
+            raise click.ClickException(f"--check runs on its own; drop {', '.join(combined)}")
+    judgment = [
+        flag
+        for flag, used in (
+            ("--mark", bool(mark_targets)),
+            ("--comment", comment_body is not None),
+            ("--finish", finish_review),
+            ("--reopen-review", reopen_review),
+            ("--discard-review", discard_review),
+            ("--publish", publish_pr and not dry_run),
+        )
+        if used
+    ]
+    if judgment:
+        from lemoncrow.core.foundation.paths import agent_session_host
+
+        agent_host = agent_session_host()
+        if agent_host:
+            # These record *human* review judgment. From the coding agent's own
+            # shell they would let the agent approve, comment or publish as the
+            # reviewer; capture, reads and --check stay available to agents.
+            raise click.ClickException(
+                f"{', '.join(judgment)} record(s) human review judgment and cannot run inside an agent "
+                f"session ({agent_host}); use the Review Reader or your own terminal"
+            )
+    if fix_actions:
+        _manage_fix_line(
+            client_config,
+            fix_snapshot=fix_snapshot,
+            apply_fix_snapshot=apply_fix_snapshot,
+            with_conflict_markers=with_conflict_markers,
+            as_json=as_json,
+        )
+        return
+    if show_current or resume_author:
+        try:
+            current_root = detect_repo_root(repo_root)
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
+        _manage_current_review(
+            client_config,
+            store_root=store_root,
+            repo_root=current_root,
+            resume_author=resume_author,
+            as_json=as_json,
+        )
+        return
     if management_actions:
         _manage_server_reviews(
             client_config,
@@ -378,59 +721,6 @@ def review_cmd(
             _emit(text, as_json=False)
         return
 
-    if serve_workspace_flag:
-        raise click.ClickException(
-            "the per-repository Review workspace server is retired; `lc review` uses LEMONCROW_URL in both local and hosted mode"
-        )
-    try:
-        resolved_root = detect_repo_root(repo_root)
-        rng = resolve_rev_range(
-            resolved_root,
-            rev,
-            base=base_rev,
-            head=head_rev,
-            staged=staged,
-            working_tree=working_tree,
-        )
-    except ValueError as exc:
-        raise click.ClickException(str(exc)) from exc
-
-    # A bare `lc review` asks "is what my agent just did safe to commit?", and on
-    # a clean tree the honest answer is about the last commit rather than an
-    # empty packet. `resolve_rev_range` already makes that substitution; saying
-    # nothing about it would leave the reader to work out which change they are
-    # looking at from the range label alone.
-    fell_back = (
-        _is_bare(rev, base_rev, head_rev, staged=staged, working_tree=working_tree) and rng.mode != "working_tree"
-    )
-
-    # One packet, whether or not it is persisted. Building a second one for the
-    # store would cost the whole impact pass twice and, worse, could disagree
-    # with the one on screen -- a reviewer must never mark a packet they were
-    # not shown. Hunk bodies are captured only when the packet is being kept.
-    #
-    # When it is kept, the build hands back the blob texts it actually read, and
-    # those -- not a second read of the working tree -- are what gets
-    # fingerprinted. A file saved between two reads would otherwise be stored as
-    # one thing and marked as another.
-    # `--open` implies tracking: the workspace *is* the durable session, and
-    # there is nothing for it to open unless the revision was recorded.
-    if comment_body is not None and not comment_target and not reply_to:
-        raise click.ClickException("--comment needs --on PATH:L10 (or --reply-to an existing comment)")
-    if comment_target and comment_body is None:
-        raise click.ClickException("--on needs --comment TEXT")
-    status_flags = [
-        name
-        for name, wanted in (
-            ("--finish", finish_review),
-            ("--reopen-review", reopen_review),
-            ("--discard-review", discard_review),
-        )
-        if wanted
-    ]
-    if len(status_flags) > 1:
-        raise click.ClickException(f"{' and '.join(status_flags)} ask for opposite things; pick one")
-
     effective_open = _effective_open(
         open_html,
         as_json=as_json,
@@ -448,8 +738,11 @@ def review_cmd(
         show_all=show_all,
         no_color=no_color,
     )
-    server_review = (
+    durable_review_requested = (
         track
+        or snapshot_title is not None
+        or bool(intent_specs)
+        or description_file is not None
         or effective_open
         or show_units
         or bool(mark_targets)
@@ -461,65 +754,349 @@ def review_cmd(
         or finish_review
         or reopen_review
         or discard_review
+        or new_review
+        or bool(continue_review)
     )
-    if not server_review:
-        # Explicit terminal-only review remains useful offline. It creates no
-        # durable state and therefore needs neither a local server nor a hosted
-        # one. The moment the caller asks to open, track, mark, comment or
-        # finish, the one server-backed path below owns the operation.
-        packet = build_review_packet(
+
+    if serve_workspace_flag:
+        raise click.ClickException(
+            "the per-repository Review workspace server is retired; `lc review` uses LEMONCROW_URL in both local and hosted mode"
+        )
+    if publish_pr and pr_spec is None:
+        raise click.ClickException("--publish needs --pr NUMBER|URL")
+    if dry_run and not publish_pr:
+        raise click.ClickException("--dry-run only applies to --publish")
+    if pr_spec is not None and (rev or base_rev or head_rev or staged or working_tree):
+        raise click.ClickException("--pr picks the range itself; drop REV, --base, --head, --staged and --working-tree")
+    if pr_spec is not None and (new_review or continue_review):
+        raise click.ClickException(
+            "--new/--continue apply to local branch Reviews; --pr already has stable PR identity"
+        )
+    if publish_pr:
+        assert pr_spec is not None
+        _publish_pull_request(client_config, detect_repo_root(repo_root), pr_spec, dry_run=dry_run, as_json=as_json)
+        return
+    try:
+        resolved_root = detect_repo_root(repo_root)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    intent_payload = _intent_payload(resolved_root, intent_specs, description_file)
+    with _ReviewCliProgress(enabled=effective_open and check_name is None, config=client_config) as progress:
+        progress.open_browser(client_config)
+        progress("range", "Resolving review range")
+        source_ref_override = ""
+        title_override = snapshot_title or ""
+        try:
+            if pr_spec is not None:
+                from dataclasses import replace
+
+                from lemoncrow.pro.capabilities.review.sources.github import GitHubCliError, resolve_pull_request
+
+                try:
+                    pull = resolve_pull_request(resolved_root, pr_spec)
+                except GitHubCliError as exc:
+                    raise click.ClickException(str(exc)) from exc
+                rng = replace(
+                    resolve_rev_range(resolved_root, base=pull.merge_base_sha, head=pull.head_sha),
+                    title=pull.review_title,
+                )
+                source_ref_override = pull.ref.source_ref
+                title_override = snapshot_title or pull.review_title
+            else:
+                bare_request = _is_bare(rev, base_rev, head_rev, staged=staged, working_tree=working_tree)
+                branch_review_base = ""
+                implicit_working_tree = bool(bare_request and (new_review or continue_review))
+                if bare_request and durable_review_requested and not implicit_working_tree:
+                    _active_review_id, branch_review_base = _active_local_branch_review(
+                        client_config, store_root=store_root, repo_root=resolved_root
+                    )
+                    implicit_working_tree = bool(branch_review_base)
+                if new_review:
+                    from lemoncrow.pro.capabilities.review.gitdiff import resolve_new_review_range
+
+                    if head_rev is not None:
+                        raise ValueError(
+                            "--new captures the working tree or index; use --base to choose its starting commit"
+                        )
+                    creation_base = base_rev if base_rev is not None else rev
+                    if creation_base is not None and ".." in creation_base:
+                        raise ValueError("--new requires one base commit, not a revision range")
+                    rng = resolve_new_review_range(resolved_root, base=creation_base, staged=staged)
+                else:
+                    rng = resolve_rev_range(
+                        resolved_root,
+                        rev,
+                        base=base_rev,
+                        head=head_rev,
+                        staged=staged,
+                        working_tree=working_tree or implicit_working_tree,
+                    )
+                if branch_review_base and rng.mode == "working_tree":
+                    from lemoncrow.pro.capabilities.review.gitdiff import with_review_base
+
+                    rng = with_review_base(resolved_root, branch_review_base, rng)
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+        progress("range_done", f"Review scope: {_review_scope_label(rng)}")
+
+        if (new_review or continue_review) and rng.mode not in {"working_tree", "staged"}:
+            raise click.ClickException(
+                "--new/--continue require a mutable branch Review; use --working-tree or --staged"
+            )
+
+        if check_name is not None:
+            assert check_command is not None
+            ctx.exit(
+                _review_server_check(
+                    client_config,
+                    resolved_root,
+                    rng,
+                    name=check_name,
+                    command=check_command,
+                    store_root=store_root,
+                    session_id=session_id,
+                    limit=limit,
+                    no_impact=no_impact,
+                    no_provenance=no_provenance,
+                    as_json=as_json,
+                    source_ref_override=source_ref_override,
+                    title_override=title_override,
+                    snapshot_title=snapshot_title or "",
+                )
+            )
+
+        # A bare `lc review` asks "is what my agent just did safe to commit?", and on
+        # a clean tree the honest answer is about the last commit rather than an
+        # empty packet. `resolve_rev_range` already makes that substitution; saying
+        # nothing about it would leave the reader to work out which change they are
+        # looking at from the range label alone.
+        fell_back = (
+            pr_spec is None
+            and _is_bare(rev, base_rev, head_rev, staged=staged, working_tree=working_tree)
+            and rng.mode != "working_tree"
+        )
+
+        # One packet, whether or not it is persisted. Building a second one for the
+        # store would cost the whole impact pass twice and, worse, could disagree
+        # with the one on screen -- a reviewer must never mark a packet they were
+        # not shown. Hunk bodies are captured only when the packet is being kept.
+        #
+        # When it is kept, the build hands back the blob texts it actually read, and
+        # those -- not a second read of the working tree -- are what gets
+        # fingerprinted. A file saved between two reads would otherwise be stored as
+        # one thing and marked as another.
+        # `--open` implies tracking: the workspace *is* the durable session, and
+        # there is nothing for it to open unless the revision was recorded.
+        if comment_body is not None and not comment_target and not reply_to:
+            raise click.ClickException("--comment needs --on PATH:L10 (or --reply-to an existing comment)")
+        if comment_target and comment_body is None:
+            raise click.ClickException("--on needs --comment TEXT")
+        status_flags = [
+            name
+            for name, wanted in (
+                ("--finish", finish_review),
+                ("--reopen-review", reopen_review),
+                ("--discard-review", discard_review),
+            )
+            if wanted
+        ]
+        if len(status_flags) > 1:
+            raise click.ClickException(f"{' and '.join(status_flags)} ask for opposite things; pick one")
+
+        server_review = durable_review_requested
+        if not server_review:
+            from lemoncrow.pro.capabilities.review.packet import build_review_packet
+            from lemoncrow.pro.capabilities.review.render import render_review
+
+            # Explicit terminal-only review remains useful offline. It creates no
+            # durable state and therefore needs neither a local server nor a hosted
+            # one. The moment the caller asks to open, track, mark, comment or
+            # finish, the one server-backed path below owns the operation.
+            packet = build_review_packet(
+                resolved_root,
+                rng,
+                store_root=store_root,
+                with_impact=not no_impact,
+                with_provenance=not no_provenance,
+                session_id=session_id,
+                limit=limit,
+            )
+            written = _write_html(packet, html_path) if html_path is not None else None
+            if as_json:
+                if written is not None:
+                    click.echo(f"HTML report: {written}", err=True)
+                _emit(packet.to_dict(), as_json=True)
+                return
+            if fell_back:
+                click.secho(_CLEAN_TREE_NOTICE, dim=not no_color)
+            _emit(render_review(packet, no_color=no_color, show_all=show_all), as_json=False)
+            if written is not None:
+                click.echo(f"\nHTML report: {written}")
+            return
+
+        _review_server_capture(
+            client_config,
             resolved_root,
             rng,
             store_root=store_root,
-            with_impact=not no_impact,
-            with_provenance=not no_provenance,
             session_id=session_id,
             limit=limit,
+            no_impact=no_impact,
+            no_provenance=no_provenance,
+            html_path=html_path,
+            effective_open=effective_open,
+            as_json=as_json,
+            show_all=show_all,
+            no_color=no_color,
+            fell_back=fell_back,
+            show_units=show_units,
+            mark_targets=mark_targets,
+            mark_state=mark_state,
+            show_marks=show_marks,
+            comment_body=comment_body,
+            comment_target=comment_target,
+            comment_kind=comment_kind,
+            reply_to=reply_to,
+            show_comments=show_comments,
+            since_my_review=since_my_review,
+            send_feedback=send_feedback,
+            finish_review=finish_review,
+            reopen_review=reopen_review,
+            discard_review=discard_review,
+            force_new_review=new_review,
+            continue_review_id=continue_review or "",
+            source_ref_override=source_ref_override,
+            title_override=title_override,
+            snapshot_title=snapshot_title or "",
+            cli_progress=progress,
+            intent_payload=intent_payload,
         )
-        written = _write_html(packet, html_path) if html_path is not None else None
-        if as_json:
-            if written is not None:
-                click.echo(f"HTML report: {written}", err=True)
-            _emit(packet.to_dict(), as_json=True)
-            return
-        if fell_back:
-            click.secho(_CLEAN_TREE_NOTICE, dim=not no_color)
-        _emit(render_review(packet, no_color=no_color, show_all=show_all), as_json=False)
-        if written is not None:
-            click.echo(f"\nHTML report: {written}")
         return
 
-    _review_server_capture(
-        client_config,
-        resolved_root,
-        rng,
-        store_root=store_root,
-        session_id=session_id,
-        limit=limit,
-        no_impact=no_impact,
-        no_provenance=no_provenance,
-        html_path=html_path,
-        effective_open=effective_open,
-        as_json=as_json,
-        show_all=show_all,
-        no_color=no_color,
-        fell_back=fell_back,
-        show_units=show_units,
-        mark_targets=mark_targets,
-        mark_state=mark_state,
-        show_marks=show_marks,
-        comment_body=comment_body,
-        comment_target=comment_target,
-        comment_kind=comment_kind,
-        reply_to=reply_to,
-        show_comments=show_comments,
-        since_my_review=since_my_review,
-        send_feedback=send_feedback,
-        finish_review=finish_review,
-        reopen_review=reopen_review,
-        discard_review=discard_review,
-    )
-    return
+
+_MAX_INTENT_FILE_BYTES = 65536
+
+
+def _intent_payload(repo_root: Path, specs: tuple[str, ...], description_file: Path | None) -> dict[str, Any] | None:
+    """The ``POST /intent`` body for ``--intent``/``--description-file`` (``None`` when neither is given).
+
+    Repository files are read from the working tree, bounded, and only inside
+    the repository; URLs and issue numbers are recorded as references and are
+    never fetched from here.
+    """
+
+    from lemoncrow.pro.capabilities.review.intent import MAX_INTENT_SOURCES, parse_cli_intent
+
+    if not specs and description_file is None:
+        return None
+    if len(specs) > MAX_INTENT_SOURCES:
+        raise click.ClickException(f"--intent accepts at most {MAX_INTENT_SOURCES} sources")
+
+    def read_bounded(path: Path) -> str:
+        with path.open("rb") as handle:
+            return handle.read(_MAX_INTENT_FILE_BYTES).decode("utf-8", errors="replace")
+
+    root = repo_root.resolve()
+    references: list[dict[str, Any]] = []
+    for spec in specs:
+        try:
+            reference = parse_cli_intent(spec)
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
+        raw = spec.partition(":")[2].strip()
+        row: dict[str, Any] = {"kind": reference.kind, "ref": raw}
+        if reference.ref.startswith("file:"):
+            relative = reference.ref.removeprefix("file:")
+            target = (root / relative).resolve()
+            if not target.is_relative_to(root) or not target.is_file():
+                raise click.ClickException(f"--intent {spec!r} names no file inside this repository")
+            row.update({"title": relative, "body": read_bounded(target)})
+        references.append(row)
+    payload: dict[str, Any] = {"references": references}
+    if description_file is not None:
+        text = read_bounded(description_file)
+        title, _newline, body = text.strip().partition("\n")
+        payload["description"] = {"title": title.strip().lstrip("#").strip()[:300], "body": body.strip()}
+    return payload
+
+
+def _publish_pull_request(config: Any, repo_root: Path, pr_spec: str, *, dry_run: bool, as_json: bool) -> None:
+    """Preview, then post, the PR's LemonCrow Review as one GitHub review."""
+
+    if config.hosted:
+        raise click.ClickException(
+            "publishing to GitHub runs only on your local LemonCrow server, where your `gh` login lives"
+        )
+    from urllib.parse import quote
+
+    from lemoncrow_client.errors import ClientError
+
+    from lemoncrow.pro.capabilities.review.hosted import server_review_request, server_review_rows
+    from lemoncrow.pro.capabilities.review.sources.github import GitHubCliError, pull_request_ref
+
+    try:
+        pr = pull_request_ref(repo_root, pr_spec)
+    except (GitHubCliError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    try:
+        rows = [row for row in server_review_rows(config) if row.get("source_ref") == pr.source_ref]
+        if not rows:
+            raise click.ClickException(f"no Review of {pr.url} yet; run `lc review --pr {pr.number}` first")
+        review_id = str(rows[0].get("id") or "")
+        base = f"/api/reviews/{quote(review_id, safe='')}/github"
+        preview = server_review_request(config, "POST", f"{base}/preview", body={})
+        if dry_run or preview.get("empty") or preview.get("stale"):
+            _emit_publish_preview(preview, as_json=as_json)
+            if preview.get("stale"):
+                raise click.ClickException(
+                    f"{pr.url} has new commits since this Review; run `lc review --pr {pr.number}` to refresh, then publish"
+                )
+            if preview.get("empty") and not dry_run:
+                raise click.ClickException("there is nothing new to publish")
+            return
+        published = server_review_request(
+            config,
+            "POST",
+            f"{base}/publish",
+            body={
+                "operation_id": preview.get("operation_id"),
+                "expected_revision_id": preview.get("revision_id"),
+                "expected_plan_hash": preview.get("plan_hash"),
+            },
+        )
+    except ClientError as exc:
+        raise _review_server_click_error(exc, hosted=False) from exc
+    if as_json:
+        _emit({"preview": preview, "published": published}, as_json=True)
+        return
+    _emit_publish_preview(preview, as_json=False)
+    click.echo(f"\nPublished  {published.get('html_url') or pr.url}")
+
+
+def _emit_publish_preview(preview: dict[str, Any], *, as_json: bool) -> None:
+    if as_json:
+        _emit(preview, as_json=True)
+        return
+    pr_raw = preview.get("pr")
+    pr = pr_raw if isinstance(pr_raw, dict) else {}
+    inline = [item for item in preview.get("inline") or [] if isinstance(item, dict)]
+    folded = [item for item in preview.get("folded") or [] if isinstance(item, dict)]
+    click.echo(f"GitHub review  {pr.get('url', '')}")
+    click.echo(f"Event          {preview.get('event', 'COMMENT')}")
+    click.echo(f"Commit         {str(preview.get('commit_id') or '')[:12]}")
+    click.echo(f"Inline         {len(inline)}")
+    for item in inline:
+        start, line = int(item.get("start_line") or 0), int(item.get("line") or 0)
+        span = f"L{start}" + (f"-L{line}" if line != start else "")
+        click.echo(f"  {item.get('path')}:{span} ({item.get('side')})")
+    click.echo(f"In body        {len(folded)}")
+    for item in folded:
+        click.echo(f"  {item.get('location')}: {item.get('reason')}")
+    for notice in preview.get("notices") or []:
+        click.echo(f"Note           {notice}")
+    if preview.get("empty"):
+        click.echo("Nothing new to publish.")
 
 
 def _review_server_capture(
@@ -552,6 +1129,13 @@ def _review_server_capture(
     finish_review: bool,
     reopen_review: bool,
     discard_review: bool,
+    force_new_review: bool = False,
+    continue_review_id: str = "",
+    source_ref_override: str = "",
+    title_override: str = "",
+    snapshot_title: str = "",
+    cli_progress: _ReviewCliProgress | None = None,
+    intent_payload: Mapping[str, Any] | None = None,
 ) -> None:
     """Publish the diff, then apply terminal Review actions on that server."""
     if config.hosted and not config.authenticated:
@@ -559,32 +1143,359 @@ def _review_server_capture(
             "Hosted Review requires sign-in; authenticate to the configured LemonCrow server first"
         )
 
+    from contextlib import nullcontext
+
     from lemoncrow_client.errors import ClientError
 
-    from lemoncrow.pro.capabilities.review.hosted import capture_server_review
-    from lemoncrow.pro.capabilities.review.render import render_review
+    progress = cli_progress or _ReviewCliProgress(enabled=effective_open, config=config)
+    with progress if cli_progress is None else nullcontext(progress):
+        progress.open_browser(config)
+        browser_opened = progress.browser_opened
+        progress("capture", "Starting source preparation")
+        from lemoncrow.pro.capabilities.review.hosted import capture_server_review, server_review_request
+        from lemoncrow.pro.capabilities.review.render import render_review
 
-    progress = _ReviewCliProgress(enabled=effective_open)
-    browser_opened = False
+        progress("capture_done", "Source preparation started")
 
-    def open_ready(capture: Any) -> None:
-        nonlocal browser_opened
-        if browser_opened or not effective_open:
-            return
-        review_value = capture.response.get("review")
-        review_row = review_value if isinstance(review_value, dict) else {}
-        browser_id = str(review_row.get("ref") or f"r/{capture.review_id}")
-        progress("browser", "Pairing and opening Review Reader on the ready source diff")
+        def open_ready(capture: Any) -> None:
+            nonlocal browser_opened
+            if not effective_open or (browser_opened and not progress.preparation_url):
+                return
+            review_value = capture.response.get("review")
+            review_row = review_value if isinstance(review_value, dict) else {}
+            browser_id = str(review_row.get("ref") or f"r/{capture.review_id}")
+            if not browser_opened:
+                progress("browser", "Pairing and opening Review Reader on the ready source diff")
+            try:
+                if not config.hosted and rng.mode == "working_tree":
+                    from lemoncrow.pro.capabilities.review.live_runtime import claim_live_review_binding
+
+                    revision_value = capture.response.get("revision")
+                    revision_row = revision_value if isinstance(revision_value, dict) else {}
+                    expected_revision_id = str(revision_row.get("id") or "")
+                    claimed = claim_live_review_binding(
+                        store_root,
+                        repo_root,
+                        server_url=config.url,
+                        expected_revision_id=expected_revision_id,
+                    )
+                    if claimed is None:
+                        raise click.ClickException(
+                            "prepared Review changed before it could be claimed; completing capture before opening"
+                        )
+                    # The browser follows the durable Change URL. The exact Snapshot
+                    # remains addressable through /rr/<snapshot>, but the default
+                    # interactive Review route should stay stable as new Snapshots
+                    # arrive underneath it. `capture.review_url` carries the short
+                    # /r/<token> plus temporary preparation state in the fragment.
+                    open_url = capture.review_url
+                else:
+                    open_url = capture.review_url
+                if browser_opened and progress.preparation_url and progress.source_ready(open_url):
+                    return
+                _open_server_review(open_url, config=config, review_id=browser_id, open_browser=True)
+                browser_opened = True
+                progress("browser_done", "Review Reader opened; remaining context continues")
+            except click.ClickException as exc:
+                # Browser pairing/opening must not strand an otherwise valid Review
+                # before its base/runtime context has finished attaching. Surface the
+                # warning and let the capture finalize; the canonical URL is printed.
+                click.echo(f"  ! {exc}", err=True)
+
         try:
-            _open_server_review(capture.review_url, config=config, review_id=browser_id, open_browser=True)
-            browser_opened = True
-            progress("browser_done", "Review Reader opened; remaining context continues")
-        except click.ClickException as exc:
-            # Browser pairing/opening must not strand an otherwise valid Review
-            # before its base/runtime context has finished attaching. Surface the
-            # warning and let the capture finalize; the canonical URL is printed.
-            click.echo(f"  ! {exc}", err=True)
+            captured = capture_server_review(
+                config,
+                repo_root,
+                rng,
+                store_root=store_root,
+                session_id=session_id,
+                limit=limit,
+                with_impact=not no_impact,
+                with_provenance=not no_provenance,
+                restore_archived=reopen_review,
+                progress=progress,
+                ready=open_ready,
+                source_ref_override=source_ref_override,
+                title_override=title_override,
+                advance_claimed_binding=True,
+                defer_post_ready=bool(
+                    effective_open and not config.hosted and rng.mode in {"working_tree", "commit_range"}
+                ),
+                force_new_review=force_new_review,
+                continue_review_id=continue_review_id,
+                reuse_closed_review=finish_review or reopen_review or discard_review,
+            )
+        except ClientError as exc:
+            raise _review_server_click_error(exc, hosted=bool(config.hosted)) from exc
+        except ValueError as exc:
+            raise _review_capture_value_error(exc, rng=rng, force_new_review=force_new_review) from exc
 
+        revision_value = captured.response.get("revision")
+        revision_row = revision_value if isinstance(revision_value, dict) else {}
+        revision_number = revision_row.get("revision_number")
+        if not isinstance(revision_number, int):
+            raise click.ClickException("Review server did not return a Snapshot number")
+        try:
+            server_review_request(
+                config,
+                "POST",
+                f"/api/reviews/{quote(captured.review_id, safe='')}/revisions/{revision_number}/publish",
+                body={},
+            )
+            if intent_payload is not None:
+                # Linked intent is recorded on the Snapshot just published.
+                server_review_request(
+                    config,
+                    "POST",
+                    f"/api/reviews/{quote(captured.review_id, safe='')}/intent",
+                    body={**intent_payload, "expected_revision_id": str(revision_row.get("id") or "")},
+                )
+        except ClientError as exc:
+            raise _review_server_click_error(exc, hosted=bool(config.hosted)) from exc
+
+        _warn_unapplied_title(captured.response, snapshot_title)
+        packet = captured.build.packet
+        written = _write_html(packet, html_path) if html_path is not None else None
+        review_value = captured.response.get("review")
+        review_row = review_value if isinstance(review_value, dict) else {}
+        browser_review_id = str(review_row.get("ref") or f"r/{captured.review_id}")
+        try:
+            terminal_state = _server_terminal_state(
+                config,
+                captured.review_id,
+                mark_targets=mark_targets,
+                mark_state=mark_state,
+                show_units=show_units,
+                show_marks=show_marks,
+                comment_body=comment_body,
+                comment_target=comment_target,
+                comment_kind=comment_kind,
+                reply_to=reply_to,
+                show_comments=show_comments,
+                since_my_review=since_my_review,
+                send_feedback=send_feedback,
+                finish_review=finish_review,
+                reopen_review=reopen_review,
+                discard_review=discard_review,
+                progress=progress,
+            )
+            public_review_id = str(review_row.get("short_id") or "")
+            revision_value = captured.response.get("revision")
+            revision_row = revision_value if isinstance(revision_value, dict) else {}
+            public_revision_id = str(revision_row.get("short_id") or "")
+            if public_review_id:
+                terminal_state["review_id"] = f"r/{public_review_id}"
+            if public_revision_id:
+                terminal_state["revision_id"] = f"rr/{public_revision_id}"
+        except ClientError as exc:
+            raise _review_server_click_error(exc, hosted=bool(config.hosted)) from exc
+
+        if as_json:
+            if written is not None:
+                click.echo(f"HTML report: {written}", err=True)
+            click.echo(json.dumps(terminal_state, ensure_ascii=False), err=True)
+            _emit(packet.to_dict(), as_json=True)
+            if not browser_opened:
+                progress("browser", "Pairing and opening Review Reader")
+                _open_server_review(
+                    captured.review_url, config=config, review_id=browser_review_id, open_browser=effective_open
+                )
+                progress("browser_done", "Review Reader opened")
+            return
+
+        if fell_back:
+            click.secho(_CLEAN_TREE_NOTICE, dim=not no_color)
+        _emit(render_review(packet, no_color=no_color, show_all=show_all), as_json=False)
+        click.echo(_render_state(terminal_state))
+        click.echo(f"\nReview  {captured.canonical_url}")
+        if written is not None:
+            click.echo(f"HTML report: {written}")
+        if not browser_opened:
+            progress("browser", "Pairing and opening Review Reader")
+            _open_server_review(
+                captured.review_url, config=config, review_id=browser_review_id, open_browser=effective_open
+            )
+            progress("browser_done", "Review Reader opened")
+
+
+def _warn_unapplied_title(response: dict[str, Any], requested: str) -> None:
+    """Say so when a capture could not title its Snapshot as ``--title`` asked.
+
+    A local server keeps the title as the Snapshot's author title. A hosted
+    server has no per-Snapshot title: it titles only a Review the capture
+    creates, so a Snapshot joining an existing hosted Review keeps that title.
+    """
+
+    if not requested:
+        return
+    review_value = response.get("review")
+    review_row = review_value if isinstance(review_value, dict) else {}
+    title = str(review_row.get("title") or "")
+    if requested not in {title, str(review_row.get("auto_title") or "")}:
+        click.echo(f'  ! --title was not applied; the Review this Snapshot joined keeps the title "{title}"', err=True)
+
+
+def _reproduce_execution(
+    config: Any,
+    target: str,
+    *,
+    repo_root: Path,
+    store_root: Path,
+    as_json: bool,
+    trusted_base: str | None = None,
+    use_recorded_policy: bool = False,
+) -> int:
+    """``--reproduce``: replay one recorded hermetic execution from this checkout.
+
+    The policy comes from the local trusted base; the record's policy is only
+    compared. A mismatch fails unless ``--use-recorded-policy`` is passed.
+    """
+
+    from urllib.parse import quote
+
+    from lemoncrow_client.errors import ClientError
+
+    from lemoncrow.pro.capabilities.review.hermetic import HermeticPolicy, HermeticUnavailable
+    from lemoncrow.pro.capabilities.review.reproduce import (
+        ReproductionError,
+        default_trusted_base,
+        load_execution_record,
+        recorded_policy_matches,
+        reproduce_execution,
+        trusted_base_commands,
+        trusted_base_policy,
+    )
+
+    record_path = Path(target)
+    raw: Any
+    if record_path.is_file():
+        try:
+            raw = json.loads(record_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise click.ClickException(f"{target} is not a JSON execution record: {exc}") from exc
+    else:
+        from lemoncrow.pro.capabilities.review.hosted import server_review_request
+
+        try:
+            raw = server_review_request(config, "GET", f"/api/evidence/{quote(target, safe='')}/content")
+        except ClientError as exc:
+            raise _review_server_click_error(exc, hosted=bool(config.hosted)) from exc
+    if not isinstance(raw, dict):
+        raise click.ClickException("execution record must be a JSON object")
+    try:
+        original = load_execution_record(raw)
+        base = trusted_base or default_trusted_base(repo_root)
+        local_policy = trusted_base_policy(repo_root, base)
+        policy: HermeticPolicy | None = local_policy
+        source = f"trusted_base:{base}"
+        if not recorded_policy_matches(original, local_policy):
+            message = (
+                f"the record's execution policy differs from the trusted base's ({base}:.lemoncrow/review.yaml); "
+                "organization policy or a changed trusted base can cause this"
+            )
+            if not use_recorded_policy:
+                click.echo(f"policy mismatch: {message}", err=True)
+                click.echo("pass --use-recorded-policy to replay under the record's policy instead", err=True)
+                return 1
+            click.echo(f"warning: {message}; replaying under the RECORDED policy (--use-recorded-policy)", err=True)
+            policy, source = None, "recorded"
+        outcome = reproduce_execution(
+            original,
+            repo=repo_root,
+            store_root=store_root,
+            policy=policy,
+            policy_source=source,
+            # Even under --use-recorded-policy the record never chooses what runs.
+            trusted_commands=trusted_base_commands(repo_root, base),
+        )
+    except (ReproductionError, HermeticUnavailable) as exc:
+        raise click.ClickException(str(exc)) from exc
+    if as_json:
+        _emit(outcome.to_wire(), as_json=True)
+    else:
+        workspace = {True: "match", False: "differs", None: "unverifiable"}[outcome.workspace_match]
+        click.echo(f"{'reproduced' if outcome.reproduced else 'NOT reproduced'}  {original.identity}")
+        click.echo(f"  source: {outcome.materialized} ({workspace})")
+        click.echo(f"  policy: {outcome.policy_source}")
+        click.echo(f"  compared: {', '.join(outcome.compared_outputs)}")
+        for stage, before, after in outcome.compared:
+            click.echo(f"  {stage}: recorded {before} -> replayed {after}")
+        for stage, recorded, reason in outcome.not_compared:
+            click.echo(f"  {stage}: recorded {recorded}, not compared ({reason})")
+        for stage in outcome.not_replayed:
+            click.echo(f"  {stage}: not replayable locally")
+        if outcome.environment_differences:
+            click.echo(f"  environment differs: {', '.join(outcome.environment_differences)}")
+        click.echo(f"  {outcome.replay.verification.statement}")
+    return 0 if outcome.reproduced else 1
+
+
+def _checkout_identity(repo_root: Path) -> str:
+    """What a command run in *repo_root* sees: HEAD plus every non-ignored working-tree change."""
+
+    from lemoncrow.pro.capabilities.review.gitdiff import resolve_rev_range, source_state
+
+    working = resolve_rev_range(repo_root, working_tree=True)
+    return f"{working.base_sha}\0{source_state(repo_root, working).fingerprint}"
+
+
+def _review_server_check(
+    config: Any,
+    repo_root: Path,
+    rng: RevRange,
+    *,
+    name: str,
+    command: str,
+    store_root: Path,
+    session_id: str | None,
+    limit: int,
+    no_impact: bool,
+    no_provenance: bool,
+    as_json: bool,
+    source_ref_override: str = "",
+    title_override: str = "",
+    snapshot_title: str = "",
+) -> int:
+    """Run one local check and record it on the exact Snapshot it ran against.
+
+    The command runs in the checkout, so its result can describe a Snapshot only
+    when the checkout *is* that Snapshot: a working-tree Review, or the commit
+    HEAD checks out on a clean tree. The checkout is fingerprinted around the
+    capture and the run; if it moved, the result is recorded as UNKNOWN rather
+    than lending a PASS/FAIL to source the command never saw.
+    """
+
+    import shlex
+    import subprocess
+    from urllib.parse import quote
+
+    from lemoncrow_client.errors import ClientError
+
+    from lemoncrow.pro.capabilities.review.hosted import capture_server_review, server_review_request
+
+    if config.hosted and not config.authenticated:
+        raise click.ClickException(
+            "Hosted Review requires sign-in; authenticate to the configured LemonCrow server first"
+        )
+    try:
+        argv = shlex.split(command)
+    except ValueError as exc:
+        raise click.ClickException(f"--run could not be parsed: {exc}") from exc
+    if not name.strip() or not argv:
+        raise click.ClickException("--check needs a NAME and --run a COMMAND")
+    try:
+        before = _checkout_identity(repo_root)
+        head = before.split("\0", 1)[0]
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    in_checkout = rng.mode == "working_tree" or (
+        rng.mode == "commit_range" and not rng.dirty and bool(rng.head_sha) and rng.head_sha == head
+    )
+    if not in_checkout:
+        raise click.ClickException(
+            "--check can only bind to a Snapshot the checkout holds: a working-tree Review, or the commit HEAD "
+            "checks out on a clean tree; drop REV/--base/--head/--staged/--pr or check out that commit first"
+        )
     try:
         captured = capture_server_review(
             config,
@@ -595,70 +1506,105 @@ def _review_server_capture(
             limit=limit,
             with_impact=not no_impact,
             with_provenance=not no_provenance,
-            restore_archived=reopen_review,
-            progress=progress,
-            ready=open_ready,
+            source_ref_override=source_ref_override,
+            title_override=title_override,
         )
     except ClientError as exc:
         raise _review_server_click_error(exc, hosted=bool(config.hosted)) from exc
     except ValueError as exc:
-        raise click.ClickException(str(exc)) from exc
+        raise _review_capture_value_error(exc, rng=rng, force_new_review=False) from exc
+    _warn_unapplied_title(captured.response, snapshot_title)
+    revision_value = captured.response.get("revision")
+    revision = revision_value if isinstance(revision_value, dict) else {}
+    revision_id = str(revision.get("id") or "")
+    if not revision_id:
+        raise click.ClickException("the Review server captured the Snapshot without returning its id")
+    if _checkout_identity(repo_root) != before:
+        raise click.ClickException("the checkout changed while its Snapshot was captured; run the check again")
 
-    packet = captured.build.packet
-    written = _write_html(packet, html_path) if html_path is not None else None
-    review_value = captured.response.get("review")
-    review_row = review_value if isinstance(review_value, dict) else {}
-    browser_review_id = str(review_row.get("ref") or f"r/{captured.review_id}")
+    started = time.monotonic()
+    exit_code: int | None
     try:
-        progress("state", "Loading durable review state")
-        terminal_state = _server_terminal_state(
-            config,
-            captured.review_id,
-            mark_targets=mark_targets,
-            mark_state=mark_state,
-            show_units=show_units,
-            show_marks=show_marks,
-            comment_body=comment_body,
-            comment_target=comment_target,
-            comment_kind=comment_kind,
-            reply_to=reply_to,
-            show_comments=show_comments,
-            since_my_review=since_my_review,
-            send_feedback=send_feedback,
-            finish_review=finish_review,
-            reopen_review=reopen_review,
-            discard_review=discard_review,
+        # JSON stays alone on stdout; the command's own output goes to stderr.
+        exit_code = subprocess.run(argv, cwd=repo_root, check=False, stdout=2 if as_json else None).returncode
+        failure = ""
+    except OSError as exc:
+        exit_code, failure = None, str(exc)
+    elapsed = time.monotonic() - started
+    bound = _checkout_identity(repo_root) == before
+    if exit_code is None:
+        status, detail = "NOT_RUN", f"`{command}` could not start: {failure}"
+    elif not bound:
+        status = "UNKNOWN"
+        detail = (
+            f"`{command}` exited {exit_code} after {elapsed:.1f}s, but the checkout changed while it ran, "
+            "so the result describes no Snapshot."
         )
-        progress("state_done", "Review state loaded")
+    else:
+        status = "PASS" if exit_code == 0 else "FAIL"
+        detail = f"`{command}` exited {exit_code} after {elapsed:.1f}s."
+    try:
+        server_review_request(
+            config,
+            "POST",
+            f"/api/reviews/{quote(captured.review_id, safe='')}/verification",
+            body={
+                "revision_id": revision_id,
+                "name": name.strip(),
+                "status": status,
+                "source": "test",
+                "source_ref": command[:500],
+                "detail": detail,
+            },
+        )
     except ClientError as exc:
         raise _review_server_click_error(exc, hosted=bool(config.hosted)) from exc
-
+    revision_number = revision.get("revision_number")
     if as_json:
-        if written is not None:
-            click.echo(f"HTML report: {written}", err=True)
-        click.echo(json.dumps(terminal_state, ensure_ascii=False), err=True)
-        _emit(packet.to_dict(), as_json=True)
-        if not browser_opened:
-            progress("browser", "Pairing and opening Review Reader")
-            _open_server_review(
-                captured.review_url, config=config, review_id=browser_review_id, open_browser=effective_open
-            )
-            progress("browser_done", "Review Reader opened")
-        return
-
-    if fell_back:
-        click.secho(_CLEAN_TREE_NOTICE, dim=not no_color)
-    _emit(render_review(packet, no_color=no_color, show_all=show_all), as_json=False)
-    click.echo(_render_state(terminal_state))
-    click.echo(f"\nReview  {captured.review_url}")
-    if written is not None:
-        click.echo(f"HTML report: {written}")
-    if not browser_opened:
-        progress("browser", "Pairing and opening Review Reader")
-        _open_server_review(
-            captured.review_url, config=config, review_id=browser_review_id, open_browser=effective_open
+        _emit(
+            {
+                "review_id": captured.review_id,
+                "revision_id": revision_id,
+                "revision_number": revision_number,
+                "name": name.strip(),
+                "status": status,
+                "exit_code": exit_code,
+                "duration_s": round(elapsed, 3),
+                "detail": detail,
+            },
+            as_json=True,
         )
-        progress("browser_done", "Review Reader opened")
+    else:
+        click.echo(f"{status}  {name.strip()}  {elapsed:.1f}s  Revision {revision_number}  {captured.canonical_url}")
+    if status == "PASS":
+        return 0
+    # A signal-killed command reports a negative status; hooks still need a failure.
+    return exit_code if status == "FAIL" and exit_code is not None and exit_code > 0 else 1
+
+
+def _review_capture_value_error(
+    exc: ValueError,
+    *,
+    rng: RevRange,
+    force_new_review: bool,
+) -> click.ClickException:
+    """Turn a stale mutable-Review base into an actionable recovery error."""
+
+    import re
+
+    message = str(exc)
+    # The saved base is the range's own on a bare `lc review`; with --continue,
+    # --working-tree or --staged the capture switches to it itself, so the lost
+    # revision is read from the error rather than from this range.
+    lost = re.fullmatch(r"cannot resolve revision '([0-9a-f]{7,64})'", message)
+    if lost is not None and not force_new_review and rng.mode in {"working_tree", "staged"}:
+        return click.ClickException(
+            f"cannot continue the current Review: saved base revision {lost.group(1)!r} is no longer available "
+            "in this checkout (for example after a rebase, history rewrite, or pruning).\n"
+            "Start a new Review from the current branch state with:\n"
+            "  lc review --new"
+        )
+    return click.ClickException(message)
 
 
 def _review_server_click_error(exc: Any, *, hosted: bool) -> click.ClickException:
@@ -678,11 +1624,19 @@ def _review_server_click_error(exc: Any, *, hosted: bool) -> click.ClickExceptio
     if not hosted:
         from lemoncrow_client.errors import ErrorCode
 
-        if getattr(exc, "code", None) in {ErrorCode.SERVER_UNREACHABLE, ErrorCode.SERVER_SESSION_UNAVAILABLE}:
+        code = getattr(exc, "code", None)
+        timed_out = isinstance(details, dict) and details.get("timed_out") is True
+        if code is ErrorCode.SERVER_UNREACHABLE and timed_out:
+            message = (
+                f"{message}. The server answered too slowly; it may be busy rather than offline. "
+                "Check it with `bash ~/.lemoncrow/install/scripts/local_server.sh status` and retry; "
+                "restart only if the health/status check is unhealthy"
+            )
+        elif code in {ErrorCode.SERVER_UNREACHABLE, ErrorCode.SERVER_SESSION_UNAVAILABLE}:
             message = (
                 f"{message}. Restart the local server with "
                 "`bash ~/.lemoncrow/install/scripts/local_server.sh restart`; if that fails, repair the install "
-                "with `make prod` from a checkout or `lc update --force` for a release install"
+                "with `make oss-prod` from a checkout or `lc update --force` for a release install"
             )
     return click.ClickException(f"Review server failed: {message}")
 
@@ -695,6 +1649,18 @@ def _server_annotation_row(row: dict[str, Any]) -> dict[str, Any]:
     path = str(row.get("path") or "")
     location = path if start <= 0 else f"{path}:L{start}" + (f"-L{end}" if end != start else "")
     return {**row, "location": location}
+
+
+def _attached_terminal_refusal(reference: Any, url: Any) -> str:
+    """Why ``--mark``/``--comment``/``--reply-to`` do nothing on a Review attached to hosted (RC5)."""
+
+    where = str(reference or "a hosted Review")
+    return (
+        f"this Review is attached to hosted {where}, which owns judgments and comments; "
+        "terminal --mark, --comment and --reply-to are not queued for sync. "
+        + (f"Act on the hosted Review at {url}" if url else "Act on the hosted Review")
+        + ", or in the Reader, where your own writes queue for `lc review hosted sync`"
+    )
 
 
 def _server_terminal_state(
@@ -715,9 +1681,11 @@ def _server_terminal_state(
     finish_review: bool,
     reopen_review: bool,
     discard_review: bool,
+    progress: Callable[[str, str], None] | None = None,
 ) -> dict[str, Any]:
     """Apply terminal actions through the same Reader API used by the browser."""
 
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     from urllib.parse import quote
 
     from lemoncrow.pro.capabilities.review.hosted import server_review_request
@@ -725,20 +1693,109 @@ def _server_terminal_state(
 
     base = f"/api/reviews/{quote(review_id, safe='')}"
 
+    read_steps = {
+        "": ("state_overview", "Loading review overview", "Review overview loaded"),
+        "/units": ("state_units", "Loading review targets and marks", "Review targets and marks loaded"),
+        "/annotations": ("state_annotations", "Loading review comments", "Review comments loaded"),
+    }
+
     def request(method: str, suffix: str = "", body: dict[str, Any] | None = None) -> dict[str, Any]:
-        return server_review_request(config, method, f"{base}{suffix}", body=body)
+        step = read_steps.get(suffix) if method == "GET" else None
+        if step is not None and progress is not None:
+            progress(step[0], step[1])
+        result = server_review_request(config, method, f"{base}{suffix}", body=body)
+        if step is not None and progress is not None:
+            progress(f"{step[0]}_done", step[2])
+        return result
+
+    def parallel_reads(suffixes: tuple[str, ...]) -> dict[str, dict[str, Any]]:
+        # Progress stays on the caller thread: its terminal output and startup
+        # session are shared, while every Reader request owns its own client.
+        for suffix in suffixes:
+            step = read_steps[suffix]
+            if progress is not None:
+                progress(step[0], step[1])
+        results: dict[str, dict[str, Any]] = {}
+        with ThreadPoolExecutor(max_workers=len(suffixes), thread_name_prefix="review-state") as pool:
+            futures = {
+                pool.submit(server_review_request, config, "GET", f"{base}{suffix}"): suffix for suffix in suffixes
+            }
+            for future in as_completed(futures):
+                suffix = futures[future]
+                results[suffix] = future.result()
+                if progress is not None:
+                    step = read_steps[suffix]
+                    progress(f"{step[0]}_done", step[2])
+        return results
+
+    has_actions = bool(
+        mark_targets or comment_body is not None or send_feedback or finish_review or reopen_review or discard_review
+    )
+    initial_reads = {} if has_actions else parallel_reads(("", "/units", "/annotations"))
 
     # Snapshot the reviewer-owned frontier before this invocation mutates any
     # judgments. A verdict discarded by capture belongs to the revision the
     # reviewer arrived at and must still be reported on the very command that
     # advances their frontier past it.
-    frontier_before = request("GET", "/frontier")
+    overview_before = request("GET") if has_actions else initial_reads[""]
+    revision_raw = overview_before.get("revision")
+    revision_before = revision_raw if isinstance(revision_raw, dict) else {}
+    expected_revision_id = str(revision_before.get("id") or "")
+    if not expected_revision_id:
+        raise click.ClickException("Review server did not return the current Snapshot identity")
+    session_raw = overview_before.get("session")
+    attached_raw = session_raw.get("hosted") if isinstance(session_raw, dict) else None
+    if isinstance(attached_raw, dict) and (mark_targets or comment_body is not None):
+        # Hosted owns judgments and comments once attached (RC5). The Reader queues a
+        # human's own writes for their offline sync; a terminal (or agent) write never
+        # enters that queue.
+        raise click.ClickException(_attached_terminal_refusal(attached_raw.get("reference"), attached_raw.get("url")))
+
+    def refuse_queued(response: dict[str, Any]) -> None:
+        """A write the server queued for hosted (attached while this ran) is withdrawn, never left queued."""
+
+        if response.get("queued") is not True:
+            return
+        from lemoncrow_client.errors import ClientError
+
+        raw_actions = response.get("actions")
+        stranded: list[str] = []
+        for action in raw_actions if isinstance(raw_actions, list) else ():
+            action_id = str(action.get("id") or "") if isinstance(action, dict) else ""
+            if not action_id:
+                continue
+            try:
+                request("POST", f"/hosted/actions/{quote(action_id, safe='')}", {"op": "discard"})
+            except ClientError:
+                stranded.append(action_id)
+        message = _attached_terminal_refusal(response.get("reference"), None)
+        if stranded:
+            message += f"; could not withdraw queued action(s) {', '.join(stranded)}: discard them in the Reader"
+        else:
+            message += "; the write it queued was withdrawn"
+        raise click.ClickException(message)
+
+    needs_frontier = bool(
+        since_my_review
+        or mark_targets
+        or comment_body is not None
+        or send_feedback
+        or finish_review
+        or reopen_review
+        or discard_review
+    )
+    frontier_before = request("GET", "/frontier") if needs_frontier else {}
 
     path_marks: list[dict[str, Any]] = []
     downgraded: list[dict[str, str]] = []
     shadowed: list[dict[str, Any]] = []
     for target in mark_targets:
-        marked = request("POST", "/marks", {"unit_key": target, "state": mark_state})
+        marked = request(
+            "POST",
+            "/marks",
+            {"unit_key": target, "state": mark_state, "expected_revision_id": expected_revision_id},
+        )
+        refuse_queued(marked)
         raw_rows = marked.get("marks")
         rows = [dict(item) for item in raw_rows if isinstance(item, dict)] if isinstance(raw_rows, list) else []
         labels = [str(item.get("label") or item.get("path") or item.get("unit_key") or "") for item in rows]
@@ -817,8 +1874,10 @@ def _server_terminal_state(
                 "parent_id": reply_to or "",
                 "file_level": start <= 0,
                 "range": {"start_line": start, "end_line": end},
+                "expected_revision_id": expected_revision_id,
             },
         )
+        refuse_queued(created)
         raw_created = created.get("annotation")
         if isinstance(raw_created, dict):
             created_annotation = _server_annotation_row(dict(raw_created))
@@ -828,12 +1887,20 @@ def _server_terminal_state(
     closure: dict[str, Any] | None = None
     if finish_review or reopen_review or discard_review:
         wanted = "open" if reopen_review else ("archived" if discard_review else "finished")
-        closure = request("POST", "/finish", {"status": wanted})
+        finish_body: dict[str, Any] = {"status": wanted}
+        if wanted != "open":
+            finish_body["expected_revision_id"] = expected_revision_id
+        closure = request("POST", "/finish", finish_body)
 
-    overview = request("GET")
-    units_payload = request("GET", "/units")
-    annotations_payload = request("GET", "/annotations")
-    targets_payload = request("GET", "/targets")
+    mutated = bool(mark_targets or comment_body is not None or finish_review or reopen_review or discard_review)
+    final_reads = (
+        parallel_reads(("", "/units", "/annotations") if mutated else ("/units", "/annotations"))
+        if has_actions
+        else initial_reads
+    )
+    overview = final_reads[""] if mutated else overview_before
+    units_payload = final_reads["/units"]
+    annotations_payload = final_reads["/annotations"]
 
     raw_units = units_payload.get("units")
     units = [dict(item) for item in raw_units if isinstance(item, dict)] if isinstance(raw_units, list) else []
@@ -843,8 +1910,6 @@ def _server_terminal_state(
         if isinstance(raw_annotations, list)
         else []
     )
-    raw_targets = targets_payload.get("targets")
-    targets = [dict(item) for item in raw_targets if isinstance(item, dict)] if isinstance(raw_targets, list) else []
 
     unit_kinds: dict[str, int] = {}
     mark_counts: dict[str, int] = {}
@@ -879,7 +1944,7 @@ def _server_terminal_state(
         discarded_value = overview.get("discarded")
     session: dict[str, Any] = dict(session_value) if isinstance(session_value, dict) else {}
     revision: dict[str, Any] = dict(revision_value) if isinstance(revision_value, dict) else {}
-    progress: dict[str, Any] = dict(progress_value) if isinstance(progress_value, dict) else {}
+    progress_data: dict[str, Any] = dict(progress_value) if isinstance(progress_value, dict) else {}
     counts: dict[str, Any] = dict(counts_value) if isinstance(counts_value, dict) else {}
     discarded = list(discarded_value) if isinstance(discarded_value, list) else []
     state: dict[str, Any] = {
@@ -892,8 +1957,8 @@ def _server_terminal_state(
         ],
         "unit_count": len(units),
         "unit_kinds": unit_kinds,
-        "target_count": int(overview.get("target_count") or progress.get("target_count") or len(targets)),
-        "target_progress": progress,
+        "target_count": int(overview.get("target_count") or progress_data.get("target_count") or 0),
+        "target_progress": progress_data,
         "mark_counts": mark_counts,
         "stale_marks": stale_marks,
         "downgraded_marks": downgraded,
@@ -925,6 +1990,199 @@ def _review_reference_matches(identifier: str, reference: str) -> bool:
     """Match an exact internal Review id or its canonical ``r/<id>`` ref."""
 
     return identifier == reference or f"r/{identifier}" == reference
+
+
+def _manage_current_review(
+    config: Any,
+    *,
+    store_root: Path,
+    repo_root: Path,
+    resume_author: bool,
+    as_json: bool,
+) -> None:
+    """Resolve terminal continuity from the same durable live Review binding."""
+
+    from urllib.parse import quote
+
+    from lemoncrow_client.errors import ClientError
+
+    from lemoncrow.pro.capabilities.review.hosted import server_review_request, server_review_url
+    from lemoncrow.pro.capabilities.review.live_runtime import load_live_review_binding
+
+    binding = load_live_review_binding(store_root, repo_root, server_url=config.url)
+    if binding is None:
+        raise click.ClickException(
+            "this workspace has no current Review binding; run `lcr` (or `lc review --open`) once to establish it"
+        )
+
+    review_id = binding.review_id
+    base = f"/api/reviews/{quote(review_id, safe='')}"
+    try:
+        overview = server_review_request(config, "GET", base)
+        annotations = server_review_request(config, "GET", f"{base}/annotations")
+        journal = server_review_request(config, "GET", f"{base}/journal")
+        source = server_review_request(config, "GET", f"{base}/source-state")
+    except ClientError as exc:
+        raise _review_server_click_error(exc, hosted=bool(config.hosted)) from exc
+
+    session_raw = overview.get("session")
+    session = session_raw if isinstance(session_raw, dict) else {}
+    revision_raw = overview.get("revision")
+    revision = revision_raw if isinstance(revision_raw, dict) else {}
+    provenance_raw = overview.get("provenance")
+    provenance = provenance_raw if isinstance(provenance_raw, dict) else {}
+    feedback_raw = annotations.get("feedback")
+    feedback = feedback_raw if isinstance(feedback_raw, dict) else {}
+    delivery_raw = annotations.get("delivery")
+    delivery = delivery_raw if isinstance(delivery_raw, dict) else {}
+
+    exact_provenance = str(provenance.get("certainty") or "") == "exact"
+    author_host = str(
+        delivery.get("host") or (provenance.get("host") if exact_provenance else "") or binding.author_host
+    )
+    author_session_id = str(
+        delivery.get("session_id")
+        or (provenance.get("session_id") if exact_provenance else "")
+        or binding.author_session_id
+    )
+    review_ref = str(session.get("ref") or f"r/{review_id}")
+    reader_url = server_review_url(config, review_ref)
+    revision_number_raw = revision.get("revision_number")
+    current_revision_number = (
+        int(revision_number_raw) if revision_number_raw is not None else int(binding.revision_number or 0)
+    )
+    latest_revision_number_raw = overview.get("latest_revision_number")
+    latest_revision_number = (
+        int(latest_revision_number_raw) if latest_revision_number_raw is not None else current_revision_number
+    )
+    reviewed_revision_number = overview.get("last_reviewed_revision_number")
+    commented_revision_number = overview.get("last_commented_revision_number")
+    viewing_base_revision_number = overview.get("default_base_revision_number")
+    viewing_target_revision_number = overview.get("default_target_revision_number")
+    status: dict[str, Any] = {
+        "review_id": review_id,
+        "review_ref": review_ref,
+        "reader_url": reader_url,
+        "review_status": str(session.get("status") or ""),
+        "revision_id": str(revision.get("id") or binding.revision_id),
+        "revision_ref": str(revision.get("ref") or f"rr/{revision.get('short_id') or binding.revision_id}"),
+        "revision_number": current_revision_number,
+        "latest_revision_number": latest_revision_number,
+        "last_reviewed_revision_number": reviewed_revision_number,
+        "last_commented_revision_number": commented_revision_number,
+        "viewing": {
+            "base_revision_number": viewing_base_revision_number,
+            "target_revision_number": viewing_target_revision_number,
+        },
+        "author": {
+            "host": author_host,
+            "session_id": author_session_id,
+            "target_ref": f"{author_host}:{author_session_id}" if author_host and author_session_id else "",
+            "status": str(journal.get("status") or ""),
+            "task": str(journal.get("task") or ""),
+            "updated_at": str(journal.get("updated_at") or ""),
+        },
+        "feedback": {
+            "open_total": int(feedback.get("open_total") or 0),
+            "unpublished": int(feedback.get("unpublished") or 0),
+            "published": int(feedback.get("published") or 0),
+            "in_flight": int(feedback.get("in_flight") or 0),
+            "addressed": int(feedback.get("addressed") or 0),
+        },
+        "source": source,
+        "binding": {
+            "source_fingerprint": binding.source_fingerprint,
+            "updated_at": binding.updated_at,
+            "claimed_at": binding.claimed_at,
+        },
+    }
+
+    if resume_author:
+        if not author_host or not author_session_id:
+            raise click.ClickException(
+                f"{review_ref} has no exact author session to resume; open the Review to inspect provenance details"
+            )
+        from lemoncrow.pro.capabilities.review.delivery import deliver_prompt_to_agent_session
+
+        prompt = (
+            f"Continue the existing authoring task in this exact session for LemonCrow Review {review_ref}. "
+            "Preserve the current session context, incorporate any Review feedback already delivered to this session, "
+            "run the relevant verification, and continue from where you left off. "
+            "Do not treat this continuity prompt as new reviewer feedback."
+        )
+        result = deliver_prompt_to_agent_session(author_host, author_session_id, repo_root, prompt)
+        resume_payload = {
+            "state": result.state,
+            "target_ref": result.target_ref,
+            "remote_ref": result.remote_ref,
+            "message": result.message,
+        }
+        status["resume"] = resume_payload
+        if not result.accepted and result.state != "sent":
+            raise click.ClickException(result.message or f"could not resume {author_host}:{author_session_id}")
+
+    if as_json:
+        _emit(status, as_json=True)
+        return
+
+    feedback_value = status.get("feedback")
+    feedback_state: dict[str, Any] = feedback_value if isinstance(feedback_value, dict) else {}
+    author_value = status.get("author")
+    author: dict[str, Any] = author_value if isinstance(author_value, dict) else {}
+    source_value = status.get("source")
+    source_state: dict[str, Any] = source_value if isinstance(source_value, dict) else {}
+    resume_value = status.get("resume")
+    resume_state: dict[str, Any] = resume_value if isinstance(resume_value, dict) else {}
+    viewing_value = status.get("viewing")
+    viewing = viewing_value if isinstance(viewing_value, dict) else {}
+    viewing_base = viewing.get("base_revision_number")
+    viewing_target = viewing.get("target_revision_number")
+    viewing_text = (
+        f"Revision {viewing_base} → Revision {viewing_target}"
+        if viewing_base is not None and viewing_target is not None and viewing_base != viewing_target
+        else f"Revision {viewing_target}" if viewing_target is not None else f"Revision {status['revision_number']}"
+    )
+    reviewed_text = (
+        f"Revision {status['last_reviewed_revision_number']}"
+        if status.get("last_reviewed_revision_number") is not None
+        else "—"
+    )
+    commented_text = (
+        f"Revision {status['last_commented_revision_number']}"
+        if status.get("last_commented_revision_number") is not None
+        else "—"
+    )
+    click.echo(
+        f"Review    {review_ref} · {status['review_status'] or 'open'}\n"
+        f"Viewing   {viewing_text}\n"
+        f"Latest    Revision {status['latest_revision_number']}\n"
+        f"Reviewed  {reviewed_text}\n"
+        f"Commented {commented_text}\n"
+        f"Reader    {reader_url}\n"
+        + (
+            f"Author    {str(author['host']).capitalize()} · {author['session_id']}"
+            + (f" · {author['status']}" if author.get("status") else "")
+            + "\n"
+            if author.get("host") and author.get("session_id")
+            else "Author    no exact session bound\n"
+        )
+        + (f"Task      {author['task']}\n" if author.get("task") else "")
+        + (
+            "Feedback  "
+            f"{feedback_state['unpublished']} unsent · {feedback_state['in_flight']} in flight · "
+            f"{feedback_state['published']} sent · {feedback_state['addressed']} addressed\n"
+        )
+        + (
+            f"Source    {source_state.get('path_count', 0)} newer file(s) · {source_state.get('fingerprint', '')}\n"
+            if source_state.get("supported") and source_state.get("changed")
+            else (
+                "Source    matches frozen Review Snapshot\n"
+                if source_state.get("supported")
+                else f"Source    unavailable · {source_state.get('reason') or 'source state is not available'}\n"
+            )
+        )
+        + (f"Resume    {resume_state.get('state', '')} · {resume_state.get('message', '')}" if resume_state else "")
+    )
 
 
 def _manage_server_reviews(
@@ -989,8 +2247,8 @@ def _manage_server_reviews(
                 review = review_value if isinstance(review_value, dict) else {}
                 revision = revision_value if isinstance(revision_value, dict) else {}
                 click.echo(
-                    f"{review.get('ref') or f"r/{review.get('id', wanted_id)}"}  {review.get('status', '')}  "
-                    f"rev {revision.get('revision_number', 0)}\n"
+                    f"{review.get('ref') or f'r/{review.get("id", wanted_id)}'}  {review.get('status', '')}  "
+                    f"Revision {revision.get('revision_number', 0)}\n"
                     f"{review.get('title') or '(untitled review)'}\n"
                     f"Repository  {repo_id}\n"
                     f"Revisions   {detail.get('revision_count', 0)}\n"
@@ -1006,13 +2264,122 @@ def _manage_server_reviews(
         if not rows:
             click.echo("No reviews found.")
             return
-        click.echo("REVIEW ID             STATUS     REV  TITLE")
+        click.echo("REVIEW ID             STATUS  REVISION  TITLE")
         for row in rows:
             title = str(row.get("title") or "(untitled)").replace("\n", " ")
             shown_id = str(row.get("ref") or (f"r/{row.get('id')}" if row.get("id") else ""))
             click.echo(
-                f"{shown_id:<21} {row.get('status') or ''!s:<10} " f"{int(row.get('revision_number') or 0):>3}  {title}"
+                f"{shown_id:<21} {row.get('status') or ''!s:<10} {int(row.get('revision_number') or 0):>8}  {title}"
             )
+    except ClientError as exc:
+        raise click.ClickException(f"Review server failed: {exc.message}") from exc
+
+
+def _parse_fix_snapshot_ref(value: str) -> tuple[str, int]:
+    raw = value.strip()
+    try:
+        review_ref, number_raw = raw.rsplit(".", 1)
+        number = int(number_raw)
+    except (ValueError, TypeError) as exc:
+        raise click.ClickException("fix target must look like REVIEW.N, for example k7q2.3") from exc
+    review_ref = review_ref.removeprefix("r/").strip()
+    if not review_ref or number < 0:
+        raise click.ClickException("fix target must look like REVIEW.N, for example k7q2.3")
+    return review_ref, number
+
+
+def _manage_fix_line(
+    config: Any,
+    *,
+    fix_snapshot: str | None,
+    apply_fix_snapshot: str | None,
+    with_conflict_markers: bool,
+    as_json: bool,
+) -> None:
+    """Start or apply one local Snapshot fix line through the Review service."""
+
+    if config.hosted:
+        raise click.ClickException("Fix lines are available for local Reviews only")
+
+    from lemoncrow_client.errors import ClientError
+
+    from lemoncrow.pro.capabilities.review.hosted import server_review_request
+
+    wanted = fix_snapshot or apply_fix_snapshot or ""
+    review_ref, snapshot_number = _parse_fix_snapshot_ref(wanted)
+    try:
+        overview = server_review_request(config, "GET", f"/api/reviews/{review_ref}")
+        raw_session = overview.get("session") if isinstance(overview, dict) else None
+        session = raw_session if isinstance(raw_session, dict) else {}
+        review_id = str(session.get("id") or "").strip()
+        if not review_id:
+            raise click.ClickException(f"no such Review {review_ref!r}")
+
+        if fix_snapshot:
+            history = server_review_request(config, "GET", f"/api/reviews/{review_id}/revisions")
+            revisions = history.get("revisions") if isinstance(history, dict) else None
+            rows = [row for row in revisions or [] if isinstance(row, dict)]
+            matches = [row for row in rows if int(row.get("revision_number") or -1) == snapshot_number]
+            if len(matches) != 1:
+                raise click.ClickException(f"Review {review_ref!r} has no unique Snapshot {snapshot_number}")
+            revision_id = str(matches[0].get("id") or "")
+            result = server_review_request(
+                config,
+                "POST",
+                f"/api/reviews/{review_id}/snapshots/{revision_id}/fix-line",
+                body={},
+            )
+            if as_json:
+                _emit(result, as_json=True)
+                return
+            line = result.get("fix_line") if isinstance(result, dict) else None
+            wire = line if isinstance(line, dict) else {}
+            path = str(wire.get("worktree_path") or "")
+            branch = str(wire.get("branch") or "")
+            click.echo(path)
+            if branch:
+                click.echo(f"Branch  {branch}", err=True)
+            return
+
+        listed = server_review_request(config, "GET", f"/api/reviews/{review_id}/fix-lines")
+        raw_lines = listed.get("fix_lines") if isinstance(listed, dict) else None
+        lines = [row for row in raw_lines or [] if isinstance(row, dict)]
+        matching = [row for row in lines if int(row.get("snapshot_number") or -1) == snapshot_number]
+        open_lines = [row for row in matching if str(row.get("status") or "") in {"fixing", "applied_with_conflicts"}]
+        line = (open_lines or matching)[-1] if (open_lines or matching) else None
+        if line is None:
+            raise click.ClickException(
+                f"Snapshot {snapshot_number} has no fix line; run lc review --fix {wanted} first"
+            )
+        fix_id = str(line.get("id") or "")
+        result = server_review_request(
+            config,
+            "POST",
+            f"/api/reviews/{review_id}/fix-lines/{fix_id}/apply",
+            body={"with_conflict_markers": bool(with_conflict_markers)},
+        )
+        if as_json:
+            _emit(result, as_json=True)
+            if not result.get("applied"):
+                raise click.exceptions.Exit(1)
+            return
+        plan = result.get("plan") if isinstance(result, dict) else None
+        plan_wire = plan if isinstance(plan, dict) else {}
+        for warning in plan_wire.get("warnings") or []:
+            click.echo(f"Warning: {warning}", err=True)
+        if not result.get("applied"):
+            conflicts = [str(path) for path in plan_wire.get("conflicts") or []]
+            if conflicts:
+                click.echo("Fix conflicts with the main worktree:", err=True)
+                for path in conflicts:
+                    click.echo(f"  {path}", err=True)
+            raise click.ClickException("nothing was written; keep fixing or rerun with --with-conflict-markers")
+        fix_wire = result.get("fix_line") if isinstance(result, dict) else None
+        applied = fix_wire.get("applied_files") if isinstance(fix_wire, dict) else []
+        files = [str(path) for path in applied or []]
+        click.echo(f"Applied fix to main as uncommitted changes ({len(files)} file{'s' if len(files) != 1 else ''}).")
+        for path in files:
+            click.echo(f"  {path}")
     except ClientError as exc:
         raise click.ClickException(f"Review server failed: {exc.message}") from exc
 
@@ -1042,14 +2409,121 @@ def _open_server_review(url: str, *, config: Any, review_id: str, open_browser: 
         except ClientError as exc:
             raise _review_server_click_error(exc, hosted=False) from exc
 
-    import webbrowser
-
-    try:
-        opened = webbrowser.open(url)
-    except Exception:
-        opened = False
+    opened = _launch_browser_url(url)
     if not opened:
         click.echo(f"(could not open a browser; open {url} manually.)", err=True)
+
+
+def arm_local_browser_url(url: str) -> None:
+    """Best-effort CLI pairing before opening a local console *url*.
+
+    The local server mints a browser capability only after the machine bearer
+    arms the exact path (or the browser renews a still-valid capability). A
+    failure here is not fatal: the page then says how to reconnect.
+    """
+    from urllib.parse import urlsplit
+
+    try:
+        from lemoncrow_client.config import load_config as load_client_config
+        from lemoncrow_client.errors import ClientError
+
+        from lemoncrow.pro.capabilities.review.hosted import pair_local_review_browser
+    except ImportError:
+        return
+    try:
+        config = load_client_config(product="review")
+        target = urlsplit(url)
+        scheme, host, port = config.endpoint_origin
+        target_port = target.port or (443 if target.scheme == "https" else 80)
+        same_origin = (target.scheme, target.hostname, target_port) == (scheme, host, port)
+        if config.hosted or not config.token or not same_origin:
+            return
+        pair_local_review_browser(config, target.path or "/")
+    except (ClientError, OSError, ValueError):
+        return
+
+
+def _launch_browser_url(url: str) -> bool:
+    """Launch *url* in the graphical desktop browser.
+
+    Do not use Python's controller return value as proof that a desktop browser
+    accepted the URL: Chrome and desktop opener helpers may exit immediately
+    after handing the URL to an already-running browser.  Successful process
+    creation is the useful contract here.  On Linux we also avoid Python's
+    browser fallback chain entirely so a failed GUI launch can never fall back
+    to links/lynx/w3m and hijack the terminal.
+    """
+
+    import os
+    import shutil
+    import subprocess
+    import sys
+    import webbrowser
+
+    if os.environ.get("LEMONCROW_NO_BROWSER", "").strip() not in {"", "0"}:
+        # Tests/CI: print the URL instead of launching a desktop browser.
+        click.echo(f"Review URL: {url}")
+        return True
+
+    def spawn(argv: list[str]) -> bool:
+        try:
+            subprocess.Popen(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+                start_new_session=True,
+            )
+            return True
+        except (OSError, subprocess.SubprocessError):
+            return False
+
+    if sys.platform == "darwin":
+        opener = shutil.which("open")
+        return bool(opener and spawn([opener, url]))
+
+    if os.name == "nt":
+        try:
+            os.startfile(url)  # type: ignore[attr-defined]
+            return True
+        except OSError:
+            return False
+
+    if sys.platform.startswith("linux"):
+        if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+            return False
+
+        # Let the desktop choose its configured graphical browser.  We count a
+        # successful spawn, not the helper's eventual exit status: xdg-open may
+        # hand the URL to an existing Chrome process and exit immediately.
+        opener = shutil.which("xdg-open")
+        if opener and spawn([opener, url]):
+            return True
+
+        # Minimal GUI-only fallback when xdg-open is unavailable/broken.
+        for name in (
+            "google-chrome",
+            "google-chrome-stable",
+            "chromium",
+            "chromium-browser",
+            "firefox",
+            "brave-browser",
+            "brave-browser-stable",
+            "microsoft-edge",
+            "vivaldi",
+        ):
+            executable = shutil.which(name)
+            if executable and spawn([executable, url]):
+                return True
+        return False
+
+    # Non-Linux Unix fallback.  Linux intentionally avoids this because
+    # webbrowser.open() may continue into terminal-only browsers.
+    try:
+        return bool(webbrowser.open(url))
+    except Exception:
+        return False
 
 
 def _review_state(
@@ -1116,6 +2590,7 @@ def _review_state(
             rng,
             title=build.packet.title or rng.title,
             restore_archived=reopen_review,
+            reuse_closed=finish_review or reopen_review or discard_review,
         )
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
@@ -1131,6 +2606,7 @@ def _review_state(
         project_annotations=project_annotations,
     )
     revision = refreshed.revision
+    store.publish_snapshot(session.id, revision.id)
     units = store.list_units(revision.id)
     by_key = {unit.unit_key: unit for unit in units}
 
@@ -1162,7 +2638,7 @@ def _review_state(
         if not covered:
             # Never a silent no-op: a reviewer who typed a stale path would
             # otherwise believe they had recorded something.
-            raise click.ClickException(f"no reviewable unit matches {target!r} in revision {revision.revision_number}")
+            raise click.ClickException(f"no review area matches {target!r} in Revision {revision.revision_number - 1}")
         if resolution.shadowed:
             # One word, two readings: a file the repository really contains, and
             # some other file's target label spelled identically. The file wins
@@ -1205,7 +2681,14 @@ def _review_state(
                 }
             )
         for unit in covered:
-            recorded = mark_unit(store, session, revision, unit, state=state)
+            recorded = mark_unit(
+                store,
+                session,
+                revision,
+                unit,
+                state=state,
+                expected_current_revision_id=revision.id,
+            )
             note = mark_downgrade_note(unit, state, recorded.state)
             if note:
                 # Said here, at the moment it happens, and on stderr so it survives
@@ -1257,7 +2740,7 @@ def _review_state(
     payload: dict[str, Any] = {
         "review_id": session.id,
         "revision_id": revision.id,
-        "revision_number": revision.revision_number,
+        "revision_number": revision.revision_number - 1,
         "range_mode": revision.range_mode,
         # No `tree_fingerprint` and no `packet_path`: both were shipped here
         # from the first day, rendered by nothing and read by nobody. The
@@ -1471,6 +2954,7 @@ def _add_comment(
             kind=kind,
             parent_id=parent_id,
             new_text=build.blobs.new.get(path),
+            expected_current_revision_id=revision.id,
         )
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
@@ -1671,7 +3155,7 @@ def _frontier_payload(
     previous = refreshed.previous_revision
     ambiguous = _ambiguous_symbols(units)
     return {
-        "previous_revision_number": previous.revision_number if previous is not None else 0,
+        "previous_revision_number": previous.revision_number - 1 if previous is not None else None,
         "changed_since_review": [_frontier_row(entry, ambiguous) for entry in groups.changed_since_review],
         "new": [_frontier_row(entry, ambiguous) for entry in groups.new],
         "unresolved": [_frontier_row(entry, ambiguous) for entry in groups.unresolved],
@@ -1793,6 +3277,8 @@ def _unit_label(
         if not ambiguous:
             return base
         return f"{base}@L{start_line}" if start_line else f"{base}#{ordinal}"
+    if kind == "dependency" and symbol:
+        return symbol
     if kind == "hunk":
         return f"{path}#{ordinal}"
     return path
@@ -1853,7 +3339,7 @@ def _render_state(state: dict[str, Any]) -> str:
     reviewed_targets = int(target_progress.get("reviewed") or 0)
     lines = [
         "",
-        f"REVIEW SESSION  {state['review_id']}  revision {state['revision_number']}  ({state['range_mode']})",
+        f"REVIEW SESSION  {state['review_id']}  Revision {state['revision_number']}  ({state['range_mode']})",
     ]
     revision_id = str(state.get("revision_id") or "")
     if revision_id:
@@ -1861,7 +3347,7 @@ def _render_state(state: dict[str, Any]) -> str:
     lines.extend(
         [
             f"  files   {int(kinds.get('file') or 0)}",
-            f"  targets {target_count}  ({reviewed_targets}/{target_count} reviewed)",
+            f"  review areas {target_count}  ({reviewed_targets}/{target_count} reviewed)",
             f"  units   {state['unit_count']} raw" + (f"  ({breakdown})" if breakdown else ""),
         ]
     )
@@ -2071,28 +3557,27 @@ def _render_frontier(frontier: dict[str, Any], state: dict[str, Any]) -> list[st
         "not yet reviewed": int(frontier["not_yet_reviewed"]),
     }
     current = int(state["revision_number"])
-    previous = int(frontier.get("previous_revision_number") or 0)
-    if not previous:
-        # No mark yet, so no revision has been looked at. Not "first revision":
+    previous_raw = frontier.get("previous_revision_number")
+    previous = int(previous_raw) if previous_raw is not None else None
+    if previous is None:
+        # No mark yet, so no Snapshot has been looked at. Not "first Snapshot":
         # this may well be the fifth, and saying otherwise would date the
         # reviewer's position to the tree's history rather than to their own.
-        headline = f"SINCE MY REVIEW  revision {current}  (nothing reviewed yet)"
+        headline = f"SINCE MY REVIEW  Revision {current}  (nothing reviewed yet)"
     elif previous == current:
         # Idempotency is a feature and has to be visible, or a reviewer who ran
         # the command twice will read an unchanged frontier as a broken one.
         # Keyed on their last review rather than on this invocation's write:
-        # whether *this* command was the one that recorded the revision is an
+        # whether *this* command was the one that recorded the Snapshot is an
         # accident of typing order and must not change what they are told.
-        headline = f"SINCE MY REVIEW  revision {current}  (unchanged since your last review)"
+        headline = f"SINCE MY REVIEW  Revision {current}  (unchanged since your last review)"
     elif previous > current:
-        # An undo puts the tree back on a revision already on file, so the
+        # An undo puts the tree back on a Snapshot already on file, so the
         # number in front of the reviewer is *lower* than the one they last
-        # recorded a verdict against. "you last saw revision 2" over a header
-        # reading revision 1 is a sentence no reviewer has a model for; saying
-        # which way the tree moved is the part they can act on.
-        headline = f"SINCE MY REVIEW  revision {current}  (the tree went back; you last saw revision {previous})"
+        # recorded a verdict against. Name the Snapshot movement directly.
+        headline = f"SINCE MY REVIEW  Revision {current}  (the tree went back; you last saw Revision {previous})"
     else:
-        headline = f"SINCE MY REVIEW  revision {current}  (you last saw revision {previous})"
+        headline = f"SINCE MY REVIEW  Revision {current}  (you last saw Revision {previous})"
 
     lines = ["", headline]
     for label, count in counts.items():
@@ -2109,7 +3594,7 @@ def _render_frontier(frontier: dict[str, Any], state: dict[str, Any]) -> list[st
         lines.append("")
         lines.append(f"{title}  ({len(rows)})")
         if key == "unchanged_reviewed":
-            plural = "unit" if len(rows) == 1 else "units"
+            plural = "judgment" if len(rows) == 1 else "judgments"
             lines.append(f"  {len(rows)} {plural} still valid — nothing to re-read")
             continue
         for row in rows[:_FRONTIER_ROWS]:
@@ -2159,6 +3644,14 @@ def _render_frontier(frontier: dict[str, Any], state: dict[str, Any]) -> list[st
     for note in frontier["notes"]:
         lines.append(f"  note: {note}")
     return lines
+
+
+def _active_local_branch_review(config: Any, *, store_root: Path, repo_root: Path) -> tuple[str, str]:
+    """Return the active working-tree Review and its frozen base."""
+
+    from lemoncrow.pro.capabilities.review.hosted import active_local_review_base
+
+    return active_local_review_base(config, repo_root=repo_root, store_root=store_root, range_mode="working_tree")
 
 
 def _effective_open(

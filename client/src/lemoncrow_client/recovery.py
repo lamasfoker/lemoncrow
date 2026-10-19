@@ -1,9 +1,9 @@
 """Small in-memory facts about automatic client recovery decisions.
 
 The thin client is intentionally standard-library-only and does not import the
-main LemonCrow runtime/telemetry stack. These facts are therefore ephemeral:
-higher layers may bridge them into their own decision sink, while the client
-itself never creates another persistent trace store.
+main LemonCrow runtime/telemetry stack. These facts are ephemeral; the only
+persistent record is the per-call runtime trace (:mod:`.trace`), which copies
+the recovery facts of the call it describes.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ RecoveryKind = Literal[
     "write_replay",
     "blob_fill",
     "reuse_reject",
+    "reconnect_retry",
 ]
 RecoveryOutcome = Literal["retrying", "recovered", "failed"]
 

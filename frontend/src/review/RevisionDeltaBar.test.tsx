@@ -55,6 +55,7 @@ describe("RevisionDeltaBar", () => {
       />,
     );
     expect(screen.getByRole("status")).toBeTruthy();
+    expect(screen.getByText("Snapshot 2")).toBeTruthy();
     expect(screen.getByText("2 returned")).toBeTruthy();
     expect(screen.getByText("1 changed")).toBeTruthy();
     expect(screen.getByText("1 new")).toBeTruthy();
@@ -82,7 +83,7 @@ describe("RevisionDeltaBar", () => {
     expect(screen.getByText("1 still pending")).toBeTruthy();
     await userEvent.click(screen.getByText("Details"));
     expect(screen.getByText("Still pending · 1")).toBeTruthy();
-    expect(screen.getByText(/already needed review before this revision/i)).toBeTruthy();
+    expect(screen.getByText(/already needed review before this Snapshot/i)).toBeTruthy();
   });
 
   it("keeps captured reviewer proposals in revision delta and links them to returned targets", async () => {

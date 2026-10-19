@@ -1,84 +1,96 @@
 # LemonCrow Python SDK
 
-The Python SDK in `lemoncrow.sdk` is the embeddable contract for custom hosts,
-tests, and service-side integrations that want LemonCrow without shelling out.
+The Python SDK is an embeddable interface for custom integrations, tests, and service-side code that need LemonCrow without driving the CLI.
 
-## Install
+The stable facade is `LemonCrowClient` in `lemoncrow.gateway.sdk` (re-exported by the SDK package where installed).
 
-From a source checkout:
+## Source-checkout setup
 
 ```bash
-cd lemoncrow
 uv sync --all-extras
 ```
 
-## Client Types
-
-- `LemonCrowClient.local(root=".lemoncrow")` uses the in-process runtime and local store.
-- `LemonCrowClient.remote(base_url=..., api_key=...)` targets the HTTP service.
-- `LemonCrowClient.mcp(root=".lemoncrow")` mirrors the MCP contract with a local loopback transport by default.
-
-## Core Workflow
+## Client modes
 
 ```python
-from lemoncrow.sdk import LemonCrowClient
+from lemoncrow.gateway.sdk import LemonCrowClient
 
-client = LemonCrowClient.local(root=".lemoncrow")
+local = LemonCrowClient.local()
+remote = LemonCrowClient.remote(base_url="https://your-lemoncrow.example", api_key="...")
+mcp = LemonCrowClient.mcp()
+```
 
-context = client.get_context(
-    task="Fix generated output that drifts back after refresh",
-    domain="source.truth",
+- `local()` uses the in-process local store/runtime contract.
+- `remote()` targets a configured LemonCrow HTTP service.
+- `mcp()` mirrors the low-level protocol contract for integration/testing use.
+
+Normal coding-agent users do not need the Python SDK or MCP client; use the host plugin/integration instead.
+
+## Core facade operations
+
+The current facade exposes operations such as:
+
+```python
+context = local.get_context(
+    task="Find the parser path responsible for this failing test",
+    files=["src/parser.py"],
 )
 
-rescue = client.rescue_failure(
-    task="Apply a live state change",
-    domain="state.change",
-    error="Known dead end triggered",
-)
-print(rescue.rescue)
-
-gate = client.run_rubric_gate(
-    rubric_id="rubric_state_change_safety",
-    checks={
-        "canonical_identifier_used": True,
-        "pre_change_state_captured": True,
-        "read_after_write_completed": True,
-        "observed_state_matches_intent": True,
-    },
+rescue = local.rescue_failure(
+    task="Fix the parser regression",
+    error="focused test still fails",
 )
 
-trace = client.traces.record(
+result = local.run_rubric_gate(
+    rubric_id="example-rubric",
+    checks={"focused_test_passed": True},
+)
+
+trace = local.record_trace(
     agent="sdk",
-    domain="state.change",
-    task="Apply a live state change",
+    domain="code.change",
+    task="Fix the parser regression",
     status="success",
 )
 ```
 
-## Namespaces
+Exact DTO fields and return types live in the SDK source and type annotations; prefer those definitions over copied examples when building a long-lived integration.
 
-- `client.playbooks` / `client.blocks` — list, search, and fetch Playbooks.
-- `client.rubrics` — list, fetch, and run rubric gates.
-- `client.traces` — record, list, and inspect traces.
-- `client.failures` — analyze failure clusters.
-- `client.evals` — list and run eval cases.
-- `client.savings` — summarize savings and cost deltas.
-- `client.memory` — upsert, fetch, archive, and recall memory blocks.
-- `client.lessons` — review lesson candidates where supported.
+## Namespaced clients
 
-## Dev-Mode Alignment
+`LemonCrowClient` also exposes namespaced helpers for the public contracts implemented by the selected backend, including:
 
-The SDK follows the same runtime policy as the CLI and MCP surfaces.
+- `playbooks` / `blocks`
+- `rubrics`
+- `traces`
+- `evals`
+- `savings`
+- `memory`
+- `lessons`
 
-- Context retrieval, rescue, verification, memory, and MCP-backed helper flows
-  follow the same `LEMONCROW_DEV_MODE=1` gating rules as the runtime.
-- Trace recording and remote-service access remain available outside developer mode.
+Availability can differ between local, remote, and protocol-backed clients. A namespace existing on the facade does not imply every commercial/private capability is present in an OSS-only install.
 
-## MCP-Aligned Operations
+## Low-level protocol client
 
-When using `LemonCrowClient.mcp()`, the client mirrors the current MCP tool
-surface documented in [mcp.md](mcp.md), including `context`, `route`, `rescue`,
-`record`, `verify`, `memory`, `read`, `edit`, `search`, and `compact`.
+`LemonCrowClient.mcp()` is for integration authors and tests. The model-facing core tool allowlist is documented in [Protocol / MCP reference](mcp.md) and currently centers on:
 
-Use the CLI for operational workflows such as `lc report`, `lc
-benchmark ...`, `lc service ...`, `lc worker ...`, and `lc domain ...`.
+- `bash`
+- `code_search`
+- `edit`
+- `read`
+- `web_fetch`
+
+Do not hard-code a broader historical tool list into a new integration. Tool visibility is deny-by-default and product/trust profiles can narrow it further.
+
+## CLI equivalents
+
+Operational workflows remain CLI-first. Current examples include:
+
+```bash
+lc rt benchmark --help
+lc rt service --help
+lc rt worker --help
+lc status
+```
+
+For coding-agent setup, use the [installation guide](../setup/installation.md) rather than embedding the SDK directly.

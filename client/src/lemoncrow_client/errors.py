@@ -60,9 +60,10 @@ class ErrorCode(StrEnum):
     BLOB_DIGEST_MISMATCH = "blob_digest_mismatch"
     MANIFEST_INCOMPLETE = "manifest_incomplete"
     #: A path argument that cannot name content inside the open view -- host
-    #: absolute, ``~``-rooted, drive-qualified, or climbing out with ``..``.
-    #: Distinct from ``blob_missing`` on purpose: no upload can satisfy it, so
-    #: the agent must fix the argument rather than sync and retry.
+    #: absolute, ``~``-rooted, drive-qualified, or climbing out with ``..``;
+    #: the client also raises it for a needed path that names nothing in the
+    #: workspace. Distinct from ``blob_missing`` on purpose: no upload can
+    #: satisfy it, so the agent must fix the argument rather than sync and retry.
     PATH_NOT_ADDRESSABLE = "path_not_addressable"
     TOOL_UNKNOWN = "tool_unknown"
     TOOL_NOT_SERVER_SIDE = "tool_not_server_side"
@@ -73,6 +74,7 @@ class ErrorCode(StrEnum):
     DEADLINE_EXCEEDED = "deadline_exceeded"
     CANCELLED = "cancelled"
     SHUTTING_DOWN = "shutting_down"
+    STORAGE_LIMIT = "storage_limit"
     INTERNAL = "internal"
 
     # -- client-originated --------------------------------------------- #
@@ -83,6 +85,9 @@ class ErrorCode(StrEnum):
     #: The session never opened, so there is no server-side surface to call.
     #: The client-side tools are unaffected and the message says so.
     SERVER_SESSION_UNAVAILABLE = "server_session_unavailable"
+    #: The session root is not a git repository, so it is never indexed.
+    #: Terminal for that directory: retrying or re-indexing cannot change it.
+    NOT_INDEXED = "not_indexed"
     #: A local tool needs a program that is not installed. The client never
     #: downloads one, so this is a terminal answer with the name in it.
     LOCAL_TOOL_UNAVAILABLE = "local_tool_unavailable"
@@ -98,6 +103,8 @@ class AgentAction(StrEnum):
 
     NONE = "none"
     UPGRADE_CLIENT = "upgrade_client"
+    #: The server is older than this client's protocol window or Review manifest.
+    UPGRADE_SERVER = "upgrade_server"
     REAUTHENTICATE = "reauthenticate"
     REQUEST_ACCESS = "request_access"
     REOPEN_SESSION = "reopen_session"
@@ -198,7 +205,7 @@ def error_block(error: ClientError) -> dict[str, Any]:
     return {
         "type": "text",
         "text": (
-            f"[lemoncrow:{error.server_code}] {error.message}\n"
+            f"[lc:{error.server_code}] {error.message}\n"
             f"retryable={str(error.retryable).lower()} action={error.action.value}\n"
             f"{json.dumps(error.to_wire(), sort_keys=True)}"
         ),

@@ -1,0 +1,7 @@
+.plans { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+.plan { display: grid; gap: 8px; padding: 22px; border: 1px solid #24282e; border-radius: 10px; background: #111419; color: #aeb3ba; }
+.plan strong { color: #f2f2f2; font-size: 16px; }
+.plan-price { color: #f7f7f7; font-size: 40px; letter-spacing: -.03em; }
+.plan-price small { color: #777e88; font-size: 14px; }
+.plan--featured { border-color: #f5d90a; background: #f5d90a; color: #1d1a05; }
+.plan--featured strong, .plan--featured .plan-price, .plan--featured .plan-price small { color: #111; }

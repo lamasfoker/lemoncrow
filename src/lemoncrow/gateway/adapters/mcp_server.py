@@ -16,7 +16,6 @@ import sys
 import tempfile
 import threading
 import time
-from collections import OrderedDict, deque
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
@@ -66,6 +65,8 @@ from lemoncrow.core.capabilities.workflow_runtime_state import (
     write_workflow_runtime_state as _write_workflow_runtime_state,
 )
 from lemoncrow.core.environment import (
+    REVIEW_AUTONOMOUS_MCP_TOOLS,
+    REVIEW_MCP_TOOLS,
     mcp_tool_visible_to_llm,
 )
 from lemoncrow.gateway.adapters.mcp import ledger as _ledger
@@ -332,6 +333,9 @@ from lemoncrow.gateway.adapters.mcp.tools_review import (
     tool_review_feedback_addressed as tool_review_feedback_addressed,
 )
 from lemoncrow.gateway.adapters.mcp.tools_review import (
+    tool_review_guidance as tool_review_guidance,
+)
+from lemoncrow.gateway.adapters.mcp.tools_review import (
     tool_review_rationale as tool_review_rationale,
 )
 from lemoncrow.gateway.adapters.mcp.tools_search import (
@@ -398,6 +402,7 @@ from lemoncrow.gateway.tools.accounting import (
 from lemoncrow.gateway.tools.broker import invoke_tool_broker
 from lemoncrow.gateway.tools.call_runtime import (
     ToolCallRuntimeHooks,
+    commit_run_trace,
     configure_default_tool_runtime,
     execute_default_tool_payload,
     finalize_tool_payload,
@@ -615,6 +620,7 @@ from lemoncrow.gateway.tools.rendering import (
 from lemoncrow.gateway.tools.rendering import (
     render_tool_result_text as _canonical_render_tool_result_text,
 )
+from lemoncrow.gateway.tools.results import clean_tool_result as _clean_tool_result  # noqa: F401  (compat re-export)
 from lemoncrow.gateway.tools.routing import (
     TASK_TEXT_KEYS as _TASK_TEXT_KEYS,  # noqa: F401  (compat re-export)
 )
@@ -818,6 +824,11 @@ def _tool_visible_to_llm(tool_name: str, spec: dict[str, Any]) -> bool:
     # Keep this wrapper local for backwards-compatible monkey-patching of
     # ``mcp_server.mcp_tool_visible_to_llm`` in embedded/test callers.
     del spec
+    profile = os.environ.get("LEMONCROW_MCP_TOOL_PROFILE", "").strip().lower()
+    if profile == "review":
+        return tool_name in REVIEW_MCP_TOOLS
+    if profile == "review_autonomous":
+        return tool_name in REVIEW_AUTONOMOUS_MCP_TOOLS
     return mcp_tool_visible_to_llm(tool_name)
 
 
@@ -944,12 +955,9 @@ def _advance_monitors(session_id: str, task: str, original_task: str) -> tuple[f
 _CONTEXT_STATE_CACHE: dict[str, tuple[tuple[tuple[str, int, int], ...], tuple[int, str]]] = {}
 _STDOUT_LOCK = threading.Lock()
 # _STATE_LOCK moved to mcp.smart_state (imported/re-exported).
-# Per-file edit locks: concurrent edit calls (the MCP dispatcher runs a thread
-# pool) that touch the same file must not interleave snapshot/apply/write, or one
-# write clobbers the other (lost update). _EDIT_PATH_LOCKS maps a resolved file
-# path to its Lock; _EDIT_PATH_LOCKS_GUARD serializes registry mutation only.
-_EDIT_PATH_LOCKS: dict[str, threading.Lock] = {}
-_EDIT_PATH_LOCKS_GUARD = threading.Lock()
+# Per-file edit locks are shared with Verified Local Work promotion so a
+# background/local candidate cannot race an ordinary lc edit between hash check
+# and write. The registry itself lives in core.capabilities.workspace_locks.
 # Per-session-id cache for the savings sidecar path; set on first write so the
 # path stays stable if the process runs past midnight (date partition fixed at
 # session-start time, not re-derived on every call).
@@ -1006,11 +1014,10 @@ def _apply_search_verdict(
 
 
 def _edit_path_locks(resolved_paths: list[Path]) -> list[threading.Lock]:
-    """Return locks for *resolved_paths*, ordered deterministically to avoid
-    deadlock when an edit batch touches several files at once."""
-    keys = sorted({str(p) for p in resolved_paths})
-    with _EDIT_PATH_LOCKS_GUARD:
-        return [_EDIT_PATH_LOCKS.setdefault(key, threading.Lock()) for key in keys]
+    """Return the shared workspace locks used by edit and verified promotion."""
+    from lemoncrow.core.capabilities.workspace_locks import workspace_path_locks
+
+    return workspace_path_locks(resolved_paths)
 
 
 _MAX_MCP_MAX_WORKERS = 64
@@ -1057,7 +1064,7 @@ def _emit_mcp_session_start() -> None:
     from importlib.metadata import PackageNotFoundError, version
 
     from lemoncrow.core.foundation.identity import get_anon_id, platform_payload
-    from lemoncrow.core.service.telemetry import emit_product
+    from lemoncrow.core.service.telemetry import emit_product, set_process_telemetry_session
 
     try:
         service_version = version("lemoncrow")
@@ -1065,6 +1072,8 @@ def _emit_mcp_session_start() -> None:
         service_version = SERVER_VERSION
     # OTel is initialized lazily on first emit_product_log call.
     _product_session_started_at = time.perf_counter()
+    # code_* events from the engine carry no session of their own.
+    set_process_telemetry_session(_get_product_session_id())
     emit_product(
         "session_start",
         agent_host=_detect_agent(),
@@ -1124,13 +1133,21 @@ def _emit_playbook_retrieved(scored: list[Any], domain: str | None) -> None:
 
 
 def _make_outcome_writer(led: RunLedger) -> Any:
-    """Return a FileStateWriter for outcomes alongside the run file, or None."""
+    """Return a FileStateWriter for outcomes alongside the run file, or None.
+
+    Closed route windows are also persisted to the telemetry store so the
+    learned router has cross-session outcome rows.
+    """
     with contextlib.suppress(Exception):
+        from lemoncrow.pro.capabilities.model_routing.success_predictor import telemetry_route_sink
         from lemoncrow.pro.runtime.outcome_capture import FileStateWriter
 
         root = led._root
         if root is not None:
-            return FileStateWriter(outcomes_path(root, led.agent or "claude", led.session_id))
+            return FileStateWriter(
+                outcomes_path(root, led.agent or "claude", led.session_id),
+                route_sink=telemetry_route_sink(root),
+            )
     return None
 
 
@@ -1209,7 +1226,7 @@ def _check_auto_update() -> None:
     if os.environ.get("LEMONCROW_AUTO_UPDATE", "").strip().lower() not in ("1", "true", "yes", "on"):
         return
 
-    # Dev/source installs (`make dev` writes <root>/.dev_mode) must never
+    # Dev/source installs (marked by <root>/.dev_mode) must never
     # auto-update: a git fetch/merge on the live checkout would fight an
     # in-progress refactor and can clobber uncommitted work. Production installs
     # have no marker. Read the marker fresh (not the cached _is_dev_mode()) so
@@ -1382,6 +1399,12 @@ def _run_worker_tick_safe(root: Path) -> None:
         maybe_flush_public_rollup(root)
     except Exception:
         logger.warning("Suppressed exception flushing public rollup", exc_info=True)
+    try:
+        from lemoncrow.core.service.telemetry.event_rollup import maybe_flush_event_rollup
+
+        maybe_flush_event_rollup(root)
+    except Exception:
+        logger.warning("Suppressed exception flushing event rollup", exc_info=True)
 
     # Remaining periodic duties the same retired daemon owned: session
     # import, recall indexing, workspace pruning, block consolidation,
@@ -1402,9 +1425,9 @@ def _run_worker_tick_safe(root: Path) -> None:
     # code too -- it's a cheap local glob + liveness check (see
     # prune_stale_mcp_sessions's docstring), not a subprocess or network call,
     # so there is no cost to re-checking it as often as the tick runs. An
-    # agent host that leaks its `lc mcp` child otherwise leaves a zombie
+    # agent host that leaks its `lc runtime mcp` child otherwise leaves a zombie
     # registration file behind for as long as that host process runs; before
-    # this it was only reaped as a side effect of a human running `lc mcp
+    # this it was only reaped as a side effect of a human running `lc runtime mcp
     # list`. (The old tick's OTHER unconditional duty, refreshing
     # hosts/status.json for a Docker-hosted status page, is not restored: the
     # /hosts endpoint that page depended on was retired in the same commit
@@ -2439,9 +2462,9 @@ def _register_mcp_session() -> None:
             if not _is_recognized_workspace(cwd):
                 _log.warning(
                     "Refusing to register MCP session workspace %s: not a git "
-                    "repository and not registered via `lc init` -- would "
+                    "repository and not registered via `lc rt init` -- would "
                     "make the code-warm daemon index an arbitrary directory "
-                    "forever. Run `lc init` here, or launch from inside a "
+                    "forever. Run `lc rt init` here, or launch from inside a "
                     "git repository.",
                     cwd,
                 )
@@ -2780,7 +2803,7 @@ def _append_savings(tool_name: str, tokens_saved: int, calls_saved: int, rid: st
     ``tokens``/``calls`` plus the pre-priced ``cost_saved_usd`` /
     ``calls_usd`` so analytics readers need not re-price.
     """
-    # A latency-profile run (`lc perf`) drives `_handle` with synthetic
+    # A latency-profile run (`lc dev perf`) drives `_handle` with synthetic
     # probe calls; those aren't work the agent avoided, so don't credit them.
     if os.environ.get("LEMONCROW_TOOL_PROFILE_PATH"):
         return
@@ -2984,7 +3007,7 @@ _dev_mode_cache: bool | None = None
 def _mcp_debug_enabled() -> bool:
     if os.environ.get("LEMONCROW_MCP_DEBUG", "0") not in ("0", "", "false", "no"):
         return True
-    # Auto-enable in dev installations (marker written by make dev / scripts/local.sh).
+    # Auto-enable in dev installations (``.dev_mode`` marker in the LemonCrow root).
     # The marker is constant per process, so cache the stat instead of issuing
     # a syscall on every tool call.
     global _dev_mode_cache
@@ -3348,13 +3371,16 @@ configure_review_handler_hooks(_review_handler_hooks)
 # Per-call accounting/render/raw-result/image state lives in
 # ``lemoncrow.gateway.tools.state`` and is re-exported above for compatibility.
 def _bootstrap_context_status(root: Path) -> dict[str, Any]:
+    from lemoncrow.core.capabilities.code_context_contract import workspace_repo_id
+    from lemoncrow.core.capabilities.code_intelligence_provider import (
+        private_code_intelligence_available,
+    )
     from lemoncrow.core.service.bootstrap_context import bootstrap_status, missing_bootstrap_labels
     from lemoncrow.core.service.jobs import JOB_BOOTSTRAP_CONTEXT
     from lemoncrow.infra.storage.factory import create_store
-    from lemoncrow.pro.capabilities.code_context import CodeContextEngine
 
     repo_root = _workspace_root().resolve()
-    repo_id = CodeContextEngine(repo_root).repo_id
+    repo_id = workspace_repo_id(repo_root)
     memory_store = _memory_store()
     state = bootstrap_status(memory_store, repo_id)
     store = create_store(root)
@@ -3369,7 +3395,9 @@ def _bootstrap_context_status(root: Path) -> dict[str, Any]:
     # Failed/dead jobs should not permanently prevent retrying bootstrap.
     active_job = next((job for job in jobs if job["status"] in {"pending", "running"}), None)
     job_id: str | None = None
-    if state != "warm" and active_job is None:
+    # The bootstrap plan is built by the private engine; without it the job
+    # could only fail, so OSS reports the stored state and queues nothing.
+    if state != "warm" and active_job is None and private_code_intelligence_available():
         job_id = store.jobs.enqueue_job(
             JOB_BOOTSTRAP_CONTEXT,
             {"repo_root": str(repo_root), "repo_id": repo_id},
@@ -3782,82 +3810,6 @@ def _read_summary_response(resolved: Path) -> dict[str, Any]:
 # from "did this file change at all" into "did the lines this edit names
 # change": drift somewhere else in the file no longer rejects the edit, and a
 # pure line SHIFT is repaired by locating the served block at its new offset.
-# Per-session recent code_search queries, same session-bucketing rationale as
-# _RANGE_READ_SIGS above (HTTP: per client session; stdio: one process-wide
-# "_global" bucket per host window). Feeds _check_repeat_query's near-
-# duplicate nudge -- measured 11 near-duplicate code_search calls in a single
-# debt-benchmark rep (2026-07-25): "fail-on-stale stale-days debt_cmd",
-# "stale_days fail_on_stale debt stale age git blame", "_line_age_days git
-# blame annotate stale", ... -- each re-phrasing re-sent on every later turn's
-# resent history, compounding for the rest of the run.
-# Timestamped (not just a bare deque): the stdio "_global" bucket is process-
-# wide, so it spans EVERY conversation a long-lived daemon happens to serve
-# (a daemon can outlive many separate Cursor/Claude chats -- confirmed this
-# session). Without a time bound, a brand-new, unrelated conversation whose
-# first query happens to share words with the LAST daemon-wide query (from a
-# previous, unrelated chat, possibly hours earlier) would be wrongly blanked.
-# Bounding to _RECENT_QUERY_WINDOW_SECONDS keeps the check scoped to "this
-# same burst of searching", not "this process's entire lifetime".
-_RECENT_CODE_SEARCH_QUERIES: OrderedDict[str, deque[tuple[float, str, frozenset[str]]]] = OrderedDict()
-_recent_code_search_queries_lock = threading.Lock()
-_MAX_RECENT_QUERY_SESSIONS = _MAX_HTTP_SESSION_LEDGERS
-_RECENT_QUERY_HISTORY = 3
-_REPEAT_QUERY_SIMILARITY_FLOOR = 0.35
-_RECENT_QUERY_WINDOW_SECONDS = 180.0
-_QUERY_WORD_RE = re.compile(r"[a-z0-9]+")
-
-
-def _query_words(query: str) -> frozenset[str]:
-    """Lowercased alnum tokens of length >=3, for cheap query-similarity."""
-    return frozenset(w for w in _QUERY_WORD_RE.findall(query.lower()) if len(w) >= 3)
-
-
-def _recent_code_search_queries() -> deque[tuple[float, str, frozenset[str]]]:
-    """The current session's recent-query bucket (see _RECENT_CODE_SEARCH_QUERIES)."""
-    led = getattr(_request_ledger, "value", None)
-    sid = led.session_id if isinstance(led, RunLedger) and led.session_id else "_global"
-    with _recent_code_search_queries_lock:
-        bucket = _RECENT_CODE_SEARCH_QUERIES.get(sid)
-        if bucket is None:
-            if len(_RECENT_CODE_SEARCH_QUERIES) >= _MAX_RECENT_QUERY_SESSIONS:
-                _RECENT_CODE_SEARCH_QUERIES.popitem(last=False)
-            bucket = deque(maxlen=_RECENT_QUERY_HISTORY)
-            _RECENT_CODE_SEARCH_QUERIES[sid] = bucket
-        else:
-            _RECENT_CODE_SEARCH_QUERIES.move_to_end(sid)
-        return bucket
-
-
-def _check_repeat_query(query: str) -> bool:
-    """True when *query* overlaps heavily (Jaccard >= floor) with a query this
-    session ran within the last _RECENT_QUERY_WINDOW_SECONDS -- re-phrasing the
-    same investigation rarely surfaces anything new. A hard signal, not a
-    hint: an explanatory sentence here just adds tokens to a response the
-    caller has already shown it skims past and searches again anyway (measured
-    across debt-benchmark reps). The caller returns blank results instead --
-    always records *query* into the bucket either way. Time-bounded (not just
-    the last _RECENT_QUERY_HISTORY calls) so a brand-new, unrelated
-    conversation on the same long-lived daemon never gets blanked because of a
-    coincidental word overlap with a stale query from a previous chat.
-    """
-    words = _query_words(query)
-    bucket = _recent_code_search_queries()
-    now = time.monotonic()
-    is_repeat = False
-    if words:
-        for ts, _prior_text, prior_words in bucket:
-            if now - ts > _RECENT_QUERY_WINDOW_SECONDS:
-                continue
-            union = words | prior_words
-            if not union:
-                continue
-            if len(words & prior_words) / len(union) >= _REPEAT_QUERY_SIMILARITY_FLOOR:
-                is_repeat = True
-                break
-    bucket.append((now, query, words))
-    return is_repeat
-
-
 def _smart_read_single(
     path: str,
     range: str | None = None,
@@ -4022,7 +3974,7 @@ def _smart_read_single(
             "mode": "directory",
             "path": str(target),
             "entries": [(e + "/" if (target / e).is_dir() else e) for e in entries],
-            "message": "Directory, not a file. Use `search` (by name) or `grep` (file_glob_patterns) to find files.",
+            "message": "Directory, not a file. Use `code_search` with this directory in `paths` to find files.",
         }
 
     # Source-side guard: an exact full read (expand) of a very large file would
@@ -5378,8 +5330,7 @@ def _maybe_attach_code_rendered(op: str, payload: dict[str, Any], *, render_comp
         engine = getattr(_code_engine_for_current_call, "value", None)
         if engine is not None and not Path(engine.db_path).exists():
             result["bootstrap_note"] = (
-                "Repository not yet indexed — results may be incomplete. "
-                "Run `lc code index` (or `lc project init`) to bootstrap the index."
+                "Repository not yet indexed — results may be incomplete. Run `lc runtime index` to bootstrap the index."
             )
 
     return result
@@ -5639,8 +5590,10 @@ def _synthesize_edges_for_paths(paths: list[str]) -> list[dict[str, Any]]:
     Returns a flat list of heuristic edge dicts (provenance="heuristic"). Never
     touches the static call graph -- this is a separate, opt-in addendum.
     """
+    from lemoncrow.core.capabilities.code_intelligence_provider import (
+        advanced_code_intelligence_helper,
+    )
     from lemoncrow.infra.code_intel.languages import language_for_path
-    from lemoncrow.pro.capabilities.code_context.edge_synthesis import synthesize_edges
 
     out: list[dict[str, Any]] = []
     for raw in paths:
@@ -5650,7 +5603,7 @@ def _synthesize_edges_for_paths(paths: list[str]) -> list[dict[str, Any]]:
         lang = language_for_path(candidate)
         language = lang.name if lang is not None else ""
         source = candidate.read_text(encoding="utf-8", errors="replace")
-        for edge in synthesize_edges(source, language=language):
+        for edge in advanced_code_intelligence_helper("synthesize_edges", source, language=language):
             out.append({"file": str(candidate), **edge.to_dict()})
     return out
 
@@ -6399,7 +6352,7 @@ _CODE_SEARCH_ENGINE_MAX_FILES = 8
 # was part of a measured -0.10 overall retrieval MRR regression (2026-07-06):
 # the tail is where non-top-1 golds live, so it earns its chars in the general
 # (ambiguous / multi-candidate) case. Do not flat-trim this constant without
-# re-running `lc eval retrieval`. The symbol map (_LEAN_MAX_CANDIDATES) stays
+# re-running `lc dev eval retrieval`. The symbol map (_LEAN_MAX_CANDIDATES) stays
 # tight because each entry carries structure.
 # 24 -> 16 -> 8 (2026-07-25): re-testing the flat-trim ceiling now that the
 # dominant-case cap, doc-diversity demotion, and inline gating all exist --
@@ -6407,7 +6360,7 @@ _CODE_SEARCH_ENGINE_MAX_FILES = 8
 # INSIDE that historical regression's range (10 then 6 both regressed -0.10
 # MRR combined) -- 16->8 is the real test of whether the old cause still
 # applies under the current architecture; 24->16 alone measured -0.0008 MRR
-# (noise-floor, hit@1 unchanged). Gated by the same `lc eval retrieval`
+# (noise-floor, hit@1 unchanged). Gated by the same `lc dev eval retrieval`
 # re-run rule; revert to 16 (or 24) if THIS step regresses for real.
 _LEAN_MAX_CANDIDATE_FILES = 8
 # Dynamic exception, not a flat trim: only when `_lean_code_search_view`'s
@@ -6423,7 +6376,7 @@ _LEAN_MAX_CANDIDATE_FILES = 8
 # 8 -> 5 (2026-07-25): the dominant case is already the confident
 # single-winner path (files already collapse to n_src=1) -- narrower blast
 # radius than the general cap, so trimmed further first. Gated by the same
-# `lc eval retrieval` re-run rule; revert to 8 if MRR regresses.
+# `lc dev eval retrieval` re-run rule; revert to 8 if MRR regresses.
 _LEAN_CANDIDATE_FILES_DOMINANT = 5
 _LEAN_DOMINANT_RATIO = 4.0
 # Tried a dynamic quality gate here (drop candidate_files entries with
@@ -6886,7 +6839,9 @@ def _observe_code_search_evidence(
             else:
                 candidate = None
             elapsed_ms = round((time.monotonic() - started) * 1000)
-            if isinstance(candidate, dict):
+            # Same rule as the native server path: an over-budget round is
+            # discarded so the experiment cannot buy recall with latency.
+            if isinstance(candidate, dict) and elapsed_ms <= proposal.latency_budget_ms:
                 result = candidate
                 actual_action = proposal.action
                 rounds = 1
@@ -6914,7 +6869,6 @@ def _search_handler_hooks() -> SearchHandlerHooks:
         grep_badge_provider=_grep_badge_provider,
         apply_search_verdict=_apply_search_verdict,
         count_grep_hits=count_grep_hits,
-        check_repeat_query=_check_repeat_query,
         workspace_code_router=_workspace_code_router,
         resolve_query_as_existing_file=_resolve_query_as_existing_file,
         lean_code_search_view=_lean_code_search_view,
@@ -7414,6 +7368,22 @@ def _tool_call_runtime_hooks() -> ToolCallRuntimeHooks:
 configure_default_tool_runtime(_tool_call_runtime_hooks)
 
 
+def _finalize_traced(run: Any, finalize: Callable[[], dict[str, Any]], error: Exception | None) -> dict[str, Any]:
+    """Apply MCP framing inside the call's trace, then commit the trace once."""
+    scope = run.trace.active() if run.trace is not None else contextlib.nullcontext()
+    try:
+        with scope:
+            response = finalize()
+    except BaseException as exc:
+        commit_run_trace(run, None, error=exc)
+        raise
+    result = response.get("result") if isinstance(response, dict) else None
+    if isinstance(response, dict) and "error" in response and error is None:
+        error = RuntimeError("protocol_error")
+    commit_run_trace(run, result if isinstance(result, dict) else None, error=error)
+    return response
+
+
 def _run_tool_call(rid: Any, params: Any, *, payload_only: bool) -> dict[str, Any] | _Deferred:
     try:
         run = _canonical_run_tool_call(rid, params, hooks=_tool_call_runtime_hooks())
@@ -7426,16 +7396,17 @@ def _run_tool_call(rid: Any, params: Any, *, payload_only: bool) -> dict[str, An
     if payload_only:
         return finalize_tool_payload(run)
     if run.error is not None:
-        return _finalize_mcp_error(lifecycle, run.error)
+        error = run.error
+        return _finalize_traced(run, lambda: _finalize_mcp_error(lifecycle, error), error)
     if run.deferred:
         result = run.result
         assert isinstance(result, _DeferredResult)
         return _Deferred(
             src=result,
-            finalize=lambda value: _finalize_mcp_response(lifecycle, value),
-            finalize_error=lambda exc: _finalize_mcp_error(lifecycle, exc),
+            finalize=lambda value: _finalize_traced(run, lambda: _finalize_mcp_response(lifecycle, value), None),
+            finalize_error=lambda exc: _finalize_traced(run, lambda: _finalize_mcp_error(lifecycle, exc), exc),
         )
-    return _finalize_mcp_response(lifecycle, run.result)
+    return _finalize_traced(run, lambda: _finalize_mcp_response(lifecycle, run.result), None)
 
 
 def _handle_tool_payload(rid: Any, params: Any) -> dict[str, Any]:
@@ -7870,7 +7841,7 @@ def _auto_init_workspace() -> None:
             # workspace env var and no git repo was detected -- never
             # auto-create `.lemoncrow/` (with seeded lessons/rubrics) at an
             # arbitrary directory like $HOME or a multi-repo container. Only
-            # a git repo or an already `lc init`-registered dir qualifies.
+            # a git repo or an already `lc rt init`-registered dir qualifies.
             _log.debug("skipping workspace auto-init: %s is not a recognized workspace", ws_root)
             return
 
@@ -7926,7 +7897,7 @@ def _warm_stdio_code_index() -> None:
 
     No-ops when ``_workspace_root()`` isn't a git repo or an ``lc
     init``-registered directory: ``warm_stdio_workspace`` has no such check
-    of its own and will fire an ``lc code index`` subprocess against
+    of its own and will fire an ``lc runtime index`` subprocess against
     *any* directory (e.g. cwd falling all the way through to an unrelated
     multi-repo container or ``$HOME``), which never finishes and burns a CPU
     core indefinitely.
@@ -7937,17 +7908,24 @@ def _warm_stdio_code_index() -> None:
     if not is_recognized_workspace(ws_root):
         _log.debug("skipping stdio code-index warm: %s is not a recognized workspace", ws_root)
         return
-    try:
-        from lemoncrow.core.service.code_warm import warm_stdio_workspace
+    if os.environ.get("LEMONCROW_CODE_PREPARED", "").strip() != "1":
+        try:
+            from lemoncrow.core.service.code_warm import warm_stdio_workspace
 
-        warm_stdio_workspace(ws_root)
-    except Exception:
-        logging.exception("Recovered from broad exception handler")
+            warm_stdio_workspace(ws_root)
+        except Exception:
+            logging.exception("Recovered from broad exception handler")
+    else:
+        _log.debug("stdio code index already prepared by explicit trial launcher")
     # Warm the query path of the cached serving engine (page cache, centrality,
     # ANN matrix) so the first tool call never pays a cold-DB spike. Runs on
     # this daemon thread; fail-open.
     try:
         engine = _code_context_engine(str(ws_root))
+        # Starts file-watch/poll autosync and ANN warming when the durable index
+        # is ready. Explicit `lc with` preparation guarantees it is; the normal
+        # persistent-host path remains fail-open/background as before.
+        engine._ensure_indexed()
         _log.info("code query path warmed: %s", engine.warm_query_path())
     except Exception:
         _log.debug("query-path warm failed", exc_info=True)
@@ -8067,7 +8045,7 @@ def main() -> None:
 
     argv = sys.argv[1:]
     if "--version" in argv or "-V" in argv:
-        sys.stdout.write(f"lc mcp {SERVER_VERSION}\n")
+        sys.stdout.write(f"lc runtime mcp {SERVER_VERSION}\n")
         return
     if "--root" in argv:
         i = argv.index("--root")

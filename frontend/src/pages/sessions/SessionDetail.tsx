@@ -1,12 +1,15 @@
+import { Button as UiButton } from "../../components/ui/button";
 import { useEffect, useState, useMemo } from "react";
 import { ExternalLink, ChevronRight, X } from "lucide-react";
 import {
   api,
+  apiUrl,
   type Trace,
   type SessionReport,
   type RunInspectorData,
 } from "../../api";
 import { cx } from "../../components/WorkbenchUI";
+import { useRuntimeCapabilities } from "../../lib/RuntimeCapabilities";
 import {
   fmtUsd,
   fmtTok,
@@ -35,25 +38,25 @@ function HeaderStat({
 }: {
   label: string;
   value: string;
-  tone?: "amber" | "emerald" | "violet";
+  tone?: "warning" | "success" | "neutral";
   title?: string;
 }) {
   return (
     <div
-      className="flex min-w-0 items-center justify-between gap-3 border border-neutral-800/40 bg-black/15 px-2.5 py-1.5 transition-colors hover:bg-neutral-800/20 group"
+      className="group flex min-w-0 items-center justify-between gap-3 rounded-md border border-border/70 bg-background/60 px-2.5 py-1.5 transition-colors hover:bg-muted/50"
       title={title}
     >
-      <div className="truncate text-[10px] text-neutral-400 uppercase font-black tracking-[0.18em] group-hover:text-neutral-400 transition-colors">
+      <div className="truncate text-caption text-neutral-400 uppercase font-black tracking-[0.18em] group-hover:text-neutral-400 transition-colors">
         {label}
       </div>
       <div
         className={cx(
-          "truncate text-[10px] font-bold font-mono leading-none",
-          tone === "amber"
+          "truncate text-caption font-bold font-mono leading-none",
+          tone === "warning"
             ? "text-amber-300"
-            : tone === "emerald"
+            : tone === "success"
               ? "text-emerald-300"
-              : tone === "violet"
+              : tone === "neutral"
                 ? "text-violet-300"
                 : "text-neutral-400"
         )}
@@ -79,10 +82,10 @@ function SidebarMetric({
 }) {
   return (
     <div className="flex items-center justify-between gap-4">
-      <span className="text-[10px] text-neutral-400 font-mono uppercase font-bold">
+      <span className="text-caption text-neutral-400 font-mono uppercase font-bold">
         {label}
       </span>
-      <span className={cx("text-[10px] font-mono font-black", color)}>
+      <span className={cx("text-caption font-mono font-black", color)}>
         {value}
       </span>
     </div>
@@ -99,6 +102,8 @@ function SidebarList({
   color?: string;
 }) {
   const [copiedPath, setCopiedPath] = useState<string | null>(null);
+  // Raw files and artifacts live on the developer machine; a hosted server has no route for them.
+  const localFiles = useRuntimeCapabilities().localMachine;
 
   const copyToClipboard = async (text: string) => {
     try {
@@ -127,19 +132,21 @@ function SidebarList({
 
   return (
     <section className="space-y-3">
-      <h3 className="text-[10px] font-black uppercase tracking-widest text-neutral-400">
+      <h3 className="text-caption font-black uppercase tracking-widest text-neutral-400">
         {title}
       </h3>
-      <div className="space-y-1.5 font-mono text-[10px]">
+      <div className="space-y-1.5 font-mono text-caption">
         {items.map((item) => {
           const p = typeof item === "string" ? item : item.path;
           const artId = typeof item === "string" ? null : item.artifact_id;
           const isPath = p.startsWith("/");
-          const canOpenRaw = Boolean(artId || isPath);
-          const rawUrl = artId
-            ? `/api/raw-artifacts/${artId}/content`
-            : `/api/v1/files/content?path=${encodeURIComponent(p)}`;
-          const projectionUrl = isPath
+          const canOpenRaw = localFiles && Boolean(artId || isPath);
+          const rawUrl = !localFiles
+            ? undefined
+            : artId
+              ? apiUrl(`/raw-artifacts/${artId}/content`)
+              : apiUrl(`/v1/files/content?path=${encodeURIComponent(p)}`);
+          const projectionUrl = localFiles && isPath
             ? api.fileProjectionInspectUrl(p, { view: "compact" })
             : null;
           // Absolute filesystem path → let Chrome try to open it directly.
@@ -152,7 +159,7 @@ function SidebarList({
             <div
               key={p}
               className={cx(
-                "group/item flex items-center justify-between border-l border-neutral-800/60 pl-2 transition-colors",
+                "group/item flex items-center justify-between border-l border-border/60 pl-2 transition-colors",
                 color
               )}
             >
@@ -175,11 +182,11 @@ function SidebarList({
                 </span>
               )}
               <div className="flex items-center gap-2 ml-2 opacity-0 group-hover/item:opacity-100 transition-opacity flex-shrink-0 bg-surface px-1">
-                <button
+                <UiButton unstyled
                   type="button"
                   onClick={() => copyToClipboard(p)}
                   className={cx(
-                    "text-[10px] uppercase font-black flex items-center gap-1",
+                    "text-caption uppercase font-black flex items-center gap-1",
                     justCopied
                       ? "text-emerald-300"
                       : "text-neutral-400 hover:text-sky-300"
@@ -187,13 +194,13 @@ function SidebarList({
                   title={`Copy path: ${p}`}
                 >
                   {justCopied ? "Copied" : "Copy"}
-                </button>
+                </UiButton>
                 {projectionUrl && (
                   <a
                     href={projectionUrl}
                     target="_blank"
                     rel="noreferrer"
-                    className="text-[10px] text-neutral-400 hover:text-cyan-300 uppercase font-black"
+                    className="text-caption text-neutral-400 hover:text-cyan-300 uppercase font-black"
                     title="Inspect compact projection metadata"
                   >
                     Projection
@@ -204,7 +211,7 @@ function SidebarList({
                     href={rawUrl}
                     target="_blank"
                     rel="noreferrer"
-                    className="text-[10px] text-neutral-400 hover:text-emerald-300 uppercase font-black flex items-center gap-1"
+                    className="text-caption text-neutral-400 hover:text-emerald-300 uppercase font-black flex items-center gap-1"
                     title="View raw content"
                   >
                     Raw <ExternalLink size={10} />
@@ -232,23 +239,23 @@ function MetaPill({
 }: {
   label: string;
   value: string;
-  tone?: "neutral" | "violet" | "amber";
+  tone?: "neutral" | "neutral" | "warning";
   /** When set, the pill truncates `value` and copies this on click. */
   copyValue?: string;
 }) {
   const [copied, setCopied] = useState(false);
   const toneClass =
-    tone === "violet"
-      ? "border-violet-900/30 bg-violet-950/25 text-violet-200"
-      : tone === "amber"
-        ? "border-amber-900/30 bg-amber-950/25 text-amber-200"
-        : "border-neutral-800 bg-black/20 text-neutral-400";
+    tone === "neutral"
+      ? "border-violet-900/40 bg-background/60 text-violet-300"
+      : tone === "warning"
+        ? "border-amber-900/40 bg-background/60 text-amber-300"
+        : "border-border bg-background/60 text-neutral-400";
 
   if (copyValue === undefined) {
     return (
       <span
         className={cx(
-          "inline-flex items-center gap-1 rounded-sm border px-2.5 py-1 text-[10px] font-mono uppercase tracking-[0.2em]",
+          "inline-flex items-center gap-1 rounded-md border px-2.5 py-1 text-caption font-mono uppercase tracking-[0.2em]",
           toneClass
         )}
       >
@@ -271,12 +278,12 @@ function MetaPill({
   };
 
   return (
-    <button
+    <UiButton unstyled
       type="button"
       onClick={handleCopy}
       title={`Copy: ${copyValue}`}
       className={cx(
-        "inline-flex items-center gap-1 rounded-sm border px-2.5 py-1 text-[10px] font-mono uppercase tracking-[0.2em] transition hover:border-neutral-600",
+        "inline-flex items-center gap-1 rounded-md border px-2.5 py-1 text-caption font-mono uppercase tracking-[0.2em] transition hover:bg-muted/50",
         toneClass
       )}
     >
@@ -284,8 +291,38 @@ function MetaPill({
       <span className="normal-case tracking-normal text-current">
         {copied ? "Copied" : truncateMiddle(value)}
       </span>
-    </button>
+    </UiButton>
   );
+}
+
+function usageSourceLabel(source?: string): string {
+  switch (source) {
+    case "claude_mod":
+      return "Claude Code measured";
+    case "host_transcript":
+      return "Host transcript measured";
+    case "lemoncrow_gateway":
+      return "LemonCrow gateway measured";
+    case "unavailable":
+      return "Unavailable from host";
+    default:
+      return source ? source.replaceAll("_", " ") : "Recorded session";
+  }
+}
+
+function costSourceLabel(source?: string): string {
+  switch (source) {
+    case "claude_mod":
+    case "host_reported":
+      return "Host measured";
+    case "priced":
+    case "claude_mod_tokens_priced":
+      return "Priced from measured usage";
+    case "unavailable":
+      return "Unavailable from host";
+    default:
+      return source ? source.replaceAll("_", " ") : "Recorded session";
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -293,6 +330,7 @@ function MetaPill({
 // ---------------------------------------------------------------------------
 
 export function SessionExplorerDetail({ sessionId }: { sessionId: string }) {
+  const localFiles = useRuntimeCapabilities().localMachine;
   const [report, setReport] = useState<SessionReport | null>(null);
   const [trace, setTrace] = useState<Trace | null>(null);
   const [inspectorData, setInspectorData] = useState<RunInspectorData | null>(
@@ -305,6 +343,8 @@ export function SessionExplorerDetail({ sessionId }: { sessionId: string }) {
   const [rightPanelOpen, setRightPanelOpen] = useState(false);
 
   useEffect(() => {
+    // A late response for the previous run must not overwrite this one.
+    let cancelled = false;
     setLoading(true);
     setErr(null);
     setAllExpanded(false);
@@ -315,6 +355,12 @@ export function SessionExplorerDetail({ sessionId }: { sessionId: string }) {
       api.outcomesForSession(sessionId).catch(() => []),
     ])
       .then(([rep, tr, led, outcomeEntries]) => {
+        if (cancelled) return;
+        if (!rep && !tr && !led) {
+          setErr("This run is not available.");
+          setLoading(false);
+          return;
+        }
         setReport(rep);
         setTrace(tr);
         if (led) setInspectorData(parseInspectorData(sessionId, led));
@@ -322,9 +368,13 @@ export function SessionExplorerDetail({ sessionId }: { sessionId: string }) {
         setLoading(false);
       })
       .catch((e) => {
-        setErr(String(e));
+        if (cancelled) return;
+        setErr(e instanceof Error ? e.message : String(e));
         setLoading(false);
       });
+    return () => {
+      cancelled = true;
+    };
   }, [sessionId]);
 
   // Average outcome_window.outcome_score across all entries of one kind
@@ -463,7 +513,7 @@ export function SessionExplorerDetail({ sessionId }: { sessionId: string }) {
     return (
       <div className="flex flex-col items-center justify-center h-full space-y-4 bg-surface">
         <div className="w-10 h-10 border border-brand-500/20 border-t-brand-500 rounded-full animate-spin" />
-        <div className="text-[10px] text-neutral-400 uppercase tracking-[0.3em] font-mono animate-pulse">
+        <div className="text-caption text-neutral-400 uppercase tracking-[0.3em] font-mono animate-pulse">
           Reconstructing Ledger...
         </div>
       </div>
@@ -471,7 +521,7 @@ export function SessionExplorerDetail({ sessionId }: { sessionId: string }) {
 
   if (err)
     return (
-      <div className="h-full flex items-center justify-center bg-surface p-12 text-center">
+      <div className="h-full flex items-center justify-center bg-surface px-6 py-8 text-center">
         <div className="max-w-xs space-y-3">
           <div className="text-red-300 text-sm font-mono font-bold uppercase tracking-widest">
             Load Failure
@@ -486,11 +536,11 @@ export function SessionExplorerDetail({ sessionId }: { sessionId: string }) {
   return (
     <div className="flex flex-col h-full bg-surface relative animate-in fade-in duration-500">
       {/* Header */}
-      <header className="flex-shrink-0 px-8 py-4 border-b border-neutral-800/80 bg-surface-raised/95 backdrop-blur-md sticky top-0 z-20 shadow-2xl">
-        <div className="space-y-3">
-          <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
-            <div className="min-w-0 flex-1 space-y-2">
-              <h1 className="text-sm font-bold tracking-wide text-neutral-100 font-mono truncate uppercase">
+      <header className="sticky top-0 z-20 flex-shrink-0 border-b border-border/80 bg-background/95 px-4 py-2.5 backdrop-blur-md">
+        <div className="space-y-2">
+          <div className="flex flex-col gap-3 xl:flex-row xl:items-start xl:justify-between">
+            <div className="min-w-0 flex-1 space-y-1.5">
+              <h1 className="text-sm font-bold tracking-wide text-foreground truncate uppercase">
                 {trace && (
                   <span
                     className="inline-flex items-center px-1"
@@ -512,72 +562,76 @@ export function SessionExplorerDetail({ sessionId }: { sessionId: string }) {
                   value={fmtDate(report?.started_at || trace?.created_at)}
                 />
                 {startedModel && (
-                  <MetaPill label="Model" value={startedModel} tone="violet" />
+                  <MetaPill label="Model" value={startedModel} tone="neutral" />
                 )}
                 <MetaPill
                   label="Agent"
                   value={`@${trace?.agent || "unknown"}`}
-                  tone="amber"
+                  tone="warning"
                 />
               </div>
             </div>
 
             <div className="flex items-center gap-3 self-start">
-              {report?.raw_artifact_ids &&
+              {localFiles && report?.raw_artifact_ids &&
                 report.raw_artifact_ids.length > 0 && (
                   <a
-                    href={`/api/raw-artifacts/${report.raw_artifact_ids[0]}/content`}
+                    href={apiUrl(`/raw-artifacts/${report.raw_artifact_ids[0]}/content`)}
                     target="_blank"
                     rel="noreferrer"
-                    className="px-3 py-1.5 border border-neutral-700 hover:border-neutral-500 hover:text-neutral-100 transition-all text-[10px] font-mono text-neutral-400 uppercase tracking-widest flex items-center gap-2"
+                    className="inline-flex h-7 items-center gap-1.5 rounded-md border border-border/80 bg-muted/55 px-2.5 text-caption font-medium text-neutral-400 transition-colors hover:bg-neutral-800/80 hover:text-foreground"
                   >
                     <ExternalLink size={10} />
                     Raw Link
                   </a>
                 )}
-              <button
+              <UiButton
                 onClick={() => setAllExpanded(!allExpanded)}
-                className="px-3 py-1.5 border border-neutral-700 hover:border-neutral-500 hover:text-neutral-100 transition-all text-[10px] font-mono text-neutral-400 uppercase tracking-widest"
+                size="xs"
+                variant="outline"
               >
                 {allExpanded ? "Collapse View" : "Expand All"}
-              </button>
-              <button
+              </UiButton>
+              <UiButton
                 onClick={() => setRightPanelOpen(!rightPanelOpen)}
-                className={cx(
-                  "w-8 h-8 flex items-center justify-center border transition-all text-sm font-mono",
-                  rightPanelOpen
-                    ? "bg-brand-600 border-brand-500 text-white"
-                    : "border-neutral-700 text-neutral-400 hover:border-neutral-500 hover:text-neutral-100"
-                )}
-                title="Toggle Detailed Metrics"
+                size="icon"
+                variant="outline"
+                active={rightPanelOpen}
+                aria-label="Toggle Detailed Metrics"
+                tooltip="Toggle Detailed Metrics"
               >
                 {rightPanelOpen ? <X size={14} /> : <ChevronRight size={14} />}
-              </button>
+              </UiButton>
             </div>
           </div>
 
           <div className="grid grid-cols-5 gap-1.5">
             <HeaderStat
-              label="Cost"
+              label={report?.actual_cost_source === "priced" ? "Priced Cost" : "Cost"}
               value={
-                report
-                  ? fmtUsd(report.total_cost_usd)
-                  : trace?.input_tokens
-                    ? "..."
-                    : "—"
+                report?.actual_cost_source === "unavailable"
+                  ? "—"
+                  : report
+                    ? fmtUsd(report.total_cost_usd)
+                    : trace?.input_tokens
+                      ? "..."
+                      : "—"
               }
-              tone="amber"
+              title={report ? costSourceLabel(report.actual_cost_source) : undefined}
+              tone="warning"
             />
             <HeaderStat
-              label="Saved"
+              label="Est. Saved"
               value={report ? fmtUsd(report.total_lemoncrow_savings_usd) : "—"}
-              tone="emerald"
+              tone="success"
             />
             <HeaderStat
               label="Tokens"
               value={
-                report || trace || inspectorData
-                  ? (() => {
+                report?.usage_measurement_source === "unavailable"
+                  ? "—"
+                  : report || trace || inspectorData
+                    ? (() => {
                       // "Input" = bytes the model freshly processed this
                       // session = new input + cache writes. Anthropic's
                       // raw `input_tokens` excludes cW even though cW is
@@ -610,7 +664,16 @@ export function SessionExplorerDetail({ sessionId }: { sessionId: string }) {
             />
             <HeaderStat
               label="Turns"
-              value={report ? String(report.total_turns) : "—"}
+              value={
+                report
+                  ? String(report.measured_total_turns || report.total_turns)
+                  : "—"
+              }
+              title={
+                report?.measured_subagent_count
+                  ? `${report.measured_main_turns ?? 0} main · ${report.measured_subagent_turns ?? 0} subagent`
+                  : undefined
+              }
             />
             <HeaderStat
               label="Time"
@@ -631,16 +694,16 @@ export function SessionExplorerDetail({ sessionId }: { sessionId: string }) {
         <div className="flex h-full">
           {/* Scrollable timeline */}
           <div className="flex-1 overflow-y-auto custom-scrollbar bg-surface">
-            <div className="p-10 space-y-16 pb-48">
-              <section className="space-y-12">
-                <div className="flex items-center gap-6">
-                  <h2 className="text-[10px] font-black uppercase tracking-[0.5em] text-neutral-400 whitespace-nowrap">
+            <div className="space-y-4 p-4 pb-16">
+              <section className="space-y-4">
+                <div className="flex items-center gap-3">
+                  <h2 className="whitespace-nowrap text-caption font-semibold uppercase tracking-[0.12em] text-muted-foreground">
                     Execution Flow
                   </h2>
-                  <div className="h-px w-full bg-gradient-to-r from-neutral-800 to-transparent" />
+                  <div className="h-px w-full bg-neutral-800/80" />
                 </div>
 
-                <div className="space-y-12">
+                <div className="space-y-4">
                   {enrichedConversations.length > 0 ? (
                     (() => {
                       const seen = new Map<string, number>();
@@ -666,16 +729,16 @@ export function SessionExplorerDetail({ sessionId }: { sessionId: string }) {
                       });
                     })()
                   ) : (
-                    <div className="space-y-8">
+                    <div className="space-y-4">
                       {trace?.reasoning && trace.reasoning.length > 0 && (
                         <div className="space-y-4">
-                          <h3 className="text-[10px] font-bold uppercase tracking-widest text-neutral-400 px-1">
+                          <h3 className="text-caption font-bold uppercase tracking-widest text-neutral-400 px-1">
                             Strategy
                           </h3>
                           {trace.reasoning.map((r, i) => (
                             <div
                               key={i}
-                              className="bg-brand-950/[0.03] border border-brand-900/10 p-5 text-[11px] leading-relaxed text-brand-400/60 font-mono whitespace-pre-wrap rounded-sm shadow-inner"
+                              className="rounded-lg border border-border/70 bg-background/60 p-3 font-mono text-label leading-relaxed text-neutral-400 whitespace-pre-wrap"
                             >
                               {r}
                             </div>
@@ -683,10 +746,10 @@ export function SessionExplorerDetail({ sessionId }: { sessionId: string }) {
                         </div>
                       )}
                       <div className="space-y-4">
-                        <h3 className="text-[10px] font-bold uppercase tracking-widest text-neutral-400 px-1">
+                        <h3 className="text-caption font-bold uppercase tracking-widest text-neutral-400 px-1">
                           Events
                         </h3>
-                        <div className="space-y-3">
+                        <div className="space-y-2">
                           {trace?.tools_called.map((t, i) => (
                             <ToolCallDetail
                               key={i}
@@ -709,13 +772,13 @@ export function SessionExplorerDetail({ sessionId }: { sessionId: string }) {
               </section>
 
               {ledgerFilesTouched.length > 0 && (
-                <section className="space-y-6 pt-12 border-t border-neutral-900/50">
-                  <div className="flex items-center gap-6">
-                    <h2 className="text-[10px] font-black uppercase tracking-[0.5em] text-neutral-400 whitespace-nowrap">
+                <section className="space-y-4 border-t border-border/70 pt-4">
+                  <div className="flex items-center gap-3">
+                    <h2 className="whitespace-nowrap text-caption font-semibold uppercase tracking-[0.12em] text-muted-foreground">
                       File Changes
                     </h2>
-                    <div className="h-px w-full bg-gradient-to-r from-neutral-800 to-transparent" />
-                    <span className="text-[10px] text-neutral-400 font-mono font-bold uppercase tracking-widest flex-shrink-0">
+                    <div className="h-px w-full bg-neutral-800/80" />
+                    <span className="flex-shrink-0 font-mono text-caption font-medium text-muted-foreground">
                       {ledgerFilesTouched.length} file
                       {ledgerFilesTouched.length !== 1 ? "s" : ""} · from
                       session
@@ -737,23 +800,51 @@ export function SessionExplorerDetail({ sessionId }: { sessionId: string }) {
 
           {/* Right rail — detailed metrics */}
           {rightPanelOpen && (
-            <aside className="w-96 flex-shrink-0 border-l border-neutral-800/60 bg-surface-raised/40 overflow-y-auto custom-scrollbar p-6 space-y-10 animate-in slide-in-from-right duration-300">
+            <aside className="w-96 flex-shrink-0 space-y-4 overflow-y-auto border-l border-border/70 bg-background/70 p-4 custom-scrollbar animate-in slide-in-from-right duration-300">
               <section className="space-y-4">
-                <h3 className="text-[10px] font-black uppercase tracking-[0.2em] text-neutral-400 border-b border-neutral-800 pb-2">
+                <h3 className="border-b border-border pb-2 text-caption font-semibold uppercase tracking-[0.12em] text-muted-foreground">
                   Session Blueprint
                 </h3>
-                <div className="grid gap-4">
+                <div className="grid gap-3">
                   <SidebarMetric
                     label="Input Cost"
-                    value={report ? fmtUsd(report.input_token_cost_usd) : "—"}
+                    value={
+                      report?.actual_cost_source === "unavailable"
+                        ? "—"
+                        : report
+                          ? fmtUsd(report.input_token_cost_usd)
+                          : "—"
+                    }
                   />
                   <SidebarMetric
                     label="Output Cost"
-                    value={report ? fmtUsd(report.output_token_cost_usd) : "—"}
+                    value={
+                      report?.actual_cost_source === "unavailable"
+                        ? "—"
+                        : report
+                          ? fmtUsd(report.output_token_cost_usd)
+                          : "—"
+                    }
                   />
                   <SidebarMetric
                     label="Cache Read Cost"
-                    value={report ? fmtUsd(report.cache_read_cost_usd) : "—"}
+                    value={
+                      report?.actual_cost_source === "unavailable"
+                        ? "—"
+                        : report
+                          ? fmtUsd(report.cache_read_cost_usd)
+                          : "—"
+                    }
+                  />
+                  <SidebarMetric
+                    label="Cache Write Cost"
+                    value={
+                      report?.actual_cost_source === "unavailable"
+                        ? "—"
+                        : report
+                          ? fmtUsd(report.cache_write_cost_usd)
+                          : "—"
+                    }
                   />
                 </div>
                 {(routeScore !== null || compactScore !== null) && (
@@ -762,31 +853,65 @@ export function SessionExplorerDetail({ sessionId }: { sessionId: string }) {
                       <MetaPill
                         label="Route outcome"
                         value={routeScore.toFixed(2)}
-                        tone="violet"
+                        tone="neutral"
                       />
                     )}
                     {compactScore !== null && (
                       <MetaPill
                         label="Compact outcome"
                         value={compactScore.toFixed(2)}
-                        tone="amber"
+                        tone="warning"
                       />
                     )}
                   </div>
                 )}
               </section>
 
+              {report && (
+                <section className="space-y-4">
+                  <h3 className="border-b border-border pb-2 text-caption font-semibold uppercase tracking-[0.12em] text-muted-foreground">
+                    Measurement
+                  </h3>
+                  <div className="grid gap-3">
+                    <SidebarMetric
+                      label="Usage"
+                      value={usageSourceLabel(report.usage_measurement_source)}
+                    />
+                    <SidebarMetric
+                      label="Cost"
+                      value={costSourceLabel(report.actual_cost_source)}
+                    />
+                    {report.usage_measurement_source === "claude_mod" && (
+                      <>
+                        <SidebarMetric
+                          label="Measured Requests"
+                          value={String(report.measured_request_steps ?? 0)}
+                        />
+                        <SidebarMetric
+                          label="Main"
+                          value={`${report.measured_main_turns ?? 0} turns`}
+                        />
+                        <SidebarMetric
+                          label="Subagents"
+                          value={`${report.measured_subagent_count ?? 0} agents · ${report.measured_subagent_turns ?? 0} turns`}
+                        />
+                      </>
+                    )}
+                  </div>
+                </section>
+              )}
+
               {report?.top_tools_by_cost &&
                 report.top_tools_by_cost.length > 0 && (
                   <section className="space-y-4">
-                    <h3 className="text-[10px] font-black uppercase tracking-[0.2em] text-neutral-400 border-b border-neutral-800 pb-2">
+                    <h3 className="border-b border-border pb-2 text-caption font-semibold uppercase tracking-[0.12em] text-muted-foreground">
                       Tool Breakdown
                     </h3>
                     <div className="space-y-2">
                       {report.top_tools_by_cost.map((t, i) => (
                         <div
                           key={i}
-                          className="flex items-center justify-between text-[10px] font-mono border-b border-neutral-800/40 pb-1 last:border-0"
+                          className="flex items-center justify-between text-caption font-mono border-b border-border/40 pb-1 last:border-0"
                         >
                           <span className="text-blue-300 truncate pr-4">
                             {t.tool} ({t.calls})
@@ -802,14 +927,14 @@ export function SessionExplorerDetail({ sessionId }: { sessionId: string }) {
 
               {report?.tool_savings && report.tool_savings.length > 0 && (
                 <section className="space-y-4">
-                  <h3 className="text-[10px] font-black uppercase tracking-[0.2em] text-neutral-400 border-b border-neutral-800 pb-2">
+                  <h3 className="border-b border-border pb-2 text-caption font-semibold uppercase tracking-[0.12em] text-muted-foreground">
                     Context Savings by Tool
                   </h3>
                   <div className="space-y-2">
                     {report.tool_savings.map((row, i) => (
                       <div
                         key={i}
-                        className="flex items-center justify-between text-[10px] font-mono border-b border-neutral-800/40 pb-1 last:border-0"
+                        className="flex items-center justify-between text-caption font-mono border-b border-border/40 pb-1 last:border-0"
                       >
                         <span className="text-emerald-300 truncate pr-4">
                           {row.tool}
@@ -827,15 +952,15 @@ export function SessionExplorerDetail({ sessionId }: { sessionId: string }) {
               {report?.models_used &&
                 Object.keys(report.models_used).length > 0 && (
                   <section className="space-y-4">
-                    <h3 className="text-[10px] font-black uppercase tracking-[0.2em] text-neutral-400 border-b border-neutral-800 pb-2">
+                    <h3 className="border-b border-border pb-2 text-caption font-semibold uppercase tracking-[0.12em] text-muted-foreground">
                       Models Involved
                     </h3>
-                    <div className="space-y-2 text-[10px] font-mono">
+                    <div className="space-y-2 text-caption font-mono">
                       {Object.entries(report.models_used).map(
                         ([model, count], i) => (
                           <div
                             key={i}
-                            className="flex items-center justify-between border-b border-neutral-800/40 pb-1 last:border-0"
+                            className="flex items-center justify-between border-b border-border/40 pb-1 last:border-0"
                           >
                             <span className="text-violet-300 truncate pr-4">
                               {model}
@@ -853,17 +978,17 @@ export function SessionExplorerDetail({ sessionId }: { sessionId: string }) {
               {report?.agent_settings &&
                 Object.keys(report.agent_settings).length > 0 && (
                   <section className="space-y-4">
-                    <h3 className="text-[10px] font-black uppercase tracking-[0.2em] text-neutral-400 border-b border-neutral-800 pb-2">
+                    <h3 className="border-b border-border pb-2 text-caption font-semibold uppercase tracking-[0.12em] text-muted-foreground">
                       Agent Config
                     </h3>
-                    <div className="space-y-2 text-[10px] font-mono">
+                    <div className="space-y-2 text-caption font-mono">
                       {Object.entries(report.agent_settings).map(
                         ([key, val], i) => (
                           <div
                             key={i}
-                            className="flex flex-col border-b border-neutral-800/40 pb-1 last:border-0 gap-0.5"
+                            className="flex flex-col border-b border-border/40 pb-1 last:border-0 gap-0.5"
                           >
-                            <span className="text-neutral-400 uppercase font-bold tracking-tighter text-[10px]">
+                            <span className="text-neutral-400 uppercase font-bold tracking-tighter text-caption">
                               {key}
                             </span>
                             <span className="text-neutral-400 truncate">
@@ -918,26 +1043,26 @@ export function SessionExplorerDetail({ sessionId }: { sessionId: string }) {
                   />
                 )}
 
-              <section className="space-y-3 opacity-60 hover:opacity-100 transition-opacity pt-4 border-t border-neutral-800">
-                <h3 className="text-[10px] font-black uppercase tracking-widest text-neutral-400">
+              <section className="space-y-3 opacity-60 hover:opacity-100 transition-opacity pt-4 border-t border-border">
+                <h3 className="text-caption font-black uppercase tracking-widest text-neutral-400">
                   Audit Telemetry
                 </h3>
-                <div className="space-y-1.5 text-[10px] font-mono text-neutral-400">
+                <div className="space-y-1.5 text-caption font-mono text-neutral-400">
                   {report?.telemetry &&
                     Object.entries(report.telemetry).map(([key, val], i) => (
                       <div
                         key={i}
-                        className="flex justify-between border-b border-neutral-800/20 pb-0.5 last:border-0"
+                        className="flex justify-between border-b border-border/20 pb-0.5 last:border-0"
                       >
-                        <span className="uppercase text-[10px] font-bold">
+                        <span className="uppercase text-caption font-bold">
                           {key}
                         </span>
                         <span className="text-neutral-400">{String(val)}</span>
                       </div>
                     ))}
                   {inspectorData?.summarized_events_count ? (
-                    <div className="flex justify-between border-b border-neutral-800/20 pb-0.5 last:border-0">
-                      <span className="uppercase text-[10px] font-bold text-amber-600/80">
+                    <div className="flex justify-between border-b border-border/20 pb-0.5 last:border-0">
+                      <span className="uppercase text-caption font-bold text-amber-600/80">
                         Compressed_Events
                       </span>
                       <span className="text-amber-300">
@@ -946,8 +1071,8 @@ export function SessionExplorerDetail({ sessionId }: { sessionId: string }) {
                     </div>
                   ) : null}
                   {inspectorData?.tokens_pre && (
-                    <div className="flex justify-between border-b border-neutral-800/20 pb-0.5 last:border-0">
-                      <span className="uppercase text-[10px] font-bold">
+                    <div className="flex justify-between border-b border-border/20 pb-0.5 last:border-0">
+                      <span className="uppercase text-caption font-bold">
                         Context_Pre
                       </span>
                       <span className="text-neutral-400">
@@ -956,8 +1081,8 @@ export function SessionExplorerDetail({ sessionId }: { sessionId: string }) {
                     </div>
                   )}
                   {inspectorData?.tokens_post && (
-                    <div className="flex justify-between border-b border-neutral-800/20 pb-0.5 last:border-0">
-                      <span className="uppercase text-[10px] font-bold text-emerald-600/80">
+                    <div className="flex justify-between border-b border-border/20 pb-0.5 last:border-0">
+                      <span className="uppercase text-caption font-bold text-emerald-600/80">
                         Context_Post
                       </span>
                       <span className="text-emerald-300">

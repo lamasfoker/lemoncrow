@@ -29,9 +29,6 @@ const sampleTraces: TraceListResponse = {
       model: "claude-3-5-sonnet",
       task: "Fix login bug",
       status: "completed",
-      files_touched: [],
-      tools_called: [],
-      commands_run: [],
       errors_seen: [],
       repeated_failures: [],
       validation_results: [],
@@ -123,13 +120,13 @@ function mockFetch(
     });
 }
 
-function renderSessions(initialEntry = "/runs") {
+function renderSessions(initialEntry = "/activity") {
   return render(
     <MemoryRouter initialEntries={[initialEntry]}>
       <TimeRangeProvider>
         <Routes>
-          <Route path="/runs" element={<Sessions />} />
-          <Route path="/runs/:id" element={<Sessions />} />
+          <Route path="/activity" element={<Sessions />} />
+          <Route path="/activity/:id" element={<Sessions />} />
         </Routes>
       </TimeRangeProvider>
     </MemoryRouter>
@@ -201,7 +198,7 @@ describe("Sessions page", () => {
     expect(screen.getByLabelText("Filter by workspace")).toBeInTheDocument();
   });
 
-  it("hides internal zero-usage traces and does not render unavailable cost as $0", async () => {
+  it("keeps sessions visible without usage and does not render unavailable cost as $0", async () => {
     const internalTrace = {
       ...sampleTraces.items[0],
       id: "internal-trace",
@@ -273,7 +270,7 @@ describe("Sessions page", () => {
     renderSessions();
 
     const task = await screen.findByText("Real OpenCode session");
-    expect(screen.queryByText("Internal LemonCrow task")).not.toBeInTheDocument();
+    expect(screen.getByText("Internal LemonCrow task")).toBeInTheDocument();
     const row = task.closest("button");
     expect(row).not.toBeNull();
     expect(within(row as HTMLElement).getByText("—")).toBeInTheDocument();
@@ -287,6 +284,26 @@ describe("Sessions page", () => {
     });
     renderSessions();
     expect(await screen.findByText(/No sessions found/i)).toBeInTheDocument();
+  });
+
+  it("explains unavailable hosted history without reporting zero activity", async () => {
+    const message = "Coding-agent telemetry has not been connected to this hosted organization.";
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
+      jsonResponse({ error: { code: "not_configured", message } }, 501),
+    );
+    renderSessions();
+    expect(await screen.findByRole("alert")).toHaveTextContent(message);
+    expect(screen.queryByText(/501|ApiError|No sessions found/)).not.toBeInTheDocument();
+    expect(screen.queryByText("$0.000")).not.toBeInTheDocument();
+  });
+
+  it("keeps an HTTP fallback when an upstream error is not JSON", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
+      new Response("<html>gateway unavailable</html>", { status: 503, statusText: "Service Unavailable" }),
+    );
+    renderSessions();
+    expect(await screen.findByRole("alert")).toHaveTextContent("503 Service Unavailable");
+    expect(screen.queryByText(/gateway unavailable/)).not.toBeInTheDocument();
   });
 
   it("shows error state on fetch failure", async () => {
@@ -364,7 +381,7 @@ describe("Sessions page", () => {
       }),
     });
 
-    renderSessions("/runs/abc123def456ghi");
+    renderSessions("/activity/abc123def456ghi");
 
     expect(await screen.findByText("Execution Flow")).toBeInTheDocument();
     expect(await screen.findByText("Done.")).toBeInTheDocument();
@@ -477,7 +494,7 @@ describe("Sessions page", () => {
     await screen.findByText("Task 50");
 
     fetchSpy.mockClear();
-    fireEvent.click(screen.getByTitle("Refresh sessions"));
+    fireEvent.click(screen.getByRole("button", { name: "Refresh sessions" }));
 
     // The refresh request must replace (offset=0, limit=100), not append
     // (offset=page*50) — the pre-fix request shape here was offset=50,

@@ -26,6 +26,7 @@ from __future__ import annotations
 import io
 import json
 import os
+from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 from typing import Any
 
@@ -173,10 +174,18 @@ def chat_with_result(
             raise LiteLLMUnavailable(f"LiteLLM returned invalid JSON: {exc}") from exc
         parsed_json = parsed if isinstance(parsed, dict) else {"value": parsed}
     usage = _field(response, "usage")
+    hidden = _field(response, "_hidden_params")
+    reported_cost = _field(hidden, "response_cost")
+    provider_cost = (
+        float(reported_cost)
+        if isinstance(reported_cost, (int, float)) and not isinstance(reported_cost, bool) and reported_cost >= 0
+        else None
+    )
     return InternalLLMChatResult(
         content=content,
         parsed_json=parsed_json,
         model=chosen_model,
+        reported_model=reported if isinstance(reported := _field(response, "model"), str) else "",
         request_id=str(_field(response, "id") or ""),
         input_tokens=_token_value(usage, "prompt_tokens"),
         output_tokens=_token_value(usage, "completion_tokens"),
@@ -185,6 +194,8 @@ def chat_with_result(
         or _usage_detail(usage, "prompt_tokens_details", "cache_creation_tokens"),
         cache_capability=_cache_capability(chosen_model=chosen_model, cache_metadata=cache_metadata),
         request_metadata=dict(cache_metadata or {}),
+        provider_cost=provider_cost,
+        currency="USD",
     )
 
 
@@ -198,6 +209,51 @@ def chat(
     if json_schema is None:
         return result.content
     return dict(result.parsed_json or {})
+
+
+def chat_stream(
+    messages: list[dict[str, Any]],
+    *,
+    on_delta: Callable[[str], None],
+    model: str | None = None,
+    json_schema: dict[str, Any] | None = None,
+) -> str | dict[str, Any]:
+    """Stream LiteLLM completion chunks and preserve chat()'s parsed result contract."""
+    litellm = _litellm_module()
+    chosen_model = _resolve_model(model)
+    request_kwargs: dict[str, Any] = {
+        "model": chosen_model,
+        "messages": messages,
+        "stream": True,
+    }
+    if json_schema is not None:
+        request_kwargs["response_format"] = {"type": "json_object"}
+    request_kwargs = _with_provider_transport(request_kwargs)
+    try:
+        response = litellm.completion(**request_kwargs)
+        chunks: list[str] = []
+        for chunk in response:
+            choices = _field(chunk, "choices")
+            choice = choices[0] if isinstance(choices, list) and choices else None
+            delta = _field(choice, "delta") if choice is not None else None
+            content = _field(delta, "content")
+            text = content if isinstance(content, str) else ""
+            if not text:
+                continue
+            chunks.append(text)
+            on_delta(text)
+    except Exception as exc:
+        if isinstance(exc, LiteLLMUnavailable):
+            raise
+        raise LiteLLMUnavailable(f"LiteLLM completion unavailable: {exc}") from exc
+    content = "".join(chunks)
+    if json_schema is None:
+        return content
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise LiteLLMUnavailable(f"LiteLLM returned invalid JSON: {exc}") from exc
+    return parsed if isinstance(parsed, dict) else {"value": parsed}
 
 
 def tool_completion(
@@ -226,7 +282,7 @@ def tool_completion(
     )
 
 
-__all__ = ["LiteLLMUnavailable", "chat", "chat_with_result", "summarize", "tool_completion"]
+__all__ = ["LiteLLMUnavailable", "chat", "chat_stream", "chat_with_result", "summarize", "tool_completion"]
 
 
 def _apply_cache_control(

@@ -1,0 +1,4 @@
+plan,seats,monthly_usd,review_surfaces
+Starter,3,0,web
+Team,25,49,web;api
+Business,100,199,web;api;runtime

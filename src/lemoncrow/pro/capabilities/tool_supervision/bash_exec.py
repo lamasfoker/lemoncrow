@@ -14,7 +14,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -785,6 +785,7 @@ def start_managed_command(
     command: str,
     *,
     cwd: str | None = None,
+    env: Mapping[str, str] | None = None,
     timeout: int = 30,
     max_lines: int = DEFAULT_MAX_LINES,
     max_chars: int | None = None,
@@ -856,6 +857,7 @@ def start_managed_command(
             # stream), so substitution is detected exactly and the raw bytes
             # stay recoverable when a stream turns out non-UTF8.
             cwd=cwd,
+            env=dict(env) if env is not None else None,
             start_new_session=True,
         )
     except Exception:
@@ -916,6 +918,13 @@ def start_managed_command(
         "status": "running",
         "session_id": session_id,
         "pid": proc.pid,
+        # This is the first status snapshot. Keep the same timing vocabulary as
+        # peek_managed_command() so detached callers do not need to poll just to
+        # learn their initial budget -- polling a fast bg command can reap it and
+        # lose the very handle bg=True promised to return.
+        "duration_ms": 0,
+        "timeout_remaining_ms": max(0, timeout * 1000),
+        "over_budget": timeout <= 0,
         "timeout": timeout,
         "explicit_background": managed.explicit_background,
     }

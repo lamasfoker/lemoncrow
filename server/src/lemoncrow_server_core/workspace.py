@@ -175,6 +175,15 @@ _HEX: Final[frozenset[str]] = frozenset("0123456789abcdef")
 #: world-readable.
 _DIR_MODE: Final[int] = 0o700
 _FILE_MODE: Final[int] = 0o600
+#: A negative revision means the slot is not a complete View tree. ``-1`` is
+#: dirty/interrupted; ``-2`` is an intentionally scoped exact-path workspace.
+_PARTIAL_REVISION: Final[int] = -2
+
+#: Bound peak plaintext held by one cold materialization read. The content
+#: stores may have tighter internal query limits, but the workspace never asks
+#: them to return an entire large repository in one mapping.
+_CONTENT_READ_BATCH: Final[int] = 400
+_CONTENT_READ_BATCH_BYTES: Final[int] = 8 * 1024 * 1024
 
 #: The lock file one server takes on its materialization root. Named with a
 #: leading dot and no hex digits so neither the stale-slot sweep nor the purge
@@ -428,8 +437,9 @@ class _Slot:
     lock: threading.Lock
     #: Path -> content digest actually on disk. The tree is exactly this map.
     on_disk: dict[str, str]
-    #: Revision the map corresponds to; ``-1`` means a write was interrupted
-    #: and the next materialization must rebuild from scratch.
+    #: Complete revision represented by the tree. Negative values mean the
+    #: next full materialization must rebuild: ``-1`` interrupted, ``-2`` an
+    #: intentional exact-path subset.
     at_revision: int
     bytes_on_disk: int
     last_used: float
@@ -621,12 +631,27 @@ class ViewMaterializer:
         the event loop. It is safe to call concurrently -- one lock per slot --
         and cheap when the tree is already at the requested revision.
         """
+        # Validate ownership and the requested revision before allocating a
+        # slot. The warm fast path must not turn a stale revision into a valid
+        # answer merely because that revision was materialized earlier, and an
+        # unauthorized view id must not leave a tenant-named directory behind.
+        state = self._backend.views.get(org_id, view_id)
+        if state.view_revision != view_revision:
+            raise ServerError(
+                ErrorCode.VIEW_REVISION_STALE,
+                "the requested workspace revision is no longer current",
+                details={
+                    "claimed_view_revision": view_revision,
+                    "committed_view_revision": state.view_revision,
+                },
+                action=AgentAction.REFRESH_VIEW_REVISION,
+            )
+
         slot = self._slot_for(org_id, view_id)
         with slot.lock:
             if slot.at_revision == view_revision:
-                # The scratch tree is private to this slot and a View revision
-                # is immutable once committed. Tool dispatch already bound the
-                # request to the current committed revision, so rebuilding
+                # The scratch tree is private to this slot and this revision is
+                # still the current committed revision, proved above. Rebuilding
                 # membership/provenance here would only re-prove the same tree.
                 result = MaterializedView(
                     root=slot.tree,
@@ -640,10 +665,87 @@ class ViewMaterializer:
                 membership = self._membership_at(org_id, view_id, view_revision)
                 reachable = addressable_in(
                     self._backend.provenance,
-                    self._backend.views.get(org_id, view_id),
+                    state,
                     tuple(sorted({entry.content_digest for entry in membership.values()})),
                 )
                 result = self._apply(slot, membership, reachable, view_revision)
+        self._enforce_quota(keep=slot.tree.name)
+        return result
+
+    def materialize_paths(
+        self,
+        org_id: str,
+        view_id: str,
+        view_revision: int,
+        paths: Sequence[str],
+    ) -> MaterializedView:
+        """Materialize only exact requested paths for a path-scoped tool call.
+
+        This is deliberately narrower than :meth:`materialize`: the resulting
+        tree is marked partial and is never reused as though it represented the
+        whole View. A later whole-tree tool therefore rebuilds normally, while
+        an exact ``read`` avoids reconstructing tens of thousands of unrelated
+        files just to open one known path.
+        """
+        selected = tuple(dict.fromkeys(validate_path(path) for path in paths))
+        if not selected:
+            return self.materialize(org_id, view_id, view_revision)
+
+        views = self._backend.views
+        state = views.get(org_id, view_id)
+        if state.view_revision != view_revision:
+            raise ServerError(
+                ErrorCode.VIEW_REVISION_STALE,
+                "the requested workspace revision is no longer current",
+                details={
+                    "claimed_view_revision": view_revision,
+                    "committed_view_revision": state.view_revision,
+                },
+                action=AgentAction.REFRESH_VIEW_REVISION,
+            )
+
+        slot = self._slot_for(org_id, view_id)
+        with slot.lock:
+            # Never replace a complete warm tree with a subset. Once full
+            # materialization has been paid for, exact reads reuse it for free.
+            if slot.at_revision == view_revision:
+                result = MaterializedView(
+                    root=slot.tree,
+                    status=slot.status,
+                    rebuilt=False,
+                    written=0,
+                    removed=0,
+                    bytes_written=0,
+                )
+            else:
+                membership: dict[str, ManifestEntry] = {}
+                for path in selected:
+                    entry = views.entry(org_id, view_id, path)
+                    if entry is not None:
+                        membership[path] = entry
+                after = views.get(org_id, view_id)
+                if after.view_revision != view_revision:
+                    raise ServerError(
+                        ErrorCode.VIEW_REVISION_STALE,
+                        "the view advanced while its workspace was being materialized",
+                        details={
+                            "claimed_view_revision": view_revision,
+                            "committed_view_revision": after.view_revision,
+                        },
+                        action=AgentAction.REFRESH_VIEW_REVISION,
+                    )
+                reachable = addressable_in(
+                    self._backend.provenance,
+                    state,
+                    tuple(sorted({entry.content_digest for entry in membership.values()})),
+                )
+                result = self._apply(
+                    slot,
+                    membership,
+                    reachable,
+                    view_revision,
+                    complete_revision=False,
+                )
         self._enforce_quota(keep=slot.tree.name)
         return result
 
@@ -706,6 +808,8 @@ class ViewMaterializer:
         membership: Mapping[str, ManifestEntry],
         reachable: frozenset[str],
         view_revision: int,
+        *,
+        complete_revision: bool = True,
     ) -> MaterializedView:
         """Write the delta between what is on disk and what the view declares."""
         wanted: dict[str, str] = {}
@@ -768,34 +872,66 @@ class ViewMaterializer:
         written = 0
         bytes_written = 0
         missing_content = 0
+        backend = self._backend.for_view(slot.org_id, slot.view_id)
+
+        # One content digest may back many paths. Group changed paths first so
+        # the store is queried once per unique digest, then read those digests
+        # in bounded batches. This avoids one SQLite/PostgreSQL metadata lookup
+        # per file without ever holding a repository-sized plaintext mapping.
+        pending_by_digest: dict[str, list[str]] = {}
+        pending_bytes: dict[str, int] = {}
         for path in sorted(wanted):
             digest = wanted[path]
             if slot.on_disk.get(path) == digest:
                 continue
-            data = self._backend.content.get(slot.org_id, digest)
-            if data is None:
-                # The organization does not hold these bytes. The blob-miss
-                # guard already answered ``{need: [...]}`` for any path this
-                # call actually referenced; this is a file nobody asked for by
-                # name, so the tree simply does not contain it and the answer
-                # is flagged.
-                missing_content += 1
-                if path in slot.on_disk:
-                    slot.bytes_on_disk -= self._unlink(slot.tree, path)
-                    del slot.on_disk[path]
-                    removed += 1
-                continue
-            if path in slot.on_disk:
-                slot.bytes_on_disk -= self._unlink(slot.tree, path)
-                del slot.on_disk[path]
-            self._write(slot.tree, path, data)
-            slot.on_disk[path] = digest
-            slot.bytes_on_disk += len(data)
-            written += 1
-            bytes_written += len(data)
+            pending_by_digest.setdefault(digest, []).append(path)
+            pending_bytes.setdefault(digest, membership[path].size)
+
+        pending_digests = tuple(pending_by_digest)
+        prepared_directories: set[str] = set()
+        offset = 0
+        while offset < len(pending_digests):
+            batch: list[str] = []
+            batch_bytes = 0
+            while offset < len(pending_digests) and len(batch) < _CONTENT_READ_BATCH:
+                digest = pending_digests[offset]
+                size = pending_bytes[digest]
+                if batch and batch_bytes + size > _CONTENT_READ_BATCH_BYTES:
+                    break
+                batch.append(digest)
+                batch_bytes += size
+                offset += 1
+            contents = backend.content.get_many(slot.org_id, batch)
+            for digest in batch:
+                data = contents.get(digest)
+                for path in pending_by_digest[digest]:
+                    if data is None:
+                        # The organization does not hold these bytes. The
+                        # blob-miss guard already answered ``{need: [...]}`` for
+                        # any path this call actually referenced; this is a file
+                        # nobody asked for by name, so the tree simply omits it
+                        # and the answer is flagged.
+                        missing_content += 1
+                        if path in slot.on_disk:
+                            slot.bytes_on_disk -= self._unlink(slot.tree, path)
+                            del slot.on_disk[path]
+                            removed += 1
+                        continue
+                    if path in slot.on_disk:
+                        slot.bytes_on_disk -= self._unlink(slot.tree, path)
+                        del slot.on_disk[path]
+                    parent = path.rpartition("/")[0]
+                    if parent and parent not in prepared_directories:
+                        (slot.tree / parent).mkdir(mode=_DIR_MODE, parents=True, exist_ok=True)
+                        prepared_directories.add(parent)
+                    self._write(self._target(slot.tree, path), data)
+                    slot.on_disk[path] = digest
+                    slot.bytes_on_disk += len(data)
+                    written += 1
+                    bytes_written += len(data)
 
         self._prune_empty_directories(slot.tree)
-        slot.at_revision = view_revision
+        slot.at_revision = view_revision if complete_revision else _PARTIAL_REVISION
         slot.status = WorkspaceStatus(
             view_revision=view_revision,
             member_paths=len(membership),
@@ -822,20 +958,13 @@ class ViewMaterializer:
         ``validate_path`` already rejected absolute paths, ``..``, ``.``,
         backslashes and NUL when the manifest row was accepted. It is applied
         again here because this is the place where a path becomes a write to
-        the server's filesystem, and a containment check that lives only at the
-        edge is one refactor away from not existing.
+        the server's filesystem. Once that lexical proof succeeds, ``tree / path``
+        is contained by construction; ``Path.is_relative_to`` used to repeat the
+        same proof per file and did not add symlink protection because it does
+        not resolve filesystem links.
         """
         validate_path(path)
-        target = tree / path
-        if not target.is_relative_to(tree):  # pragma: no cover - defence in depth
-            raise ServerError(
-                ErrorCode.PATH_NOT_ADDRESSABLE,
-                "a manifest path escaped the materialized view",
-                details={"view_root": tree.name},
-                retryable=False,
-                action=AgentAction.FIX_REQUEST,
-            )
-        return target
+        return tree / path
 
     def _next_stamp(self) -> int:
         """A modification time no file in this process has carried before.
@@ -847,8 +976,8 @@ class ViewMaterializer:
             self._stamp = max(int(self._stamp_source()), self._stamp + 1)
             return self._stamp
 
-    def _write(self, tree: Path, path: str, data: bytes) -> None:
-        """Write one file, and make the change visible to a stat-keyed cache.
+    def _write(self, target: Path, data: bytes) -> None:
+        """Write one validated target, and make the change visible to a stat-keyed cache.
 
         The bytes are the easy half. The other half is that the tools reading
         this tree keep their own caches keyed by ``(absolute path, st_mtime_ns,
@@ -870,10 +999,10 @@ class ViewMaterializer:
         descriptor, so the stamp lands on the file just written and never on
         something a symlink swapped in afterwards.
         """
-        target = self._target(tree, path)
-        target.parent.mkdir(mode=_DIR_MODE, parents=True, exist_ok=True)
-        # O_NOFOLLOW so a symlink left in the tree can never redirect a write
-        # out of it. The caller unlinked any previous file at this path, so the
+        # Parent directories are prepared once per materialization by the
+        # caller. O_NOFOLLOW means a symlink left at the file target can never
+        # redirect this write out of the tree. The caller unlinked any previous
+        # file at this path, so the
         # open creates rather than truncates in the normal case.
         descriptor = os.open(target, os.O_CREAT | os.O_TRUNC | os.O_WRONLY | os.O_NOFOLLOW, _FILE_MODE)
         try:

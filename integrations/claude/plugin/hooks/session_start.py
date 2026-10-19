@@ -362,6 +362,16 @@ def main() -> int:
             return 0
 
         _append_session_start_event(session_id, source, model, cwd, transcript_path)
+        if cwd:
+            with suppress(Exception):
+                from lemoncrow.pro.capabilities.review.live_runtime import request_live_review_prepare
+
+                request_live_review_prepare(
+                    _lemoncrow_root(),
+                    Path(cwd),
+                    host="claude",
+                    session_id=session_id,
+                )
     except (OSError, TypeError, ValueError):
         pass  # fail-open
 

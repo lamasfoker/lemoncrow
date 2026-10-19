@@ -38,10 +38,12 @@ here read-only.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sqlite3
-from collections.abc import Iterable, Mapping
+import threading
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from math import isfinite
 from pathlib import Path
@@ -363,6 +365,109 @@ def load_outcome_rows(source: sqlite3.Connection | str | Path) -> list[OutcomeRo
     return rows
 
 
+# lc-debt: fixed cut-offs over outcome_capture's heuristic 0..1 route score;
+# upgrade path: calibrate against verified task outcomes (tests/review accept).
+_PASS_SCORE_MIN = 0.8
+_FAIL_SCORE_MAX = 0.4
+
+
+def verb_bucket(text: str | None) -> str:
+    """Public verb bucket used to stamp live routes for later persistence."""
+    return _verb_bucket(text)
+
+
+def outcome_label(score: float) -> str:
+    """Map an outcome-capture route score to a verification outcome label."""
+    if score >= _PASS_SCORE_MIN:
+        return "pass"
+    if score <= _FAIL_SCORE_MAX:
+        return "fail"
+    return "warn"
+
+
+def persistable_route_outcome(
+    session_id: str,
+    outcome: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Reduce one *closed* outcome-capture route entry to store rows.
+
+    The rows are shaped so :func:`load_outcome_rows` reproduces the same bucket
+    key that :func:`features_from_state` derives live: ``task=<verb>`` in the
+    reason, the tool as ``step_type``, and ``escalation_trigger`` set only for
+    the ``many`` prior-error bucket (the persisted side is two-valued, so a live
+    ``some`` bucket never matches and falls back to the heuristic).
+    """
+    window = outcome.get("outcome_window")
+    decision_id = str(outcome.get("decision_id") or "")
+    if not isinstance(window, Mapping) or not decision_id or not session_id:
+        return None
+    score = _safe_float(window.get("outcome_score"))
+    if score is None:
+        return None
+    scored = outcome.get("scored_state")
+    scored = scored if isinstance(scored, Mapping) else {}
+    verb = str(scored.get("task_verb") or "other")
+    reason_parts = [
+        f"task={verb}",
+        f"tool={outcome.get('tool') or ''}",
+        f"followed={bool(outcome.get('recommendation_followed'))}",
+        f"actual_model={outcome.get('actual_model') or ''}",
+    ]
+    retrieval_status = str(scored.get("retrieval_status") or "")
+    if retrieval_status:
+        reason_parts.append(f"retrieval={retrieval_status}")
+    prior = _prior_error_bucket(_safe_int(scored.get("prior_errors")))
+    retrieval_confidence = _safe_float(scored.get("retrieval_confidence"))
+    created_at = str(window.get("captured_at") or outcome.get("at") or "")
+    route = {
+        "id": decision_id,
+        "session_id": session_id,
+        "step_index": _safe_int(scored.get("turn_number")),
+        "step_type": str(outcome.get("tool") or ""),
+        "tier": str(outcome.get("recommended_tier") or ""),
+        "selected_model": str(outcome.get("recommended_model") or ""),
+        "confidence": retrieval_confidence if retrieval_confidence is not None else 0.0,
+        "reason": ", ".join(reason_parts),
+        "escalation_trigger": "prior_errors" if prior == "many" else None,
+        "created_at": created_at,
+    }
+    envelope = {
+        "id": f"ve-{decision_id}",
+        "outcome": outcome_label(score),
+        "compressed_evidence": json.dumps(dict(window), sort_keys=True)[:1024],
+        "created_at": created_at,
+    }
+    return route, envelope
+
+
+_TELEMETRY_STORES: dict[str, Any] = {}
+_TELEMETRY_STORES_LOCK = threading.Lock()
+
+
+def _telemetry_store(root: str | Path) -> Any:
+    from lemoncrow.core.foundation.telemetry_store import TelemetryStore
+
+    key = str(Path(root).resolve())
+    with _TELEMETRY_STORES_LOCK:
+        store = _TELEMETRY_STORES.get(key)
+        if store is None:
+            store = TelemetryStore(key)
+            store.init()
+            _TELEMETRY_STORES[key] = store
+        return store
+
+
+def telemetry_route_sink(root: str | Path) -> Callable[[str, dict[str, Any]], None]:
+    """Outcome-capture sink that persists closed routes for the learned router."""
+
+    def sink(session_id: str, outcome: dict[str, Any]) -> None:
+        rows = persistable_route_outcome(session_id, outcome)
+        if rows is not None:
+            _telemetry_store(root).persist_route_outcome(*rows)
+
+    return sink
+
+
 # --------------------------------------------------------------------------- #
 # Public predictor                                                             #
 # --------------------------------------------------------------------------- #
@@ -495,6 +600,10 @@ __all__ = [
     "learned_routing_min_samples",
     "learned_routing_threshold",
     "load_outcome_rows",
+    "outcome_label",
     "outcome_row_from_persisted",
     "p_weak_succeeds",
+    "persistable_route_outcome",
+    "telemetry_route_sink",
+    "verb_bucket",
 ]

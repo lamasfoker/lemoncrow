@@ -1,3 +1,4 @@
+import { Button as UiButton } from "../components/ui/button";
 import { useEffect, useState } from "react";
 import { useTimeRange } from "../lib/TimeRangeContext";
 import LeverBar from "../components/LeverBar";
@@ -74,10 +75,10 @@ export default function Savings() {
     api
       .savingsSummary(days)
       .then(setData)
-      .catch((e) => setErr(String(e)));
+      .catch((e) => setErr(e instanceof Error ? e.message : String(e)));
   }, [days]);
 
-  if (err) return <div className="text-red-300">Error: {err}</div>;
+  if (err) return <div role="alert" className="p-4 text-body leading-6 text-muted-foreground">{err}</div>;
   if (!data) return <div className="text-neutral-400">Loading…</div>;
 
   const latestBenchmark = data.latest_benchmark ?? null;
@@ -131,14 +132,14 @@ export default function Savings() {
   };
 
   return (
-    <div className="space-y-8">
-      <section className="border border-cyan-900/60 bg-gradient-to-r from-cyan-950/60 to-neutral-950 p-6">
-        <div className="flex flex-col md:flex-row md:items-end md:justify-between gap-6">
+    <div className="space-y-4">
+      <section className="rounded-lg border border-border/70 bg-background/60 p-4">
+        <div className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
           <div>
-            <div className="text-[11px] font-mono uppercase tracking-[0.22em] text-cyan-300">
+            <div className="text-label font-mono uppercase tracking-[0.22em] text-cyan-300">
               {headlineLabel}
             </div>
-            <div className="text-6xl md:text-7xl font-semibold leading-none text-cyan-200 mt-2">
+            <div className="mt-1 text-3xl font-semibold leading-none text-foreground md:text-4xl">
               {fmtPct(
                 data.cost_basis === "session_ledger"
                   ? (data.saved_pct ?? 0)
@@ -170,7 +171,7 @@ export default function Savings() {
           </div>
           <div className="w-full md:w-auto">
             <Sparkline values={sparkValues} />
-            <p className="font-mono text-[10px] text-neutral-400 uppercase tracking-wider mt-2">
+            <p className="font-mono text-caption text-neutral-400 uppercase tracking-wider mt-2">
               Daily reduction trend
             </p>
           </div>
@@ -178,8 +179,8 @@ export default function Savings() {
       </section>
 
       <section className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-3">
-        <div className="border border-emerald-900/60 bg-emerald-950/30 p-4">
-          <div className="text-[10px] font-mono uppercase tracking-widest text-emerald-300 mb-1">
+        <div className="rounded-lg border border-border/70 border-l-2 border-l-emerald-600/50 bg-background/60 p-4">
+          <div className="text-caption font-mono uppercase tracking-widest text-emerald-300 mb-1">
             Cost Saved
           </div>
           <div className="text-2xl font-semibold text-emerald-300">
@@ -201,8 +202,8 @@ export default function Savings() {
             </div>
           )}
         </div>
-        <div className="border border-neutral-800 bg-neutral-950/50 p-4">
-          <div className="text-[10px] font-mono uppercase tracking-widest text-neutral-400/70 mb-1">
+        <div className="rounded-lg border border-border/70 bg-background/60 p-4">
+          <div className="text-caption font-mono uppercase tracking-widest text-neutral-400/70 mb-1">
             Actual Cost
           </div>
           <div className="text-2xl font-semibold text-neutral-200">
@@ -216,8 +217,8 @@ export default function Savings() {
                 : `live estimate ${fmtUsd(data.live_saved_usd ?? 0)}`}
           </div>
         </div>
-        <div className="border border-neutral-800 bg-neutral-950/50 p-4">
-          <div className="text-[10px] font-mono uppercase tracking-widest text-neutral-400/70 mb-1">
+        <div className="rounded-lg border border-border/70 bg-background/60 p-4">
+          <div className="text-caption font-mono uppercase tracking-widest text-neutral-400/70 mb-1">
             Calls Saved
           </div>
           <div className="text-2xl font-semibold text-neutral-200">
@@ -235,8 +236,8 @@ export default function Savings() {
                 : "0 tracked calls yet"}
           </div>
         </div>
-        <div className="border border-neutral-800 bg-neutral-950/50 p-4">
-          <div className="text-[10px] font-mono uppercase tracking-widest text-neutral-400/70 mb-1">
+        <div className="rounded-lg border border-border/70 bg-background/60 p-4">
+          <div className="text-caption font-mono uppercase tracking-widest text-neutral-400/70 mb-1">
             Actual Tool Tokens
           </div>
           <div className="text-2xl font-semibold text-neutral-200">
@@ -246,8 +247,8 @@ export default function Savings() {
             persisted compacted tool-output tokens
           </div>
         </div>
-        <div className="border border-teal-900/60 bg-teal-950/30 p-4">
-          <div className="text-[10px] font-mono uppercase tracking-widest text-teal-300 mb-1">
+        <div className="rounded-lg border border-border/70 border-l-2 border-l-teal-600/50 bg-background/60 p-4">
+          <div className="text-caption font-mono uppercase tracking-widest text-teal-300 mb-1">
             Read Savings
           </div>
           <div className="text-2xl font-semibold text-teal-300">
@@ -257,11 +258,11 @@ export default function Savings() {
             cache-read / retrieval cost avoided
           </div>
         </div>
-        <div className="rounded-lg border border-neutral-800/70 bg-neutral-900/60 p-4">
-          <div className="mb-1 text-[10px] font-medium text-neutral-500">
+        <div className="rounded-lg border border-border/70 bg-muted/60 p-4">
+          <div className="mb-1 text-caption font-medium text-muted-foreground">
             Context Carry
           </div>
-          <div className="text-2xl font-semibold text-neutral-100">
+          <div className="text-2xl font-semibold text-foreground">
             {fmtUsd(data.carry_usd ?? 0)}
           </div>
           <div className="text-xs text-neutral-400 mt-1">
@@ -271,7 +272,7 @@ export default function Savings() {
       </section>
 
       {(data.unpriced_cache_write_tokens ?? 0) > 0 && (
-        <section className="border border-amber-900/50 bg-amber-950/20 p-4 text-xs text-neutral-300">
+        <section className="rounded-lg border border-border/70 border-l-2 border-l-amber-600/50 bg-background/60 p-4 text-xs text-neutral-300">
           <span className="font-mono uppercase tracking-widest text-amber-300 mr-2">
             Cost Note
           </span>
@@ -291,15 +292,15 @@ export default function Savings() {
           description={
             <>
               Run any task with{" "}
-              <code className="bg-neutral-900 px-1">lc mcp</code> enabled to
+              <code className="bg-muted px-1">lc mcp</code> enabled to
               start collecting savings telemetry.
             </>
           }
         />
       ) : (
         <>
-          <section className="border border-neutral-800 bg-neutral-950/70 p-5">
-            <h2 className="text-xs uppercase tracking-widest font-mono text-neutral-400 mb-4">
+          <section className="rounded-lg border border-border/70 bg-background/60 p-4">
+            <h2 className="text-xs uppercase tracking-widest text-neutral-400 mb-4">
               Per-lever savings
             </h2>
             <div className="space-y-4">
@@ -317,13 +318,13 @@ export default function Savings() {
           <SavingsTimeChart data={data.by_day} windowDays={data.window_days} />
 
           {latestBenchmark && (
-            <section className="border border-cyan-900/50 bg-cyan-950/20 p-5">
-              <h2 className="text-xs uppercase tracking-widest font-mono text-cyan-300 mb-4">
+            <section className="rounded-lg border border-border/70 border-l-2 border-l-cyan-600/45 bg-background/60 p-4">
+              <h2 className="text-xs uppercase tracking-widest text-cyan-300 mb-4">
                 Latest paired benchmark
               </h2>
               <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
                 <div>
-                  <div className="text-[10px] uppercase tracking-widest text-neutral-400">
+                  <div className="text-caption uppercase tracking-widest text-neutral-400">
                     Token reduction
                   </div>
                   <div className="text-2xl font-semibold text-cyan-200">
@@ -331,7 +332,7 @@ export default function Savings() {
                   </div>
                 </div>
                 <div>
-                  <div className="text-[10px] uppercase tracking-widest text-neutral-400">
+                  <div className="text-caption uppercase tracking-widest text-neutral-400">
                     Cost saved
                   </div>
                   <div className="text-2xl font-semibold text-emerald-300">
@@ -339,7 +340,7 @@ export default function Savings() {
                   </div>
                 </div>
                 <div>
-                  <div className="text-[10px] uppercase tracking-widest text-neutral-400">
+                  <div className="text-caption uppercase tracking-widest text-neutral-400">
                     Tasks
                   </div>
                   <div className="text-2xl font-semibold text-neutral-200">
@@ -347,7 +348,7 @@ export default function Savings() {
                   </div>
                 </div>
                 <div>
-                  <div className="text-[10px] uppercase tracking-widest text-neutral-400">
+                  <div className="text-caption uppercase tracking-widest text-neutral-400">
                     Success
                   </div>
                   <div className="text-2xl font-semibold text-neutral-200">
@@ -365,13 +366,13 @@ export default function Savings() {
           )}
 
           {topSources.length > 0 && (
-            <section className="border border-neutral-800 bg-neutral-950/70 p-5">
-              <h2 className="text-xs uppercase tracking-widest font-mono text-neutral-400 mb-4">
+            <section className="rounded-lg border border-border/70 bg-background/60 p-4">
+              <h2 className="text-xs uppercase tracking-widest text-neutral-400 mb-4">
                 Top savings sources
               </h2>
               <div className="overflow-x-auto">
                 <table className="w-full text-left text-xs">
-                  <thead className="text-[10px] uppercase tracking-widest text-neutral-400">
+                  <thead className="text-caption uppercase tracking-widest text-neutral-400">
                     <tr>
                       <th className="pb-2 pr-4">Lever</th>
                       <th className="pb-2 pr-4">Tool</th>
@@ -415,13 +416,13 @@ export default function Savings() {
           )}
 
           {toolAggregates.length > 0 && (
-            <section className="border border-neutral-800 bg-neutral-950/70 p-5">
-              <h2 className="text-xs uppercase tracking-widest font-mono text-neutral-400 mb-4">
+            <section className="rounded-lg border border-border/70 bg-background/60 p-4">
+              <h2 className="text-xs uppercase tracking-widest text-neutral-400 mb-4">
                 Per-tool cost proof
               </h2>
               <div className="overflow-x-auto">
                 <table className="w-full text-left text-xs">
-                  <thead className="text-[10px] uppercase tracking-widest text-neutral-400">
+                  <thead className="text-caption uppercase tracking-widest text-neutral-400">
                     <tr>
                       <th className="pb-2 pr-4">Tool</th>
                       <th className="pb-2 pr-4">Lever</th>
@@ -481,7 +482,7 @@ export default function Savings() {
           {sessionProof.length > 0 && (
             <section className="space-y-4">
               <div>
-                <h2 className="text-xs uppercase tracking-widest font-mono text-neutral-400 mb-2">
+                <h2 className="text-xs uppercase tracking-widest text-neutral-400 mb-2">
                   Session proof
                 </h2>
                 <p className="text-xs text-neutral-400">
@@ -505,17 +506,17 @@ export default function Savings() {
           )}
 
           {coverageGaps.length > 0 && (
-            <section className="border border-red-900/40 bg-red-950/10 p-5">
-              <h2 className="text-xs uppercase tracking-widest font-mono text-red-300 mb-4">
+            <section className="rounded-lg border border-border/70 border-l-2 border-l-red-600/45 bg-background/60 p-4">
+              <h2 className="text-xs uppercase tracking-widest text-red-300 mb-4">
                 Coverage gaps
               </h2>
               <div className="space-y-3">
                 {coverageGaps.map((gap) => (
                   <div
                     key={gap.session_id}
-                    className="border border-red-900/20 bg-neutral-950/40 p-4"
+                    className="rounded-md border border-border/70 border-l-2 border-l-red-600/45 bg-background/60 p-4"
                   >
-                    <div className="flex flex-wrap items-center gap-2 mb-2 text-[10px] font-mono uppercase tracking-widest">
+                    <div className="flex flex-wrap items-center gap-2 mb-2 text-caption font-mono uppercase tracking-widest">
                       <span className="px-2 py-0.5 border border-red-500/40 text-red-300">
                         {gap.agent}
                       </span>
@@ -553,10 +554,10 @@ function ManualVerificationPanel({
     verification.compact_output_saved_tokens ?? 0;
 
   return (
-    <section className="border border-amber-900/40 bg-amber-950/10 p-5 space-y-4">
+    <section className="rounded-lg border border-border/70 border-l-2 border-l-amber-600/45 bg-background/60 p-4 space-y-4">
       <div className="flex flex-col xl:flex-row xl:items-start xl:justify-between gap-4">
         <div>
-          <h2 className="text-xs uppercase tracking-widest font-mono text-amber-300 mb-2">
+          <h2 className="text-xs uppercase tracking-widest text-amber-300 mb-2">
             Manual verification
           </h2>
           <p className="text-sm text-neutral-300 leading-relaxed max-w-3xl">
@@ -566,7 +567,7 @@ function ManualVerificationPanel({
           </p>
         </div>
         {verification.warning && (
-          <div className="max-w-xl border border-amber-700/40 bg-neutral-950/50 p-3 text-xs text-amber-200 leading-relaxed">
+          <div className="max-w-xl rounded-lg border border-border/70 border-l-2 border-l-amber-600/50 bg-background/60 p-3 text-xs text-amber-200 leading-relaxed">
             {verification.warning}
           </div>
         )}
@@ -600,8 +601,8 @@ function ManualVerificationPanel({
       </div>
 
       {compactOutputRows > 0 && (
-        <div className="border border-neutral-800 bg-neutral-950/50 p-4 space-y-2">
-          <div className="text-[10px] font-mono uppercase tracking-widest text-neutral-400">
+        <div className="rounded-lg border border-border/70 bg-background/60 p-4 space-y-2">
+          <div className="text-caption font-mono uppercase tracking-widest text-neutral-400">
             Excluded Compact Output Rows
           </div>
           <div className="text-lg font-semibold text-cyan-200">
@@ -618,8 +619,8 @@ function ManualVerificationPanel({
       )}
 
       <div className="grid xl:grid-cols-2 gap-3">
-        <div className="border border-neutral-800 bg-neutral-950/50 p-4 space-y-2">
-          <div className="text-[10px] font-mono uppercase tracking-widest text-neutral-400">
+        <div className="rounded-lg border border-border/70 bg-background/60 p-4 space-y-2">
+          <div className="text-caption font-mono uppercase tracking-widest text-neutral-400">
             Dominant Session
           </div>
           {dominantRun ? (
@@ -648,8 +649,8 @@ function ManualVerificationPanel({
           )}
         </div>
 
-        <div className="border border-neutral-800 bg-neutral-950/50 p-4 space-y-2">
-          <div className="text-[10px] font-mono uppercase tracking-widest text-neutral-400">
+        <div className="rounded-lg border border-border/70 bg-background/60 p-4 space-y-2">
+          <div className="text-caption font-mono uppercase tracking-widest text-neutral-400">
             Largest Proof Row
           </div>
           {dominantItem ? (
@@ -720,10 +721,10 @@ function SessionProofCard({
       : "This session only has persisted context-budget rows. No live ledger or imported trace survived, so detailed proof beyond the token rows cannot be reconstructed.";
 
   return (
-    <article className="border border-neutral-800 bg-neutral-950/70 p-5 space-y-4">
+    <article className="rounded-lg border border-border/70 bg-background/60 p-4 space-y-4">
       <div className="flex flex-col xl:flex-row xl:items-start xl:justify-between gap-4">
         <div className="space-y-2 min-w-0">
-          <div className="flex flex-wrap items-center gap-2 text-[10px] font-mono uppercase tracking-widest">
+          <div className="flex flex-wrap items-center gap-2 text-caption font-mono uppercase tracking-widest">
             <span
               className={`px-2 py-0.5 border ${statusTone(session.status)}`}
             >
@@ -754,10 +755,10 @@ function SessionProofCard({
               </span>
             ))}
           </div>
-          <div className="text-sm text-neutral-100 break-words">
+          <div className="text-sm text-foreground break-words">
             {session.task}
           </div>
-          <div className="text-[10px] font-mono text-neutral-400 break-all">
+          <div className="text-caption font-mono text-neutral-400 break-all">
             Session: {session.session_id}
           </div>
           {session.note && (
@@ -783,7 +784,7 @@ function SessionProofCard({
 
       <div className="overflow-x-auto">
         <table className="w-full text-left text-xs">
-          <thead className="text-[10px] uppercase tracking-widest text-neutral-400">
+          <thead className="text-caption uppercase tracking-widest text-neutral-400">
             <tr>
               <th className="pb-2 pr-4">Turn</th>
               <th className="pb-2 pr-4">Tool</th>
@@ -828,22 +829,23 @@ function SessionProofCard({
       </div>
 
       <div className="flex flex-wrap items-center gap-3">
-        <button
+        <UiButton
           type="button"
           onClick={onToggle}
-          className="text-[11px] px-2.5 py-1 border border-neutral-700 text-neutral-300 hover:text-cyan-300 hover:border-cyan-500/50 transition"
+          size="xs"
+          variant="outline"
         >
           {expanded ? "Hide evidence details" : "Inspect evidence details"}
-        </button>
+        </UiButton>
         {session.has_ledger && (
-          <span className="text-[10px] font-mono uppercase tracking-widest text-neutral-400">
+          <span className="text-caption font-mono uppercase tracking-widest text-neutral-400">
             stored ledger available
           </span>
         )}
       </div>
 
       {expanded && (
-        <div className="border border-neutral-900 bg-neutral-950/60 p-4 space-y-4">
+        <div className="rounded-lg border border-border/70 bg-background/60 p-4 space-y-4">
           {loading && (
             <div className="text-xs text-neutral-400">
               Loading ledger proof…
@@ -855,8 +857,8 @@ function SessionProofCard({
           {!loading && !ledger?.error && (
             <>
               {!hasEvidence ? (
-                <div className="border border-amber-900/40 bg-amber-950/10 p-4 space-y-2 text-xs">
-                  <div className="text-[10px] font-mono uppercase tracking-widest text-amber-300">
+                <div className="rounded-lg border border-border/70 border-l-2 border-l-amber-600/50 bg-background/60 p-4 space-y-2 text-xs">
+                  <div className="text-caption font-mono uppercase tracking-widest text-amber-300">
                     Capture gap
                   </div>
                   <div className="text-neutral-200">
@@ -875,7 +877,7 @@ function SessionProofCard({
               ) : (
                 <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 text-xs">
                   <div>
-                    <div className="text-[10px] font-mono uppercase tracking-widest text-neutral-400 mb-2">
+                    <div className="text-caption font-mono uppercase tracking-widest text-neutral-400 mb-2">
                       Tool calls
                     </div>
                     <div className="space-y-2">
@@ -889,7 +891,7 @@ function SessionProofCard({
                           .map((tool: any, index: number) => (
                             <div
                               key={`${tool.name}:${index}`}
-                              className="border border-neutral-900 p-2"
+                              className="rounded-md border border-border/70 p-2"
                             >
                               <div className="text-cyan-200 font-semibold">
                                 {tool.name}
@@ -909,7 +911,7 @@ function SessionProofCard({
                   </div>
 
                   <div>
-                    <div className="text-[10px] font-mono uppercase tracking-widest text-neutral-400 mb-2">
+                    <div className="text-caption font-mono uppercase tracking-widest text-neutral-400 mb-2">
                       Commands
                     </div>
                     <div className="space-y-2">
@@ -928,7 +930,7 @@ function SessionProofCard({
                             return (
                               <div
                                 key={`${commandText}:${index}`}
-                                className="border border-neutral-900 p-2"
+                                className="rounded-md border border-border/70 p-2"
                               >
                                 <div className="font-mono text-neutral-300 break-all">
                                   {truncate(commandText, 140)}
@@ -941,7 +943,7 @@ function SessionProofCard({
                   </div>
 
                   <div>
-                    <div className="text-[10px] font-mono uppercase tracking-widest text-neutral-400 mb-2">
+                    <div className="text-caption font-mono uppercase tracking-widest text-neutral-400 mb-2">
                       Conversation / LLM response
                     </div>
                     <div className="space-y-2">
@@ -956,9 +958,9 @@ function SessionProofCard({
                           .map((entry: any, index: number) => (
                             <div
                               key={`${entry.kind}:${index}`}
-                              className="border border-neutral-900 p-2"
+                              className="rounded-md border border-border/70 p-2"
                             >
-                              <div className="text-[10px] font-mono uppercase tracking-widest text-neutral-400">
+                              <div className="text-caption font-mono uppercase tracking-widest text-neutral-400">
                                 {entry.kind}
                               </div>
                               <div className="mt-1 text-neutral-200 leading-relaxed">
@@ -986,8 +988,8 @@ function SessionProofCard({
 
 function Metric({ label, value }: { label: string; value: string }) {
   return (
-    <div className="border border-neutral-900 bg-neutral-950/40 p-3">
-      <div className="text-[10px] font-mono uppercase tracking-widest text-neutral-400 mb-1">
+    <div className="rounded-md border border-border/70 bg-background/60 p-3">
+      <div className="text-caption font-mono uppercase tracking-widest text-neutral-400 mb-1">
         {label}
       </div>
       <div className="text-sm font-semibold text-neutral-200">{value}</div>

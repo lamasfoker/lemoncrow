@@ -18,6 +18,24 @@
         "bash": "python3 __HOOKS_DIR__/stop.py",
         "timeout": 30
       }
+    ],
+    "userPromptSubmitted": [
+      {
+        "bash": "python3 __HOOKS_DIR__/user_prompt.py",
+        "timeout": 10
+      }
+    ],
+    "sessionEnd": [
+      {
+        "bash": "python3 __HOOKS_DIR__/session_end.py",
+        "timeout": 10
+      }
+    ],
+    "postToolUse": [
+      {
+        "bash": "python3 __HOOKS_DIR__/post_tool_use.py",
+        "timeout": 10
+      }
     ]
   }
 }

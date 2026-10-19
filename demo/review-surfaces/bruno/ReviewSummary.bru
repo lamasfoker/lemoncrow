@@ -1,0 +1,18 @@
+meta {
+  name: Review summary
+  type: http
+  seq: 4
+}
+
+get {
+  url: {{baseUrl}}/api/reviews/summary
+  body: none
+  auth: none
+}
+
+tests {
+  test("counts stale marks", function() {
+    expect(res.status).to.equal(200);
+    expect(res.body.stale_marks).to.equal(1);
+  });
+}

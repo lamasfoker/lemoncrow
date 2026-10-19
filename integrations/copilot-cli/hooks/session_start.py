@@ -44,7 +44,7 @@ def _session_savings_path(workspace: str) -> Path:
     return Path(workspace) / ".lemoncrow" / "workspace" / "session_savings.jsonl"
 
 
-def _write_session_state_bridge(workspace: str, session_id: str) -> None:
+def _write_session_state_bridge(workspace: str, session_id: str, *, activity: str = "") -> None:
     """Refresh workspaces/<hash>/session_state.json with the live session id.
 
     Copilot CLI does not set GITHUB_COPILOT_SESSION_ID for the MCP server
@@ -65,12 +65,18 @@ def _write_session_state_bridge(workspace: str, session_id: str) -> None:
             state = {}
     except (OSError, json.JSONDecodeError):
         state = {}
-    if state.get("session_id") == session_id and state.get("host") == "copilot":
+    if (
+        state.get("session_id") == session_id
+        and state.get("host") == "copilot"
+        and (not activity or state.get("activity") == activity)
+    ):
         return
     state["session_id"] = session_id
     # Host stamp: the MCP bridge fallback only trusts this shared slot when the
     # stamp matches the reading server's host.
     state["host"] = "copilot"
+    if activity:
+        state["activity"] = activity
     try:
         state_path.parent.mkdir(parents=True, exist_ok=True)
         state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
@@ -92,7 +98,7 @@ def main() -> None:
     )
 
     session_id = str(payload.get("sessionId") or os.environ.get("GITHUB_COPILOT_SESSION_ID", "") or "").strip()
-    _write_session_state_bridge(workspace, session_id)
+    _write_session_state_bridge(workspace, session_id, activity="idle")
 
     path = _session_savings_path(workspace)
     try:

@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
 from lemoncrow.pro.capabilities.swarm.capability import build_swarm_spec_payload
 from lemoncrow.pro.capabilities.swarm.fitness import (
     FitnessSpec,
@@ -18,20 +16,17 @@ from lemoncrow.pro.capabilities.swarm.models import SwarmChildState, SwarmRunSta
 from lemoncrow.pro.capabilities.swarm.reducers import WaveContext, get_reducer
 
 
-@pytest.mark.parametrize(
-    ("stdout", "exit_code", "spec", "expected"),
-    [
+def test_parse_metric_modes() -> None:
+    for stdout, exit_code, spec, expected in [
         ('{"savings_pct": 53.5, "correct": true}', 0, "json:savings_pct", 53.5),
         ('logs...\n{"a": {"b": [1, 2, 7]}}', 0, "json:a.b.2", 7.0),
         ("final cost = 3.14 usd", 0, "stdout_float", 3.14),
-        ("savings=42% of base", 0, r"regex:savings=(\d+)", 42.0),
+        ("savings=42% of base", 0, "regex:savings=(\\d+)", 42.0),
         ("", 5, "exit_code", 5.0),
-    ],
-)
-def test_parse_metric_modes(stdout: str, exit_code: int, spec: str, expected: float) -> None:
-    value, err = parse_metric(stdout, exit_code, spec)
-    assert err == ""
-    assert value == expected
+    ]:
+        value, err = parse_metric(stdout, exit_code, spec)
+        assert err == ""
+        assert value == expected
 
 
 def test_parse_metric_reports_errors() -> None:

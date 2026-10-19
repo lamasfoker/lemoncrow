@@ -25,7 +25,12 @@ What is derived here, and why each row exists:
 ``embedding``
     A deterministic hashed bag-of-terms vector. Stdlib only, no model weights,
     no download -- the thin-client design forbids both on the client and this
-    server has no business pulling a model at import time either.
+    server has no business pulling a model at import time either. It is a
+    neutral, content-keyed storage row; public queries never score it.
+``semantic_units``
+    Always empty here. Symbol/chunk retrieval units, their embeddings and
+    semantic scoring are private advanced code intelligence (see
+    :mod:`.semantic`); the private layer derives and stores them lazily.
 
 Comments and string literals are blanked before definitions and references are
 read, so a ``def`` inside a docstring is not a definition and a word inside a
@@ -38,6 +43,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import operator
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -52,6 +58,7 @@ __all__ = [
     "LexicalQuery",
     "ParserProfile",
     "analyze",
+    "analyze_foreground",
     "cosine",
     "embed_terms",
     "idf_weight",
@@ -107,6 +114,10 @@ class ParserProfile:
     quotes: tuple[str, ...]
     read_imports: Callable[[str], tuple[ImportRef, ...]]
     is_exported: Callable[[str, str], bool]
+    structural: bool = False
+    #: Whether a semantic engine, when installed, derives symbol/chunk units for
+    #: this profile. Public analysis never derives them itself.
+    semantic_units: bool = False
 
 
 # --------------------------------------------------------------------------- #
@@ -191,7 +202,11 @@ _PY_FROM: Final[re.Pattern[str]] = re.compile(
     re.MULTILINE,
 )
 _ECMA_IMPORT: Final[re.Pattern[str]] = re.compile(
-    r"""^[ \t]*(?:import|export)[ \t]+(?:([^'";]*?)[ \t]+from[ \t]+)?['"]([^'"]+)['"]""",
+    r"""^[ \t]*import[ \t]+(?:([^'";\n]*?)[ \t]+from[ \t]+)?['"]([^'"\n]+)['"]""",
+    re.MULTILINE,
+)
+_ECMA_EXPORT_FROM: Final[re.Pattern[str]] = re.compile(
+    r"""^[ \t]*export[ \t]+((?:type[ \t]+)?(?:\{[^}\n]*\}|\*(?:[ \t]+as[ \t]+[A-Za-z_]\w*)?))[ \t]+from[ \t]+['"]([^'"\n]+)['"]""",
     re.MULTILINE,
 )
 _ECMA_REQUIRE: Final[re.Pattern[str]] = re.compile(r"""require\([ \t]*['"]([^'"]+)['"]""")
@@ -270,13 +285,19 @@ def _ecma_clause_bindings(clause: str) -> tuple[tuple[str, str], ...]:
 
 
 def _ecma_imports(text: str) -> tuple[ImportRef, ...]:
+    matches: list[tuple[int, str, str]] = []
+    for pattern in (_ECMA_IMPORT, _ECMA_EXPORT_FROM):
+        for match in pattern.finditer(text):
+            matches.append((match.start(), match.group(1) or "", match.group(2)))
+    matches.sort(key=lambda item: item[0])
+
     refs: list[ImportRef] = []
-    for match in _ECMA_IMPORT.finditer(text):
+    for start, clause, module in matches:
         refs.append(
             ImportRef(
-                module=match.group(2),
-                bindings=_ecma_clause_bindings(match.group(1) or ""),
-                line=_line_of(text, match.start()),
+                module=module,
+                bindings=_ecma_clause_bindings(clause),
+                line=_line_of(text, start),
                 level=0,
             )
         )
@@ -470,6 +491,132 @@ PARSER_PROFILES: Final[Mapping[str, ParserProfile]] = {
         read_imports=_rust_uses,
         is_exported=_exported_by_pub,
     ),
+    "python-2": ParserProfile(
+        name="python-2",
+        language="python",
+        extensions=(".py", ".pyi"),
+        definitions=_PYTHON_DEFS,
+        line_comments=("#",),
+        block_comments=(),
+        quotes=('"""', "'''", '"', "'"),
+        read_imports=_python_imports,
+        is_exported=_exported_unless_underscored,
+        structural=True,
+    ),
+    "typescript-2": ParserProfile(
+        name="typescript-2",
+        language="typescript",
+        extensions=(".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"),
+        definitions=_ECMA_DEFS,
+        line_comments=("//",),
+        block_comments=(("/*", "*/"),),
+        quotes=('"', "'", "`"),
+        read_imports=_ecma_imports,
+        is_exported=_exported_by_keyword,
+        structural=True,
+    ),
+    "go-2": ParserProfile(
+        name="go-2",
+        language="go",
+        extensions=(".go",),
+        definitions=_GO_DEFS,
+        line_comments=("//",),
+        block_comments=(("/*", "*/"),),
+        quotes=('"', "`"),
+        read_imports=_go_imports,
+        is_exported=_exported_by_capital,
+        structural=True,
+    ),
+    "rust-2": ParserProfile(
+        name="rust-2",
+        language="rust",
+        extensions=(".rs",),
+        definitions=_RUST_DEFS,
+        line_comments=("//",),
+        block_comments=(("/*", "*/"),),
+        quotes=('"',),
+        read_imports=_rust_uses,
+        is_exported=_exported_by_pub,
+        structural=True,
+    ),
+    "python-3": ParserProfile(
+        name="python-3",
+        language="python",
+        extensions=(".py", ".pyi"),
+        definitions=_PYTHON_DEFS,
+        line_comments=("#",),
+        block_comments=(),
+        quotes=('"""', "'''", '"', "'"),
+        read_imports=_python_imports,
+        is_exported=_exported_unless_underscored,
+        structural=True,
+        semantic_units=True,
+    ),
+    "typescript-3": ParserProfile(
+        name="typescript-3",
+        language="typescript",
+        extensions=(".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"),
+        definitions=_ECMA_DEFS,
+        line_comments=("//",),
+        block_comments=(("/*", "*/"),),
+        quotes=('"', "'", "`"),
+        read_imports=_ecma_imports,
+        is_exported=_exported_by_keyword,
+        structural=True,
+        semantic_units=True,
+    ),
+    "go-3": ParserProfile(
+        name="go-3",
+        language="go",
+        extensions=(".go",),
+        definitions=_GO_DEFS,
+        line_comments=("//",),
+        block_comments=(("/*", "*/"),),
+        quotes=('"', "`"),
+        read_imports=_go_imports,
+        is_exported=_exported_by_capital,
+        structural=True,
+        semantic_units=True,
+    ),
+    "rust-3": ParserProfile(
+        name="rust-3",
+        language="rust",
+        extensions=(".rs",),
+        definitions=_RUST_DEFS,
+        line_comments=("//",),
+        block_comments=(("/*", "*/"),),
+        quotes=('"',),
+        read_imports=_rust_uses,
+        is_exported=_exported_by_pub,
+        structural=True,
+        semantic_units=True,
+    ),
+    "c-3": ParserProfile(
+        name="c-3",
+        language="c",
+        extensions=(".c", ".h"),
+        definitions=_GENERIC_DEFS,
+        line_comments=("//",),
+        block_comments=(("/*", "*/"),),
+        quotes=('"', "'"),
+        read_imports=_no_imports,
+        is_exported=_exported_unless_underscored,
+        structural=True,
+        semantic_units=True,
+    ),
+    "cpp-3": ParserProfile(
+        name="cpp-3",
+        language="cpp",
+        extensions=(".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx"),
+        definitions=_GENERIC_DEFS,
+        line_comments=("//",),
+        block_comments=(("/*", "*/"),),
+        quotes=('"', "'"),
+        read_imports=_no_imports,
+        is_exported=_exported_unless_underscored,
+        structural=True,
+        semantic_units=True,
+    ),
 }
 
 _BY_EXTENSION: Final[Mapping[str, str]] = {
@@ -507,9 +654,22 @@ def resolve_profile(parser_profile: str) -> ParserProfile:
 
 def trigrams_of(text: str, *, limit: int = _MAX_TRIGRAMS) -> tuple[str, ...]:
     """Sorted, deduplicated lowercase 3-grams over non-space runs."""
-    seen: set[str] = set()
     lowered = text.lower()
-    for index in range(len(lowered) - 2):
+    candidates = max(0, len(lowered) - 2)
+    if candidates <= limit:
+        # The cap cannot possibly be reached, so let the set comprehension run
+        # in the interpreter's tight path instead of checking its size after
+        # every character. Large inputs retain the ordered early-stop behavior
+        # below, preserving exactly which grams survive the bound.
+        unique = {
+            gram
+            for index in range(candidates)
+            if "\n" not in (gram := lowered[index : index + 3]) and not gram.isspace()
+        }
+        return tuple(sorted(unique))
+
+    seen: set[str] = set()
+    for index in range(candidates):
         gram = lowered[index : index + 3]
         if "\n" in gram or gram.isspace():
             continue
@@ -517,6 +677,13 @@ def trigrams_of(text: str, *, limit: int = _MAX_TRIGRAMS) -> tuple[str, ...]:
         if len(seen) >= limit:
             break
     return tuple(sorted(seen))
+
+
+def _normalize_embedding_buckets(buckets: Sequence[float]) -> tuple[float, ...]:
+    norm = math.sqrt(sum(value * value for value in buckets))
+    if norm == 0.0:
+        return tuple(buckets)
+    return tuple(round(value / norm, 6) for value in buckets)
 
 
 def embed_terms(terms: Iterable[str], *, dim: int = EMBEDDING_DIM) -> tuple[float, ...]:
@@ -532,10 +699,7 @@ def embed_terms(terms: Iterable[str], *, dim: int = EMBEDDING_DIM) -> tuple[floa
         bucket = digest % dim
         sign = 1.0 if (digest >> 16) & 1 else -1.0
         buckets[bucket] += sign
-    norm = math.sqrt(sum(value * value for value in buckets))
-    if norm == 0.0:
-        return tuple(buckets)
-    return tuple(round(value / norm, 6) for value in buckets)
+    return _normalize_embedding_buckets(buckets)
 
 
 def _term_hash(term: str) -> bytes:
@@ -543,15 +707,41 @@ def _term_hash(term: str) -> bytes:
 
 
 def analyze(digest: str, parser_profile: str, data: bytes) -> AnalysisArtifact:
-    """Derive the Layer-1 artifact for ``data`` under ``parser_profile``."""
+    """Derive the public Layer-1 artifact for ``data`` under ``parser_profile``.
+
+    ``semantic_units`` is always empty here: semantic retrieval units are
+    derived by the private semantic layer and kept beside the artifact through
+    :meth:`~.contracts.AnalysisStore.store_semantic_units`.
+    """
+    return _analyze(digest, parser_profile, data)
+
+
+def analyze_foreground(digest: str, parser_profile: str, data: bytes) -> AnalysisArtifact:
+    """Upload-time derivation; identical to :func:`analyze` (kept for callers)."""
+    return _analyze(digest, parser_profile, data)
+
+
+def _analyze(digest: str, parser_profile: str, data: bytes) -> AnalysisArtifact:
     profile = resolve_profile(parser_profile)
     text = data.decode("utf-8", errors="replace")
     comment_free = _scrub(text, profile, strings=False)
-    scrubbed = _scrub(text, profile, strings=True)
+    structural = None
+    if profile.structural:
+        from .structural import analyze_structural
 
-    definitions = _read_definitions(scrubbed, profile)
-    defined_spans = {(item.start, item.end) for item in definitions}
-    references = _read_references(scrubbed, defined_spans)
+        structural = analyze_structural(data, profile.language)
+    if structural is None:
+        # Legacy/unknown profiles still use the regex reader. Structural
+        # profiles used to run this pass too and then overwrite its results,
+        # paying twice for definitions/references on every cold ingest. The
+        # string-scrubbed copy is likewise needed only by this fallback.
+        scrubbed = _scrub(text, profile, strings=True)
+        definitions = _read_definitions(scrubbed, profile)
+        defined_spans = {(item.start, item.end) for item in definitions}
+        references = _read_references(scrubbed, defined_spans)
+    else:
+        definitions = structural.definitions
+        references = structural.references
     imports = profile.read_imports(comment_free)
     exports = tuple(sorted({item.name for item in definitions if item.exported})[:_MAX_EXPORTS])
 
@@ -712,7 +902,9 @@ def cosine(left: Sequence[float], right: Sequence[float]) -> float:
     """
     if not left or not right or len(left) != len(right):
         return 0.0
-    return round(sum(a * b for a, b in zip(left, right, strict=True)), 6)
+    # The same products summed in the same order as a generator, without its frames.
+    dot: float = sum(map(operator.mul, left, right))
+    return round(dot, 6)
 
 
 def _read_references(scrubbed: str, defined_spans: set[tuple[int, int]]) -> tuple[SymbolRef, ...]:

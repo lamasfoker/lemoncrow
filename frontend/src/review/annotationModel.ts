@@ -16,6 +16,7 @@
  */
 
 import type { Annotation, AnnotationKind, AnnotationSource, DiffSide } from "./types";
+import { agentColors } from "../lib/agentColors";
 
 /** New human comments have three dispositions. `looks_good` remains render-only compatibility. */
 export const KIND_ORDER: AnnotationKind[] = ["comment", "request_change", "suggestion"];
@@ -35,14 +36,46 @@ export const SOURCE_LABELS: Record<AnnotationSource, string> = {
 };
 
 export const SOURCE_ACCENTS: Record<AnnotationSource, string> = {
-  human: "border-sky-900 text-sky-300",
-  author: "border-amber-900 text-amber-300",
+  human: "border-amber-900 text-amber-300",
+  author: "border-violet-900 text-violet-300",
   lemoncrow: "border-emerald-900 text-emerald-300",
   ai_review: "border-violet-900 text-violet-300",
 };
 
 export function annotationSource(annotation: Annotation): AnnotationSource {
   return annotation.source ?? "human";
+}
+
+export function annotationIdentityColor(annotation: Annotation): string {
+  return annotation.created_by_actor === "agent"
+    ? agentColors(annotation.agent_role || "unknown").text
+    : SOURCE_ACCENTS[annotationSource(annotation)].split(" ").at(-1) ?? "text-neutral-400";
+}
+
+export function annotationIdentityLabel(annotation: Annotation): string {
+  const source = annotationSource(annotation);
+  return (source === "author" || source === "ai_review") && annotation.agent_role
+    ? `Agent(${annotation.agent_role})`
+    : SOURCE_LABELS[source];
+}
+
+export function annotationProducerDetail(annotation: Annotation): string {
+  const hosts: Record<string, string> = { claude: "Claude Code", codex: "Codex", opencode: "OpenCode" };
+  return annotation.agent_host
+    ? [hosts[annotation.agent_host] || annotation.agent_host, annotation.agent_model].filter(Boolean).join(" · ")
+    : annotation.source_id || annotation.created_by;
+}
+
+export function annotationProducerTitle(annotation: Annotation): string {
+  return [
+    annotation.source_id && `Session: ${annotation.source_id}`,
+    annotation.parent_session_id && `Parent session: ${annotation.parent_session_id}`,
+    annotation.source_message_id && `Message: ${annotation.source_message_id}`,
+  ].filter(Boolean).join("\n");
+}
+
+export function isUnanchoredComment(annotation: Annotation): boolean {
+  return annotation.comment_scope !== "change" && (annotation.state === "orphaned" || !annotation.anchored);
 }
 
 export function isHumanJudgment(annotation: Annotation): boolean {
@@ -72,7 +105,7 @@ export const KIND_ACCENTS: Record<AnnotationKind, string> = {
 export function anchorAccent(annotation: Annotation): string {
   if (!annotation.anchored) return "border-amber-800 text-amber-300";
   return annotation.anchor_exact
-    ? "border-neutral-800 text-neutral-500"
+    ? "border-border text-muted-foreground"
     : "border-amber-900/70 text-amber-300/80";
 }
 
@@ -92,8 +125,11 @@ export interface Draft {
   kind?: AnnotationKind;
   markTarget?: boolean;
   mode?: "annotation" | "proposal";
-  sourceAction?: "suggest" | "edit";
+  sourceAction?: "suggest" | "edit" | "quick";
   replacementText?: string;
+  /** New-side source already loaded to render the selected range. */
+  selectedText?: string;
+  selectedRevisionId?: string;
   proposalIntent?: string;
   proposalId?: string;
   /** Anchor changed underneath this draft; the human must choose a new one. */
@@ -156,31 +192,52 @@ function annotationMarkerKey(annotation: Annotation): string {
 }
 
 /**
+ * Where the viewer can draw a card for a range: a rendered line of that range,
+ * or 0 when the viewer renders none of it. Never a line outside the range.
+ */
+export type MarkerDisplayLine = (side: DiffSide, startLine: number, endLine: number) => number;
+
+/**
  * One `DiffLineAnnotation` per anchored comment, plus the draft if there is one.
  *
  * Comments ending on the same line collapse to a single marker: `renderAnnotation`
  * is called once per entry, and two entries on one line would draw two
  * overlapping cards. The card itself renders every comment on that line.
+ *
+ * `displayLine` lets the viewer draw a card whose last line is hidden (collapsed
+ * unchanged context) under the last line of its range it does render. Only the
+ * card moves: `metadata.key` stays the comment's own anchor.
+ *
+ * A finding below the finding threshold (`below_threshold`) gets no marker: a
+ * marker is surfacing, and the threshold decides what is surfaced. It stays
+ * readable behind the "N below threshold" disclosure of the lists, and inside
+ * the card of a surfaced comment that shares its line.
  */
 export function markerLines(
   annotations: Annotation[],
   path: string,
   draft: Draft | null,
+  displayLine?: MarkerDisplayLine,
 ): { side: DiffSide; lineNumber: number; metadata: { key: string } }[] {
-  const seen = new Set<string>();
-  const out: { side: DiffSide; lineNumber: number; metadata: { key: string } }[] = [];
+  const groups = new Map<string, { side: DiffSide; startLine: number; endLine: number }>();
+  const add = (key: string, side: DiffSide, startLine: number, endLine: number) => {
+    const group = groups.get(key);
+    if (group) group.startLine = Math.max(group.startLine, Math.min(startLine, endLine));
+    else groups.set(key, { side, startLine: Math.min(startLine, endLine), endLine: anchorLine(startLine, endLine) });
+  };
   for (const annotation of partition(annotations, path).anchored) {
-    if (annotation.file_level || annotation.start_line < 1) continue;
-    const side = markerSide(annotation.side);
-    const key = annotationMarkerKey(annotation);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push({ side, lineNumber: anchorLine(annotation.start_line, annotation.end_line), metadata: { key } });
+    if (annotation.file_level || annotation.start_line < 1 || annotation.below_threshold) continue;
+    add(annotationMarkerKey(annotation), markerSide(annotation.side), annotation.start_line, annotation.end_line);
   }
   if (draft && draft.path === path && !draft.fileLevel && draft.startLine > 0) {
-    const key = draftMarkerKey(draft);
-    if (!seen.has(key)) out.push({ side: draft.side, lineNumber: anchorLine(draft.startLine, draft.endLine), metadata: { key } });
+    add(draftMarkerKey(draft), draft.side, draft.startLine, draft.endLine);
   }
+  const out = [...groups].map(([key, group]) => ({
+    side: group.side,
+    // A card shared by several ranges stays inside every one of them.
+    lineNumber: displayLine?.(group.side, group.startLine, group.endLine) || group.endLine,
+    metadata: { key },
+  }));
   return out.sort((a, b) => a.lineNumber - b.lineNumber || a.side.localeCompare(b.side));
 }
 
@@ -205,7 +262,7 @@ export function commentsAt(annotations: Annotation[], path: string, key: string)
  */
 export function markerSignature(annotations: Annotation[], path: string, draft: Draft | null): string {
   const parts = partition(annotations, path)
-    .anchored.map((item) => `${item.id}@${markerSide(item.side)}:${item.start_line}-${item.end_line}:${item.state}:${item.kind}`)
+    .anchored.map((item) => `${item.id}@${markerSide(item.side)}:${item.start_line}-${item.end_line}:${item.state}:${item.kind}${item.below_threshold ? ":below" : ""}`)
     .sort();
   const replies = annotations.filter((item) => item.parent_id && item.path === path).length;
   const drafted = draft && draft.path === path ? `${draft.side}:${draft.startLine}-${draft.endLine}` : "";

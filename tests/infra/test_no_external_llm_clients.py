@@ -36,7 +36,6 @@ ALLOWED_PROVIDER_IMPORTS = {
     },
     "httpx": {
         Path("src/lemoncrow/infra/embeddings/openai_embedder.py"),
-        Path("src/lemoncrow/infra/ipc/httpx_uds.py"),
     },
 }
 

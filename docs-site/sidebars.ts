@@ -18,6 +18,16 @@ const sidebars: SidebarsConfig = {
         },
         {
           type: "doc",
+          id: "setup/pro-hosted-runtime",
+          label: "LemonCrow Pro: Hosted Runtime",
+        },
+        {
+          type: "doc",
+          id: "setup/hosted-review",
+          label: "Hosted Review: administrator guide",
+        },
+        {
+          type: "doc",
           id: "setup/privacy",
         },
         {
@@ -96,11 +106,15 @@ const sidebars: SidebarsConfig = {
         },
         {
           type: "doc",
-          id: "reference/architecture",
+          id: "reference/review",
         },
         {
           type: "doc",
-          id: "reference/openai-gateway",
+          id: "reference/review-walkthrough",
+        },
+        {
+          type: "doc",
+          id: "reference/architecture",
         },
       ],
     },
@@ -161,10 +175,6 @@ const sidebars: SidebarsConfig = {
         {
           type: "doc",
           id: "operations/production-readiness",
-        },
-        {
-          type: "doc",
-          id: "operations/maintenance-mode-transition",
         },
       ],
     },

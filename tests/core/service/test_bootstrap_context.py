@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from lemoncrow.core.service.bootstrap_context import (
     _render_architecture_sketch,
     build_bootstrap_plan,
@@ -39,6 +41,7 @@ def _write_fixture_repo(root: Path) -> None:
     )
 
 
+@pytest.mark.private_engine
 def test_cold_repo_plans_and_persists_expected_bootstrap_blocks(tmp_path: Path) -> None:
     repo_root = tmp_path / "repo"
     store_root = tmp_path / ".lemoncrow"
@@ -56,6 +59,7 @@ def test_cold_repo_plans_and_persists_expected_bootstrap_blocks(tmp_path: Path) 
     assert "python" in blocks[3].value
 
 
+@pytest.mark.private_engine
 def test_bootstrap_plan_is_deterministic_and_does_not_embed_or_summarize(
     tmp_path: Path,
 ) -> None:
@@ -68,6 +72,7 @@ def test_bootstrap_plan_is_deterministic_and_does_not_embed_or_summarize(
     assert first.model_dump(mode="json") == second.model_dump(mode="json")
 
 
+@pytest.mark.private_engine
 def test_partial_bootstrap_metadata_allows_retry_without_rewriting_completed_blocks(tmp_path: Path) -> None:
     repo_root = tmp_path / "repo"
     store_root = tmp_path / ".lemoncrow"

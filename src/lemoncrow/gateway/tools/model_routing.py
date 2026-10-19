@@ -23,6 +23,7 @@ from lemoncrow.infra.runtime.run_ledger import RunLedger
 from lemoncrow.pro.capabilities.cross_vendor_routing.configuration import RouteConfigError
 from lemoncrow.pro.capabilities.cross_vendor_routing.router import NoFeasibleRouteError
 from lemoncrow.pro.capabilities.model_routing import ModelRouter
+from lemoncrow.pro.capabilities.model_routing.success_predictor import verb_bucket
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +90,39 @@ def persist_legacy_route(
         hooks.write_workspace_state(state)
 
 
+# lc-debt: recency window, not a full-ledger scan; evidence older than this many
+# events is treated as stale. Upgrade path: keep a per-ledger latest-evidence slot.
+_EVIDENCE_LOOKBACK_EVENTS = 64
+
+
+def latest_retrieval_evidence(led: RunLedger) -> dict[str, Any]:
+    """Latest code_search EvidenceState fact in this ledger, as routing shadow input.
+
+    Observation only (IR-5 shadow feed): the fields are attributed on the route
+    decision but no router tier rule reads them yet.
+    """
+    for event in reversed(led.events[-_EVIDENCE_LOOKBACK_EVENTS:]):
+        if event.kind != "note":
+            continue
+        decision = (event.payload or {}).get("runtime_decision")
+        if not isinstance(decision, dict) or decision.get("kind") != "retrieval.evidence_state":
+            continue
+        observed = decision.get("actual")
+        status = str(observed.get("status") or "") if isinstance(observed, dict) else ""
+        if not status:
+            continue
+        evidence: dict[str, Any] = {"retrieval_status": status}
+        confidence = decision.get("confidence")
+        if isinstance(confidence, int | float) and not isinstance(confidence, bool):
+            evidence["retrieval_confidence"] = float(confidence)
+        return evidence
+    return {}
+
+
+def _retrieval_fields(session_state: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: session_state[key] for key in ("retrieval_status", "retrieval_confidence") if key in session_state}
+
+
 def model_recommendation_state(
     hooks: ModelRoutingHooks,
     led: RunLedger,
@@ -125,6 +159,7 @@ def model_recommendation_state(
     expected_input_tokens = max(1_000, int(led.token_count or 0) // max(1, hooks.ledger_turn_count(led)))
     session_state["expected_input_tokens"] = expected_input_tokens
     session_state.setdefault("expected_output_tokens", max(1, int(expected_input_tokens * 0.2)))
+    session_state.update(latest_retrieval_evidence(led))
     return session_state
 
 
@@ -140,6 +175,10 @@ def prepare_model_recommendation(
     current_step = str(session_state.get("workflow_step") or "")
     prior_route, stickiness_remaining = restore_legacy_route(workflow, current_step)
     estimated_input_tokens = max(1_000, int(session_state.get("expected_input_tokens") or 0))
+    retrieval = _retrieval_fields(session_state)
+    # Coarse verb bucket so the closed route outcome can be persisted under the
+    # same learned-routing key the live predictor derives from task text.
+    session_state["task_verb"] = verb_bucket(task_text_from_args(args))
     try:
         decision = hooks.select_owned_execution_route(
             tool_name=tool_name,
@@ -150,7 +189,7 @@ def prepare_model_recommendation(
             runner="",
             session_state=session_state,
         )
-        led.record("route_decision", f"{decision.mode} route for {tool_name}", decision.to_dict())
+        led.record("route_decision", f"{decision.mode} route for {tool_name}", {**decision.to_dict(), **retrieval})
         actual_model = str(getattr(led, "model", "") or os.environ.get("LEMONCROW_MODEL") or "").strip()
         actual_vendor = provider_for_model(actual_model)
         recommendation = {
@@ -183,6 +222,7 @@ def prepare_model_recommendation(
             "estimated_input_tokens": estimated_input_tokens,
             "configured": True,
             **recommendation,
+            **retrieval,
         }
     except (RouteConfigError, NoFeasibleRouteError) as exc:
 
@@ -190,7 +230,7 @@ def prepare_model_recommendation(
             led.record(
                 "route_decision",
                 f"{route_payload.get('decision', 'baseline')} route for {tool_name}",
-                route_payload,
+                {**route_payload, **retrieval},
             )
 
         legacy = ModelRouter().recommend(
@@ -217,6 +257,7 @@ def prepare_model_recommendation(
             "vs_model": "auto",
             "error": str(exc),
             **legacy.to_dict(),
+            **retrieval,
         }
     return payload, session_state, workflow, current_step
 
@@ -318,6 +359,8 @@ def finalize_model_recommendation(
                 "prior_errors": len(led.errors_seen) + len(led.repeated_failures),
                 "session_phase": str(session_state.get("session_phase") or "explore"),
                 "workflow_step": str(session_state.get("workflow_step") or ""),
+                "task_verb": str(session_state.get("task_verb") or "other"),
+                **_retrieval_fields(session_state),
             },
             writer=hooks.make_outcome_writer(led),
         )

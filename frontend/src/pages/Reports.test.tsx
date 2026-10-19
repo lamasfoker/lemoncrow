@@ -67,7 +67,7 @@ describe("Reports page", () => {
 
     renderReports();
     expect(await screen.findByText("codebench")).toBeInTheDocument();
-    expect(screen.getByText("20260920T203438Z")).toBeInTheDocument();
+    expect((await screen.findAllByText("20260920T203438Z")).length).toBeGreaterThan(0);
     expect(await screen.findByRole("heading", { name: "CodeBench" })).toBeInTheDocument();
   });
 });

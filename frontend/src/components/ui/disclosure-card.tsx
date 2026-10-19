@@ -1,5 +1,11 @@
+import * as CollapsiblePrimitive from "@radix-ui/react-collapsible";
 import type { ReactNode } from "react";
+
 import { cn } from "../../lib/utils";
+
+export const Collapsible = CollapsiblePrimitive.Root;
+export const CollapsibleTrigger = CollapsiblePrimitive.Trigger;
+export const CollapsibleContent = CollapsiblePrimitive.Content;
 
 interface DisclosureCardProps {
   open: boolean;
@@ -21,32 +27,30 @@ export function DisclosureCard({
   contentClassName,
 }: DisclosureCardProps) {
   return (
-    <div
+    <Collapsible
+      open={open}
+      onOpenChange={onToggle}
       className={cn(
-        "overflow-hidden rounded-lg border border-neutral-800/70 bg-neutral-900/50 transition-colors",
+        "overflow-hidden rounded-lg border border-border/70 bg-muted/50 transition-colors",
         className
       )}
     >
-      <button
-        type="button"
-        onClick={onToggle}
+      <CollapsibleTrigger
         className={cn(
-          "w-full px-4 py-3 text-left transition-colors hover:bg-neutral-800/50",
+          "w-full px-4 py-3 text-left transition-colors hover:bg-accent/50",
           triggerClassName
         )}
       >
         {header}
-      </button>
-      {open && (
-        <div
-          className={cn(
-            "border-t border-neutral-800 bg-neutral-950/50 px-4 py-3",
-            contentClassName
-          )}
-        >
-          {children}
-        </div>
-      )}
-    </div>
+      </CollapsibleTrigger>
+      <CollapsibleContent
+        className={cn(
+          "border-t border-border bg-background/50 px-4 py-3",
+          contentClassName
+        )}
+      >
+        {children}
+      </CollapsibleContent>
+    </Collapsible>
   );
 }

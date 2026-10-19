@@ -50,7 +50,7 @@ else
 fi
 STAGING_DIR="${HOME}/.lemoncrow/lemoncode"
 
-info()  { echo "[lemoncrow:uninstall:lemoncode] $*"; }
+info()  { echo "[lc:uninstall:lemoncode] $*"; }
 run()   { $DRY_RUN && echo "  [dry-run] $*" || eval "$@"; }
 
 clean_config() {
@@ -95,7 +95,7 @@ if [ -d "$AGENTS_DIR" ]; then
 fi
 
 if [ -d "$PLUGIN_DIR" ]; then
-    for f in "$PLUGIN_DIR"/lemoncrow-nudge.js "$PLUGIN_DIR"/lemoncrow_nudge.py; do
+    for f in "$PLUGIN_DIR"/lemoncrow-nudge.js "$PLUGIN_DIR"/lemoncrow_nudge.py "$PLUGIN_DIR"/.lemoncrow-host; do
         [ -f "$f" ] || continue
         run "rm -f $(printf %q "$f")"
         info "Removed $f"

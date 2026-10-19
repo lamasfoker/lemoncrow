@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="LemonCrow demo mark">
+  <rect width="64" height="64" rx="14" fill="#f3f3f3"/>
+  <path d="M18 18h10v20c0 6 3 8 9 8h9v9H35c-12 0-17-6-17-17V18Z" fill="#111418"/>
+  <path d="M35 15h11v11H35z" fill="#777e88"/>
+</svg>

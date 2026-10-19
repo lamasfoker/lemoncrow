@@ -12,12 +12,21 @@ import re
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from lemoncrow.pro.capabilities.review.surfaces import ReviewSurface, SetupCandidate, SurfaceConfigEntry, SurfaceContext
+from lemoncrow.pro.capabilities.review.surfaces import (
+    ComparisonDescriptor,
+    ReviewSurface,
+    SetupCandidate,
+    SurfaceConfigEntry,
+    SurfaceContext,
+)
 
 _IGNORED_DIRS = frozenset(
     {
         ".git",
         ".jj",
+        ".claude",
+        ".lc-worktrees",
+        ".lemoncrow",
         "node_modules",
         ".venv",
         "venv",
@@ -99,6 +108,11 @@ class WebSurfaceProvider:
 
         surfaces: list[ReviewSurface] = []
         changed_paths = list(context.changed_paths)
+        # ``repo_root`` can be an exact materialized Snapshot workspace and
+        # intentionally contain no .git directory. Use the trusted source
+        # repository, when the composition has one, for immutable Git-tree
+        # route reachability while keeping execution/config bound to repo_root.
+        source_repo = context.dependency_root or context.repo_root
         try:
             from lemoncrow.pro.capabilities.review.snapshot import (
                 frozen_submodule_changed_paths,
@@ -107,7 +121,7 @@ class WebSurfaceProvider:
 
             changed_paths.extend(
                 path
-                for path in frozen_submodule_changed_paths(context.store_root, context.revision)
+                for path in frozen_submodule_changed_paths(context.store_root, context.revision, store=context.store)
                 if path not in changed_paths
             )
             # A clean commit-range submodule bump appears in the parent packet
@@ -125,9 +139,7 @@ class WebSurfaceProvider:
                     continue
                 changed_paths.extend(
                     path
-                    for path in review_submodule_changed_paths(
-                        context.store_root, context.repo_root, context.revision, root
-                    )
+                    for path in review_submodule_changed_paths(context.store_root, source_repo, context.revision, root)
                     if path not in changed_paths
                 )
         except (OSError, ValueError):
@@ -135,7 +147,7 @@ class WebSurfaceProvider:
         for path in changed_paths:
             try:
                 descriptor = infer_web_preview_descriptor(
-                    context.repo_root,
+                    source_repo,
                     context.revision,
                     path,
                     store_root=context.store_root,
@@ -159,12 +171,18 @@ class WebSurfaceProvider:
                         locator=route,
                         runtime=runtime,
                         affected_paths=(path,),
-                        capabilities=("preview", "compare", "source"),
+                        capabilities=("preview", "compare", "source", "auto_compare"),
                         metadata={
                             "framework": descriptor.framework,
                             "root": root,
                             "surface_id": configured.id if configured is not None else "",
                         },
+                        comparison=ComparisonDescriptor(
+                            source="web",
+                            comparator="image",
+                            label="Visual difference",
+                            auto=True,
+                        ),
                     )
                 )
         return tuple(surfaces)
@@ -256,8 +274,22 @@ class BrunoSurfaceProvider:
                     for path in context.changed_paths
                     if any(fnmatch.fnmatch(path, pattern) for pattern in watch_patterns)
                 )
+                if rel not in context.changed_paths and not watched_changes:
+                    # A collection may contain hundreds of endpoints. Discovery
+                    # is a Review projection, not an API browser: only surface
+                    # request definitions changed by this Snapshot, or endpoints
+                    # explicitly connected to changed implementation paths by a
+                    # configured watch pattern.
+                    continue
                 affected_paths = tuple(dict.fromkeys((rel, *watched_changes)))
-                capabilities = ("source", "execute", "results", "compare") if runtime is not None else ("source",)
+                concrete_url_value = url.replace("{{baseUrl}}", "")
+                concrete_url = "{{" not in concrete_url_value and re.search(r"/:([^/?]+)", concrete_url_value) is None
+                safe_auto_compare = runtime is not None and method in {"GET", "HEAD", "OPTIONS"} and concrete_url
+                capabilities = (
+                    ("source", "execute", "results", "compare", "auto_compare")
+                    if safe_auto_compare
+                    else (("source", "execute", "results", "compare") if runtime is not None else ("source",))
+                )
                 surfaces.append(
                     ReviewSurface(
                         id=rel,
@@ -277,6 +309,16 @@ class BrunoSurfaceProvider:
                             "runner": runtime.runner if runtime is not None else "",
                             "runtime_required": runtime is None,
                         },
+                        comparison=(
+                            ComparisonDescriptor(
+                                source="run",
+                                comparator="api-response",
+                                label="API response difference",
+                                auto=safe_auto_compare,
+                            )
+                            if runtime is not None
+                            else None
+                        ),
                     )
                 )
         return tuple(surfaces)

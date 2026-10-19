@@ -26,6 +26,8 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
+from lemoncrow.core.foundation.optional_modules import skip_if_absent
+
 from .gitdiff import (
     MAX_HUNK_PATCH_BYTES,
     BlobPair,
@@ -34,6 +36,7 @@ from .gitdiff import (
     commit_datetime,
     head_symbol_filter,
     load_blobs,
+    source_state,
 )
 from .models import (
     SCHEMA_VERSION,
@@ -42,11 +45,17 @@ from .models import (
     EvidenceRecord,
     ImpactSite,
     IndexStatus,
+    ProvenanceAttribution,
     ProvenanceRecord,
+    ReviewJournalEntry,
     ReviewOrderEntry,
     ReviewPacket,
     unknown_provenance,
 )
+
+#: Its reader of the author's session records, which Runtime writes: a build without it
+#: (the Review-only engine) builds packets with no journal, as when there is no session.
+REVIEW_JOURNAL = "lemoncrow.pro.capabilities.review.journal"
 
 
 def _collect_impact(
@@ -101,6 +110,7 @@ def _collect_provenance(
     head_sha: str,
     head_commit_time: datetime | None,
     session_id: str | None = None,
+    session_id_is_hint: bool = False,
 ) -> tuple[ProvenanceRecord, tuple[EvidenceRecord, ...], tuple[str, ...]]:
     """Return (provenance, evidence records, degraded signals).
 
@@ -121,9 +131,30 @@ def _collect_provenance(
             head_sha=head_sha,
             head_commit_time=head_commit_time,
             session_id=session_id,
+            session_id_is_hint=session_id_is_hint,
         )
     except Exception:
         return unknown_provenance(), (), ("provenance_failed",)
+
+
+def _collect_exact_attributions(
+    store_root: Path,
+    repo_root: Path,
+    packet_paths: Sequence[str],
+    *,
+    head_commit_time: datetime | None,
+) -> tuple[ProvenanceAttribution, ...]:
+    try:
+        from .provenance import collect_exact_file_attributions
+
+        return collect_exact_file_attributions(
+            store_root,
+            repo_root,
+            packet_paths,
+            head_commit_time=head_commit_time,
+        )
+    except Exception:
+        return ()
 
 
 def _link_impact_to_provenance(
@@ -197,6 +228,8 @@ class PacketBuild:
 
     packet: ReviewPacket
     blobs: BlobPair
+    source_fingerprint: str = ""
+    """Exact source identity proven stable across diff/blob capture."""
 
 
 def build_review_packet(
@@ -207,6 +240,7 @@ def build_review_packet(
     with_impact: bool = True,
     with_provenance: bool = True,
     session_id: str | None = None,
+    session_id_is_hint: bool = False,
     context_lines: int = 3,
     limit: int = 40,
     with_patch_text: bool = False,
@@ -233,6 +267,7 @@ def build_review_packet(
         with_impact=with_impact,
         with_provenance=with_provenance,
         session_id=session_id,
+        session_id_is_hint=session_id_is_hint,
         context_lines=context_lines,
         limit=limit,
         with_patch_text=with_patch_text,
@@ -248,6 +283,7 @@ def build_review_packet_with_blobs(
     with_impact: bool = True,
     with_provenance: bool = True,
     session_id: str | None = None,
+    session_id_is_hint: bool = False,
     context_lines: int = 3,
     limit: int = 40,
     with_patch_text: bool = False,
@@ -269,6 +305,7 @@ def build_review_packet_with_blobs(
         with_impact=with_impact,
         with_provenance=with_provenance,
         session_id=session_id,
+        session_id_is_hint=session_id_is_hint,
         context_lines=context_lines,
         limit=limit,
         with_patch_text=with_patch_text,
@@ -323,6 +360,78 @@ def attach_changed_symbols(
             stats=stats,
         ),
         blobs=build.blobs,
+        source_fingerprint=build.source_fingerprint,
+    )
+
+
+def attach_provenance(
+    store_root: Path,
+    repo_root: Path,
+    rng: RevRange,
+    build: PacketBuild,
+    *,
+    session_id: str | None = None,
+    session_id_is_hint: bool = False,
+    limit: int | None = None,
+) -> PacketBuild:
+    """Attach exact author provenance/journal to an already-frozen source packet."""
+
+    packet = build.packet
+    degraded = set(packet.degraded)
+    degraded.discard("provenance_disabled")
+    provenance, evidence, provenance_degraded = _collect_provenance(
+        store_root,
+        repo_root,
+        [item.path for item in packet.files],
+        head_sha=rng.head_sha,
+        head_commit_time=commit_datetime(repo_root, rng.head_sha),
+        session_id=session_id,
+        session_id_is_hint=session_id_is_hint,
+    )
+    degraded.update(provenance_degraded)
+    provenance, impact = _link_impact_to_provenance(provenance, packet.impact)
+    attributions = _collect_exact_attributions(
+        store_root,
+        repo_root,
+        [item.path for item in packet.files],
+        head_commit_time=commit_datetime(repo_root, rng.head_sha),
+    )
+
+    journal: tuple[ReviewJournalEntry, ...] = ()
+    if provenance.certainty == "exact" and provenance.session_id and provenance.host:
+        try:
+            with skip_if_absent(REVIEW_JOURNAL):
+                from .journal import collect_review_journal
+
+                journal = collect_review_journal(
+                    store_root,
+                    repo_root,
+                    provenance,
+                    [item.path for item in packet.files],
+                )
+        except (OSError, TypeError, ValueError):
+            journal = ()
+
+    order = _collect_order(
+        packet.files,
+        packet.symbols,
+        impact,
+        inspected=frozenset(provenance.files_inspected),
+        limit=len(packet.files) if limit is None else max(0, limit),
+    )
+    return PacketBuild(
+        packet=replace(
+            packet,
+            impact=impact,
+            order=order,
+            provenance=provenance,
+            evidence=evidence,
+            journal=journal,
+            attributions=attributions,
+            degraded=tuple(sorted(degraded)),
+        ),
+        blobs=build.blobs,
+        source_fingerprint=build.source_fingerprint,
     )
 
 
@@ -388,6 +497,7 @@ def attach_impact(
             stats=stats,
         ),
         blobs=blobs,
+        source_fingerprint=build.source_fingerprint,
     )
 
 
@@ -399,6 +509,7 @@ def _build(
     with_impact: bool,
     with_provenance: bool,
     session_id: str | None,
+    session_id_is_hint: bool,
     context_lines: int,
     limit: int,
     with_patch_text: bool,
@@ -408,6 +519,7 @@ def _build(
 ) -> PacketBuild:
     """The single composition pass behind both public entry points."""
 
+    captured_source_before = source_state(repo_root, rng) if keep_blobs else None
     if progress is not None:
         progress("diff")
     diff = collect_diff(
@@ -421,12 +533,30 @@ def _build(
     degraded: set[str] = set(diff.degraded)
 
     # One read, whether it feeds the impact pass, the fingerprints, or both.
+    # Supported dependency manifests/lockfiles get a separate bounded allowance
+    # so semantic dependency review can replace generated lockfile churn even
+    # when a lockfile exceeds the generic source-analysis blob cap.
     blobs = BlobPair(old={}, new={}, degraded=())
     if files and (with_impact or keep_blobs):
         if progress is not None:
             progress("source")
-        blobs = load_blobs(repo_root, rng, files)
+        from .dependencies import MAX_SEMANTIC_DEPENDENCY_BYTES, supported_path
+
+        dependency_caps = {
+            item.path: MAX_SEMANTIC_DEPENDENCY_BYTES for item in files if supported_path(item.path) is not None
+        }
+        blobs = load_blobs(repo_root, rng, files, max_bytes_by_path=dependency_caps)
         degraded.update(blobs.degraded)
+
+    source_fingerprint = ""
+    if keep_blobs:
+        captured_source_after = source_state(repo_root, rng)
+        if (
+            captured_source_before is not None
+            and captured_source_before.fingerprint != captured_source_after.fingerprint
+        ):
+            raise ValueError("source changed while Review source bytes were being captured; retry")
+        source_fingerprint = captured_source_after.fingerprint
 
     symbols: tuple[ChangedSymbol, ...] = ()
     impact: tuple[ImpactSite, ...] = ()
@@ -465,12 +595,38 @@ def _build(
             head_sha=rng.head_sha,
             head_commit_time=commit_datetime(repo_root, rng.head_sha),
             session_id=session_id,
+            session_id_is_hint=session_id_is_hint,
         )
         degraded.update(provenance_degraded)
     else:
         degraded.add("provenance_disabled")
 
     provenance, impact = _link_impact_to_provenance(provenance, impact)
+    attributions: tuple[ProvenanceAttribution, ...] = ()
+    if with_provenance and files:
+        attributions = _collect_exact_attributions(
+            store_root,
+            repo_root,
+            [item.path for item in files],
+            head_commit_time=commit_datetime(repo_root, rng.head_sha),
+        )
+
+    journal: tuple[ReviewJournalEntry, ...] = ()
+    if provenance.certainty == "exact" and provenance.session_id and provenance.host:
+        try:
+            with skip_if_absent(REVIEW_JOURNAL):
+                from .journal import collect_review_journal
+
+                journal = collect_review_journal(
+                    store_root,
+                    repo_root,
+                    provenance,
+                    [item.path for item in files],
+                )
+        except (OSError, TypeError, ValueError):
+            # Review journaling is enrichment over an already-complete packet.
+            # A malformed/missing live ledger may never make source review fail.
+            journal = ()
 
     if progress is not None:
         progress("ranking")
@@ -514,14 +670,19 @@ def _build(
         index_status=index_status,
         degraded=tuple(sorted(degraded)),
         stats=stats,
+        journal=journal,
+        attributions=attributions,
+        scope_paths=tuple(rng.paths),
     )
-    return PacketBuild(packet=packet, blobs=blobs)
+    return PacketBuild(packet=packet, blobs=blobs, source_fingerprint=source_fingerprint)
 
 
 __all__ = [
+    "REVIEW_JOURNAL",
     "PacketBuild",
     "attach_changed_symbols",
     "attach_impact",
+    "attach_provenance",
     "build_review_packet",
     "build_review_packet_with_blobs",
 ]

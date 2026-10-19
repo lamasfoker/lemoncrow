@@ -33,9 +33,8 @@ def test_tips_disabled_via_nested_lemoncrow_block(tmp_path: Path) -> None:
     assert _resolve_status_text(tmp_path) == ""
 
 
-def test_login_takes_priority_over_tip(tmp_path: Path) -> None:
-    # No auth.json -> login status wins over any tip.
-    assert _resolve_status_text(tmp_path) == "login"
+def test_tip_does_not_require_account_login(tmp_path: Path) -> None:
+    assert _resolve_status_text(tmp_path) in _STATUS_TIPS
 
 
 def test_status_tip_is_known() -> None:

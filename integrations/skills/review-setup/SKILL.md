@@ -9,7 +9,8 @@ description: "Set up LemonCrow Review surfaces and self-contained execution runt
 Make `lc review` useful for the repository's real product surfaces, not only source diffs. Keep two extension points separate:
 
 - **surface providers** discover *what* a reviewer can inspect (`web`, `bruno`, `service`, custom providers);
-- **runner plugins** own *how* an immutable revision executes (`docker-compose`, `command`, or installed runners such as Node/Python/service runners).
+- **runner plugins** own *how* an immutable revision executes (`docker-compose`, `command`, or installed runners such as Node/Python/service runners);
+- **preview renderers** produce the old/new Snapshot artifacts (image, HTML, text, JSON, download) for a surface whose provider attached a versioned preview descriptor (`storybook`, or installed renderers).
 
 A surface may bind to a runtime by ID. Never put Docker/npm/Python execution logic inside a surface provider.
 
@@ -66,9 +67,15 @@ A surface may bind to a runtime by ID. Never put Docker/npm/Python execution log
        provider: service
        runtime: app-stack
        services: [app, api]
+
+     - id: components
+       provider: storybook
+       root: frontend        # directory containing .storybook/
+       preview:
+         timeout: 180        # seconds; host cap is 300
    ```
 
-   Built-in surface providers are `web`, `bruno`, and `service`. Built-in runners currently include `docker-compose` and bounded `command`. Installed extensions can add providers through `lemoncrow.review_surface_providers` and runners through `lemoncrow.review_runners`.
+   Built-in surface providers are `web`, `bruno`, `service`, and `storybook`. Built-in runners currently include `docker-compose`, bounded `command`, and `http-service`. Installed extensions can add providers through `lemoncrow.review_surface_providers`, runners through `lemoncrow.review_runners`, and preview renderers through `lemoncrow.review_preview_renderers` (see `docs/reference/review-preview-plugins.md`).
 5. Keep every runtime grounded in the captured review revision. Working-tree and staged reviews are supported only when LemonCrow can reconstruct the complete immutable snapshot. Never point Review at today's mutable checkout as a substitute.
 6. Re-run setup validation after edits:
 
@@ -83,7 +90,7 @@ A surface may bind to a runtime by ID. Never put Docker/npm/Python execution log
    lc review --repo-root <repo> --open
    ```
 
-   For UI changes, confirm `Preview | Compare | Source` and affected route selection. For executable surfaces, confirm the surface names its runtime and the result names the runner that executed it.
+   For UI changes, confirm `Preview | Compare | Source` and affected route selection. For executable surfaces, confirm the surface names its runtime and the result names the runner that executed it. For plugin previews (Storybook stories, installed renderers), confirm both sides render or name a specific reason, and that `--setup` reports no plugin `error:` lines.
 
 ## Choosing a runner
 
@@ -126,6 +133,40 @@ surfaces:
     collection: backend/bruno
     runtime: api
 ```
+
+## Browser regression evidence
+
+Review does not run a browser farm. Existing Playwright/browser tests, CI, an external browser agent, or a local hook run the scenario; Review binds the observed result to one exact Snapshot and decides PASS/FAIL only from inspectable checks (completion, assertions, HTTP outcome, console/runtime errors, and a visual threshold only when configured). A reported or model "looks fine" is never PASS.
+
+Declare scenarios in the base branch's `.lemoncrow/review.yaml` (the base governs, so a Change cannot weaken the checks gating it):
+
+```yaml
+browser_checks:
+  trusted_origins: ["https://*.preview.example.com"]   # loopback is always trusted
+  scenarios:
+    - id: checkout
+      title: Checkout regression
+      route: /checkout
+      paths: ["web/src/checkout/*"]   # or omit and match the Web route the Change exposes
+      required: true                    # optional scenarios inform but never block landing
+      viewports: ["1280x800"]
+      visual_threshold: 0.01            # only counts when configured here
+```
+
+Reporters upload screenshots/traces/recordings with `POST /api/reviews/<id>/evidence/upload?revision_id=<snapshot>&kind=screenshot|playwright_trace|video`, then post one run per Snapshot side to `POST /api/reviews/<id>/browser-checks` with `revision_id`, `scenario`, `side` (`new`, or `old` for the baseline), `viewport`, `environment`, `navigation`, `assertions`, `console`, and `artifacts: {screenshot, trace, video}` evidence ids. A Playwright JSON-reporter test result may be passed as `playwright: {status, errors}`. When nothing applicable is configured or reported, Review shows `NOT_RUN` instead of implying coverage.
+
+## Evidence freshness
+
+Some evidence describes the world at the moment it was observed, not the Snapshot: vulnerability scans, live previews, and typed trusted-security-feed attestations. On an unchanged Snapshot, readiness treats such an observation as `UNKNOWN` once it is older than a max-age, and withdraws an armed landing that relied on it. The built-in max-age is 24 hours. The base branch's `.lemoncrow/review.yaml` may shorten it, but never extend it:
+
+```yaml
+evidence_freshness:
+  external_observation_max_age: 6h   # seconds, or 90m / 12h / 7d; longer than 24h has no effect
+```
+
+`external_observation_max_age` is the only key in this section. If the section is invalid (an unknown key, or a duration that cannot be read), it fails closed: every external observation reads as expired and readiness shows the error. It never falls back to the default. A hosted operator policy can shorten the max-age further (`evidence_max_age_seconds`), and the shortest max-age wins. SBOMs, provenance, and test or CI results stay bound to their Snapshot and do not age this way.
+
+The supply-chain readiness condition is satisfied only by a typed trusted-security-feed attestation. A scan verdict uploaded by a human, or one that only names its source, still blocks on a non-PASS result, but its PASS never satisfies the policy. A reviewer can waive the policy on the latest Snapshot with `POST /api/reviews/<id>/verification/waivers` and `{"revision_id", "requirement_key": "supply-chain-policy", "reason"}`. A current FAIL from the feed itself cannot be waived.
 
 ## Guardrails
 

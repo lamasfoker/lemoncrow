@@ -9,12 +9,13 @@ sync-friendliness rules a hosted team service would later need.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import threading
 import time
 from dataclasses import fields, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -25,8 +26,14 @@ from lemoncrow.pro.capabilities.review.session_models import (
     AnnotationAnchor,
     DeliveryRecord,
     DiscardedMark,
+    ReviewAskMessage,
+    ReviewAttribution,
+    ReviewBinding,
+    ReviewCommit,
+    ReviewDeletionTombstone,
     ReviewEvidence,
     ReviewMark,
+    ReviewRelationship,
     ReviewRevision,
     ReviewSession,
     ReviewUnit,
@@ -35,8 +42,12 @@ from lemoncrow.pro.capabilities.review.store import (
     DB_NAME,
     AnnotationHistoryContext,
     AnnotationVersionConflict,
+    DerivedResult,
     ReviewStore,
+    deletion_tombstone_digest,
     new_annotation_id,
+    new_ask_message_id,
+    new_binding_id,
     new_evidence_id,
     new_revision_id,
     new_session_id,
@@ -116,7 +127,24 @@ def test_init_creates_the_file_and_every_required_table(tmp_path: Path) -> None:
     with sqlite3.connect(store.db_path) as conn:
         names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
     assert set(ReviewStore.REQUIRED_TABLES) <= names
-    assert len(ReviewStore.REQUIRED_TABLES) == 17
+    assert len(ReviewStore.REQUIRED_TABLES) == 44
+    assert "review_destinations" in names
+    assert {
+        "review_bindings",
+        "review_commits",
+        "review_relationships",
+        "review_author_guidance",
+        "review_decision_events",
+        "review_plan_syntheses",
+        "review_discussion_comments",
+        "review_comment_imports",
+    } <= set(ReviewStore.REQUIRED_TABLES)
+    assert {
+        "development_sessions",
+        "development_events",
+        "development_projections",
+        "development_snapshots",
+    } <= set(ReviewStore.REQUIRED_TABLES)
     assert {
         "review_participants",
         "review_requests",
@@ -126,6 +154,393 @@ def test_init_creates_the_file_and_every_required_table(tmp_path: Path) -> None:
         "provider_webhook_receipts",
         "provider_operations",
     }.isdisjoint(names)
+
+
+def test_branch_binding_selects_one_active_review_without_erasing_history(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    first = store.create_session(_session(review_base_sha="base-a"))
+    second = store.create_session(_session(review_base_sha="base-b"))
+
+    bound_first = store.bind_subject(
+        ReviewBinding(
+            id=new_binding_id(),
+            repository_identity="repo:alpha",
+            subject_kind="branch",
+            subject_key="refs/heads/feature/map",
+            review_id=first.id,
+            worktree_key="wt-1",
+        )
+    )
+    assert bound_first.active is True
+    assert (
+        store.active_binding(
+            repository_identity="repo:alpha",
+            subject_kind="branch",
+            subject_key="refs/heads/feature/map",
+        )
+        == bound_first
+    )
+
+    bound_second = store.bind_subject(
+        ReviewBinding(
+            id="",
+            repository_identity="repo:alpha",
+            subject_kind="branch",
+            subject_key="refs/heads/feature/map",
+            review_id=second.id,
+            worktree_key="wt-1",
+        )
+    )
+    assert bound_second.review_id == second.id
+    assert (
+        store.active_binding(
+            repository_identity="repo:alpha",
+            subject_kind="branch",
+            subject_key="refs/heads/feature/map",
+        )
+        == bound_second
+    )
+    assert [item.active for item in store.list_bindings(first.id)] == [False]
+    assert [item.active for item in store.list_bindings(second.id)] == [True]
+    assert store.unbind_review(second.id) == 1
+    assert (
+        store.active_binding(
+            repository_identity="repo:alpha",
+            subject_kind="branch",
+            subject_key="refs/heads/feature/map",
+        )
+        is None
+    )
+
+
+def test_commit_checkpoint_round_trips_and_is_idempotent(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    session = store.create_session(_session(review_base_sha="base-a"))
+    revision = store.add_revision(
+        _revision(
+            session.id,
+            capture_kind="commit",
+            commit_sha="abc123",
+            branch_ref="refs/heads/feature/map",
+            worktree_key="wt-1",
+        ),
+        [_unit()],
+    )
+    checkpoint = store.record_commit(
+        ReviewCommit(
+            review_id=session.id,
+            commit_number=0,
+            commit_sha="abc123",
+            revision_id=revision.id,
+            parent_sha="base-a",
+        )
+    )
+    assert checkpoint.commit_number == 1
+    assert store.record_commit(replace(checkpoint, commit_number=0)) == checkpoint
+    assert store.find_commit(session.id, "abc123") == checkpoint
+    assert store.list_commits(session.id) == (checkpoint,)
+    superseded = store.set_commit_state(session.id, "abc123", "superseded")
+    assert superseded is not None and superseded.state == "superseded"
+    assert store.list_commits(session.id, include_superseded=False) == ()
+
+    reopened = ReviewStore(tmp_path)
+    reopened.init()
+    stored_session = reopened.get_session(session.id)
+    stored_revision = reopened.get_revision(revision.id)
+    assert stored_session is not None and stored_session.review_base_sha == "base-a"
+    assert stored_revision is not None
+    assert stored_revision.capture_kind == "commit"
+    assert stored_revision.commit_sha == "abc123"
+    assert stored_revision.branch_ref == "refs/heads/feature/map"
+    assert stored_revision.worktree_key == "wt-1"
+
+
+def test_ask_conversation_and_handoff_survive_reopen(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    session, revision = _seed(store)
+
+    human = store.append_ask_message(
+        ReviewAskMessage(
+            id="",
+            review_id=session.id,
+            revision_id=revision.id,
+            role="human",
+            intent="question",
+            body="Why is this helper needed?",
+            target_unit_key="file:src/app.py",
+            path="src/app.py",
+            symbol="render_app",
+            side="new",
+            start_line=10,
+            end_line=12,
+            context_json=json.dumps(
+                {
+                    "selection": {
+                        "kind": "review_map_node",
+                        "review_id": session.id,
+                        "revision_id": revision.id,
+                        "node_id": "symbol:render_app",
+                        "exactness": "snapshot",
+                    }
+                }
+            ),
+        )
+    )
+    assert human.id.startswith("ram-")
+    assert human.created_at
+
+    assistant = store.append_ask_message(
+        ReviewAskMessage(
+            id=new_ask_message_id(),
+            review_id=session.id,
+            revision_id=revision.id,
+            role="assistant",
+            intent="change_request",
+            body="It is redundant. I can ask the author to remove it.",
+            target_unit_key=human.target_unit_key,
+            path=human.path,
+            symbol=human.symbol,
+            side=human.side,
+            start_line=human.start_line,
+            end_line=human.end_line,
+            references_json=json.dumps([{"path": "src/app.py", "start_line": 10, "end_line": 12}]),
+            action_json=json.dumps({"handoff_instruction": "Remove the redundant helper."}),
+        )
+    )
+
+    rows = store.list_ask_messages(session.id)
+    assert [item.id for item in rows] == [human.id, assistant.id]
+    assert rows[0].symbol == "render_app"
+    assert json.loads(rows[0].context_json)["selection"]["node_id"] == "symbol:render_app"
+    assert rows[1].symbol == "render_app"
+    assert json.loads(rows[1].references_json)[0]["path"] == "src/app.py"
+
+    prepared, created = store.prepare_ask_handoff(
+        assistant.id,
+        operation_id="aop-test",
+        instruction_hash="sha256-test",
+        target_ref="codex:session-1",
+    )
+    assert created is True
+    assert prepared.state == "prepared"
+
+    same, created_again = store.prepare_ask_handoff(
+        assistant.id,
+        operation_id="aop-test",
+        instruction_hash="sha256-test",
+        target_ref="codex:session-1",
+    )
+    assert created_again is False
+    assert same == prepared
+
+    # Dispatch is a compare-and-set: only one concurrent sender may wake the
+    # authoring agent; the loser observes the in-flight state instead.
+    claimed = store.claim_ask_handoff_dispatch(assistant.id)
+    assert claimed is not None and claimed.state == "dispatching"
+    assert store.claim_ask_handoff_dispatch(assistant.id) is None
+
+    sent = store.update_ask_handoff(assistant.id, state="sent", remote_ref="message-1")
+    assert store.claim_ask_handoff_dispatch(assistant.id) is None
+    assert sent is not None
+    assert sent.state == "sent"
+    assert sent.remote_ref == "message-1"
+
+    reopened = ReviewStore(tmp_path)
+    reopened.init()
+    assert reopened.list_ask_messages(session.id) == rows
+    assert reopened.get_ask_message(assistant.id) == assistant
+    reopened_handoff = reopened.get_ask_handoff(assistant.id)
+    assert reopened_handoff is not None
+    assert reopened_handoff.state == "sent"
+    assert reopened_handoff.remote_ref == "message-1"
+
+
+def test_ask_conversations_filter_history_and_title_from_first_question(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    session, revision = _seed(store)
+    first = store.create_ask_conversation(
+        session.id,
+        origin_json=json.dumps({"kind": "selection", "path": "src/app.py", "start_line": 10}),
+    )
+    second = store.create_ask_conversation(session.id, origin_json=json.dumps({"kind": "review"}))
+
+    first_message = store.append_ask_message(
+        ReviewAskMessage(
+            id="",
+            review_id=session.id,
+            revision_id=revision.id,
+            role="human",
+            intent="question",
+            body="  Why   is this helper needed?  ",
+            conversation_id=first.id,
+        )
+    )
+    second_message = store.append_ask_message(
+        ReviewAskMessage(
+            id="",
+            review_id=session.id,
+            revision_id=revision.id,
+            role="human",
+            intent="question",
+            body="What else changed?",
+            conversation_id=second.id,
+        )
+    )
+
+    assert store.list_ask_messages(session.id, conversation_id=first.id) == (first_message,)
+    assert store.list_ask_messages(session.id, conversation_id=second.id) == (second_message,)
+    assert store.list_ask_messages(session.id, conversation_id="") == ()
+    summaries = {item.id: item for item in store.list_ask_conversations(session.id)}
+    assert summaries[first.id].title == "Why is this helper needed?"
+    assert json.loads(summaries[first.id].origin_json)["path"] == "src/app.py"
+
+    reopened = ReviewStore(tmp_path)
+    reopened.init()
+    assert reopened.get_ask_conversation(first.id) == summaries[first.id]
+    assert reopened.list_ask_messages(session.id, conversation_id=first.id) == (first_message,)
+
+
+def test_landing_intents_are_listed_across_changes(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    first, _revision_row = _seed(store)
+    second = store.create_session(
+        ReviewSession(
+            id="",
+            subject_type="commit_range",
+            repo_root="/repo/alpha",
+            range_mode="commit_range",
+            source_ref="named:refs/heads/main...refs/heads/other",
+        )
+    )
+    armed = store.upsert_relationship(
+        ReviewRelationship(id="", review_id=first.id, kind="landing", relation="merge_when_ready", status="armed")
+    )
+    stale = store.upsert_relationship(
+        ReviewRelationship(id="", review_id=second.id, kind="landing", relation="merge_when_ready", status="stale")
+    )
+    store.upsert_relationship(
+        ReviewRelationship(
+            id="",
+            review_id=first.id,
+            kind="work_item",
+            relation="implements",
+            provider="linear",
+            external_id="ENG-1",
+        )
+    )
+
+    assert {item.id for item in store.list_relationships_by_kind("landing")} == {armed.id, stale.id}
+    assert store.list_relationships_by_kind("change") == ()
+
+
+def test_relationship_compare_and_set_refuses_a_concurrent_change(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    session, _revision_row = _seed(store)
+    read = store.upsert_relationship(
+        ReviewRelationship(id="", review_id=session.id, kind="landing", relation="merge_when_ready", status="armed")
+    )
+    cancelled = store.upsert_relationship(replace(read, id="", status="cancelled"))
+
+    assert store.update_relationship_if_unchanged(read, status="armed", metadata_json="{}") is None
+    assert store.list_relationships(session.id, kind="landing")[0].status == "cancelled"
+    written = store.update_relationship_if_unchanged(cancelled, status="stale", metadata_json='{"why": "moved"}')
+    assert written is not None
+    assert (written.id, written.status, written.metadata_json) == (read.id, "stale", '{"why": "moved"}')
+
+
+def test_change_relationships_are_durable_and_upsert_external_state(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    session, _revision_row = _seed(store)
+    related = store.create_session(
+        ReviewSession(
+            id="",
+            subject_type="commit_range",
+            repo_root="/repo/alpha",
+            range_mode="commit_range",
+            source_ref="named:refs/heads/main...refs/heads/child",
+        )
+    )
+
+    work = store.upsert_relationship(
+        ReviewRelationship(
+            id="",
+            review_id=session.id,
+            kind="work_item",
+            relation="implements",
+            provider="linear",
+            external_id="ENG-431",
+            url="https://linear.app/acme/issue/ENG-431",
+            title="Device approval race",
+        )
+    )
+    dependency = store.upsert_relationship(
+        ReviewRelationship(
+            id="",
+            review_id=session.id,
+            kind="change",
+            relation="depends_on",
+            target_review_id=related.id,
+            source="imported",
+        )
+    )
+    requirement = store.upsert_relationship(
+        ReviewRelationship(
+            id="",
+            review_id=session.id,
+            kind="scm_requirement",
+            relation="requires",
+            provider="github",
+            external_id="required-checks",
+            status="pending",
+        )
+    )
+    updated = store.upsert_relationship(replace(requirement, id="", status="passed"))
+
+    assert updated.id == requirement.id
+    relationships = store.list_relationships(session.id)
+    assert {item.id for item in relationships} == {work.id, dependency.id, requirement.id}
+    assert next(item for item in relationships if item.id == requirement.id).status == "passed"
+
+    reopened = ReviewStore(tmp_path)
+    reopened.init()
+    assert reopened.list_relationships(session.id) == relationships
+
+
+def test_revision_attributions_preserve_primary_and_per_file_contributors(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    _session_row, revision = _seed(store)
+    rows = store.add_revision_attributions(
+        revision.id,
+        (
+            ReviewAttribution(
+                revision_id=revision.id,
+                scope="revision",
+                scope_key="",
+                host="claude",
+                session_id="session-a",
+                role="primary",
+                model="sonnet",
+                certainty="exact",
+                method="recorded at edit time",
+            ),
+            ReviewAttribution(
+                revision_id=revision.id,
+                scope="file",
+                scope_key="src/app.py",
+                host="codex",
+                session_id="session-b",
+                role="contributor",
+                model="gpt-5.6",
+                certainty="exact",
+                method="recorded_edit",
+            ),
+        ),
+    )
+    assert [(item.scope, item.scope_key, item.host, item.session_id, item.role) for item in rows] == [
+        ("revision", "", "claude", "session-a", "primary"),
+        ("file", "src/app.py", "codex", "session-b", "contributor"),
+    ]
+    assert store.list_revision_attributions(revision.id) == rows
 
 
 def test_init_is_idempotent_and_keeps_existing_rows(tmp_path: Path) -> None:
@@ -158,6 +573,33 @@ def test_additive_review_migrations_are_registered_without_bumping_schema_versio
         "v3_011_review_outcomes.sql",
         "v3_012_review_current_revision.sql",
         "v3_013_review_change_proposals.sql",
+        "v3_014_review_attributions.sql",
+        "v3_015_review_ask_scope.sql",
+        "v3_016_change_identity.sql",
+        "v3_017_review_ask_context.sql",
+        "v3_018_review_source_view.sql",
+        "v3_019_review_development.sql",
+        "v3_020_review_development_since_cache.sql",
+        "v3_021_review_commit_model.sql",
+        "v3_022_review_binding_active_unique.sql",
+        "v3_023_review_author_guidance.sql",
+        "v3_024_review_decision_events.sql",
+        "v3_025_review_plan_syntheses.sql",
+        "v3_026_review_synthesis_spend.sql",
+        "v3_027_review_derived.sql",
+        "v3_028_review_destinations.sql",
+        "v3_029_review_base_policy.sql",
+        "v3_030_review_agent_comments.sql",
+        "v3_031_review_revision_title.sql",
+        "v3_032_review_intelligence.sql",
+        "v3_033_review_attestations.sql",
+        "v3_034_review_rules.sql",
+        "v3_035_review_finding_dispositions.sql",
+        "v3_036_review_evidence_executor_class.sql",
+        "v3_037_review_deletion_tombstones.sql",
+        "v3_038_review_ask_conversations.sql",
+        "v3_039_review_hosted_attachment.sql",
+        "v3_040_project_knowledge.sql",
     )
     assert SESSION_SCHEMA_VERSION == 1
 
@@ -169,6 +611,10 @@ def test_additive_review_migrations_are_registered_without_bumping_schema_versio
         delivery_columns = {row[1] for row in conn.execute("PRAGMA table_info(deliveries)")}
         session_columns = {row[1] for row in conn.execute("PRAGMA table_info(review_sessions)")}
         proposal_columns = {row[1] for row in conn.execute("PRAGMA table_info(review_change_proposals)")}
+        ask_columns = {row[1] for row in conn.execute("PRAGMA table_info(review_ask_messages)")}
+        relationship_columns = {row[1] for row in conn.execute("PRAGMA table_info(review_relationships)")}
+        development_snapshot_columns = {row[1] for row in conn.execute("PRAGMA table_info(development_snapshots)")}
+        revision_indexes = {row[1] for row in conn.execute("PRAGMA index_list(review_revisions)")}
         history_tables = {
             row[0]
             for row in conn.execute(
@@ -177,6 +623,21 @@ def test_additive_review_migrations_are_registered_without_bumping_schema_versio
             )
         }
         annotation_version_columns = {row[1] for row in conn.execute("PRAGMA table_info(annotation_versions)")}
+        guidance_columns = {row[1] for row in conn.execute("PRAGMA table_info(review_author_guidance)")}
+        decision_columns = {row[1] for row in conn.execute("PRAGMA table_info(review_decision_events)")}
+        synthesis_columns = {row[1] for row in conn.execute("PRAGMA table_info(review_plan_syntheses)")}
+    assert {"synthesis_key", "status", "payload_json", "completed_at"} <= synthesis_columns
+    assert {"review_id", "id", "revision_id", "producer_host", "producer_session_id", "payload_json"} <= (
+        guidance_columns
+    )
+    assert {
+        "decision_key",
+        "disposition",
+        "semantic_fingerprint",
+        "implementation_fingerprint",
+        "scope_json",
+        "prior_event_id",
+    } <= decision_columns
     assert {
         "source",
         "source_id",
@@ -187,10 +648,42 @@ def test_additive_review_migrations_are_registered_without_bumping_schema_versio
         "author_response_source_id",
         "author_response_at",
     } <= annotation_columns
-    assert "source_fingerprint" in revision_columns
+    assert {
+        "source_fingerprint",
+        "source_view_id",
+        "source_view_revision",
+        "capture_kind",
+        "commit_sha",
+        "branch_ref",
+        "worktree_key",
+        "title",
+    } <= revision_columns
+    assert "review_base_sha" in session_columns
+    assert "review_base_policy" in session_columns
     assert "current_revision_id" in session_columns
-    assert {"verification_status", "detail"} <= evidence_columns
+    assert {
+        "verification_status",
+        "detail",
+        "attestation_class",
+        "stable_key",
+        "provider",
+        "integration_id",
+        "provider_revision",
+        "branch",
+        "environment",
+        "attestation_scope",
+        "attested_by",
+        "remote_identity",
+        "observed_at",
+        "waived_requirement_key",
+        "execution_intent",
+    } <= evidence_columns
     assert {"operation_id", "revision_id", "feedback_hash", "annotation_version"} <= delivery_columns
+    assert {"symbol", "context_json"} <= ask_columns
+    assert {"kind", "relation", "provider", "external_id", "target_review_id", "status"} <= relationship_columns
+    assert {"since_cursor", "since_json"} <= development_snapshot_columns
+    assert "ux_review_revisions_snapshot" in revision_indexes
+    assert "ux_review_revisions_tree" not in revision_indexes
     assert history_tables == {"review_mark_events", "review_activity_events", "annotation_versions"}
     assert {"turn_owner_kind", "turn_owner_id"} <= annotation_columns
     assert {"turn_owner_kind", "turn_owner_id"} <= annotation_version_columns
@@ -202,6 +695,70 @@ def test_additive_review_migrations_are_registered_without_bumping_schema_versio
         "result_revision_id",
     } <= proposal_columns
     assert {"operation_id", "revision_id", "feedback_hash", "annotation_version"} <= delivery_columns
+
+
+def test_v3_031_adds_snapshot_titles_without_losing_revision_rows(tmp_path: Path) -> None:
+    root = tmp_path / "store"
+    store = _store(root)
+    session, revision = _seed(store)
+
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute("ALTER TABLE review_revisions DROP COLUMN title")
+        conn.execute("DELETE FROM _schema_migrations WHERE name = 'v3_031_review_revision_title.sql'")
+        conn.commit()
+
+    migrated = ReviewStore(root)
+    migrated.init()
+    loaded = migrated.get_revision(revision.id)
+    assert loaded is not None and loaded.review_id == session.id
+    assert loaded.title == ""
+    with sqlite3.connect(migrated.db_path) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(review_revisions)")}
+    assert "title" in columns
+
+
+def test_v3_021_migrates_legacy_identity_without_losing_review_rows(tmp_path: Path) -> None:
+    root = tmp_path / "store"
+    store = _store(root)
+    session, revision = _seed(store)
+
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute("DROP TABLE review_commits")
+        conn.execute("DROP TABLE review_bindings")
+        conn.execute("ALTER TABLE review_sessions DROP COLUMN review_base_sha")
+        conn.execute("ALTER TABLE review_revisions DROP COLUMN capture_kind")
+        conn.execute("ALTER TABLE review_revisions DROP COLUMN commit_sha")
+        conn.execute("ALTER TABLE review_revisions DROP COLUMN branch_ref")
+        conn.execute("ALTER TABLE review_revisions DROP COLUMN worktree_key")
+        conn.execute("DROP INDEX IF EXISTS idx_review_sessions_legacy_subject")
+        conn.execute(
+            "CREATE UNIQUE INDEX ux_review_sessions_subject "
+            "ON review_sessions(repo_root, subject_type, source_ref, range_mode)"
+        )
+        conn.execute("DELETE FROM _schema_migrations WHERE name = 'v3_021_review_commit_model.sql'")
+        conn.commit()
+
+    migrated = ReviewStore(root)
+    migrated.init()
+    loaded_session = migrated.get_session(session.id)
+    loaded_revision = migrated.get_revision(revision.id)
+    assert loaded_session is not None and loaded_session.review_base_sha == ""
+    assert loaded_revision is not None and loaded_revision.capture_kind == "legacy"
+
+    # The old uniqueness boundary is intentionally gone: active ReviewBinding
+    # rows decide which of several historical Reviews owns a branch now.
+    another = migrated.create_session(_session())
+    assert another.id != session.id
+    with sqlite3.connect(migrated.db_path) as conn:
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        indexes = {row[1] for row in conn.execute("PRAGMA index_list(review_sessions)")}
+        marker = conn.execute(
+            "SELECT 1 FROM _schema_migrations WHERE name = 'v3_021_review_commit_model.sql'"
+        ).fetchone()
+    assert {"review_bindings", "review_commits"} <= tables
+    assert "ux_review_sessions_subject" not in indexes
+    assert "idx_review_sessions_legacy_subject" in indexes
+    assert marker is not None
 
 
 def test_v3_009_migrates_an_existing_deliveries_table_before_building_operation_indexes(tmp_path: Path) -> None:
@@ -397,6 +954,27 @@ def test_reviewer_outcome_is_revision_bound_append_only_history(tmp_path: Path) 
     assert [event.kind for event in activity] == ["outcome.recorded", "outcome.recorded", "outcome.recorded"]
 
 
+def test_retrying_the_same_reviewer_outcome_does_not_append_a_duplicate(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    session, revision = _seed(store)
+
+    first = store.record_outcome(session.id, revision.id, "reviewer-a", outcome="lgtm", summary="Ship it.")
+    retried = store.record_outcome(session.id, revision.id, "reviewer-a", outcome="lgtm", summary="Ship it.")
+    assert retried == first
+    assert store.list_outcomes(session.id, reviewer_id="reviewer-a") == (first,)
+    activity = [event for event in store.list_activity_events(session.id) if event.subject_type == "outcome"]
+    assert len(activity) == 1
+
+    # A different verdict, summary or reviewer is a new judgment, and returning
+    # to an earlier verdict after changing it is recorded again.
+    changed = store.record_outcome(session.id, revision.id, "reviewer-a", outcome="changes_requested")
+    back = store.record_outcome(session.id, revision.id, "reviewer-a", outcome="lgtm", summary="Ship it.")
+    other = store.record_outcome(session.id, revision.id, "reviewer-b", outcome="lgtm", summary="Ship it.")
+    assert back.id not in {first.id, changed.id}
+    assert other.id != first.id
+    assert len(store.list_outcomes(session.id, reviewer_id="reviewer-a")) == 3
+
+
 def test_reviewer_outcome_rejects_wrong_revision_or_unknown_kind(tmp_path: Path) -> None:
     store = _store(tmp_path)
     session, revision = _seed(store)
@@ -458,6 +1036,28 @@ def test_existing_pre_annotation_source_database_migrates_before_source_index(tm
     assert "idx_annotations_source" in indexes
 
 
+def test_pre_source_fingerprint_database_migrates_before_snapshot_identity_index(tmp_path: Path) -> None:
+    root = tmp_path / "pre-source"
+    root.mkdir()
+    legacy_schema = ReviewStore.SCHEMA.replace(
+        "  source_fingerprint    TEXT NOT NULL DEFAULT '',\n",
+        "",
+    )
+    with sqlite3.connect(root / DB_NAME) as conn:
+        conn.executescript(legacy_schema)
+
+    store = ReviewStore(root)
+    store.init()
+    with sqlite3.connect(store.db_path) as conn:
+        revision_columns = {row[1] for row in conn.execute("PRAGMA table_info(review_revisions)")}
+        indexes = {row[1]: bool(row[2]) for row in conn.execute("PRAGMA index_list(review_revisions)")}
+        snapshot_index_columns = [row[2] for row in conn.execute("PRAGMA index_info(ux_review_revisions_snapshot)")]
+
+    assert "source_fingerprint" in revision_columns
+    assert indexes["ux_review_revisions_snapshot"] is True
+    assert snapshot_index_columns == ["review_id", "tree_fingerprint", "source_fingerprint"]
+
+
 def test_store_self_initialises_on_first_use(tmp_path: Path) -> None:
     """Not a StoreBundle member, so nothing else calls init() for it."""
     store = ReviewStore(tmp_path)
@@ -491,12 +1091,13 @@ def test_create_and_find_session_round_trips_every_field(tmp_path: Path) -> None
     assert store.get_session(created.id) == created
 
 
-def test_second_session_with_the_same_subject_identity_is_rejected(tmp_path: Path) -> None:
-    """Reopen identity: a second `lc review --open` reopens, never forks."""
+def test_multiple_sessions_may_share_legacy_source_identity(tmp_path: Path) -> None:
+    """Branch/PR bindings, not the legacy source tuple, choose the active Review."""
     store = _store(tmp_path)
-    store.create_session(_session())
-    with pytest.raises(sqlite3.IntegrityError):
-        store.create_session(_session())
+    first = store.create_session(_session())
+    second = store.create_session(_session())
+    assert first.id != second.id
+    assert len(store.list_sessions()) == 2
 
 
 def test_a_different_range_mode_is_a_different_session(tmp_path: Path) -> None:
@@ -551,6 +1152,7 @@ def test_add_revision_round_trips_every_field(tmp_path: Path) -> None:
             provenance_session_id="sess-1",
             provenance_certainty="exact",
             source_fingerprint="watch-abc",
+            title="Validate price changes",
         ),
         [],
     )
@@ -559,6 +1161,7 @@ def test_add_revision_round_trips_every_field(tmp_path: Path) -> None:
     assert revision.dirty is True
     assert revision.head_sha == ""
     assert revision.source_fingerprint == "watch-abc"
+    assert revision.title == "Validate price changes"
 
 
 def test_revision_numbers_are_dense_and_assigned_by_the_store(tmp_path: Path) -> None:
@@ -663,27 +1266,78 @@ def test_add_revision_numbers_itself_inside_the_write_lock(tmp_path: Path) -> No
     assert [item.revision_number for item in store.list_revisions(session.id)] == [1, 2]
 
 
-def test_identical_tree_fingerprint_is_never_a_second_revision(tmp_path: Path) -> None:
-    """The same tree adopts the row already on file instead of raising.
+def test_write_lock_contention_surfaces_instead_of_proceeding_unserialized(tmp_path: Path) -> None:
+    """A ``BEGIN IMMEDIATE`` that times out on a rival writer must not be swallowed.
 
-    ``ux_review_revisions_tree`` says one revision per tree, and the caller
-    asking to record a tree somebody already recorded got what it asked for.
-    Only a *tree* conflict is absorbed: every other integrity failure -- a
-    reused revision id, a duplicate unit key -- is a programming error and
-    must keep raising.
+    Swallowing it left the caller in a deferred transaction, so the read its
+    write depends on (the exact-Snapshot re-check) ran without the write lock.
     """
 
     store = _store(tmp_path)
+    rival = sqlite3.connect(store.db_path, timeout=0.5)
+    rival.execute("BEGIN IMMEDIATE")
+    conn = sqlite3.connect(store.db_path, timeout=0.05)
+    conn.execute("PRAGMA busy_timeout = 50")
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            ReviewStore._lock_for_write(conn)
+        assert not conn.in_transaction
+    finally:
+        rival.rollback()
+        rival.close()
+    ReviewStore._lock_for_write(conn)  # the rival is gone: the lock is taken
+    assert conn.in_transaction
+    conn.rollback()
+    conn.close()
+
+
+def test_identical_snapshot_identity_is_never_a_second_revision(tmp_path: Path) -> None:
+    """The same semantic tree from the same source generation is idempotent."""
+
+    store = _store(tmp_path)
     session = store.create_session(_session())
-    first = store.add_revision(_revision(session.id, tree_fingerprint="same"), [])
-    again = store.add_revision(_revision(session.id, tree_fingerprint="same"), [])
+    first = store.add_revision(
+        _revision(session.id, tree_fingerprint="same", source_fingerprint="source-a"),
+        [],
+    )
+    again = store.add_revision(
+        _revision(session.id, tree_fingerprint="same", source_fingerprint="source-a"),
+        [],
+    )
     assert again == first
     assert [item.id for item in store.list_revisions(session.id)] == [first.id]
+    assert store.find_revision_by_snapshot_identity(session.id, "same", "source-a") == first
     assert store.find_revision_by_tree(session.id, "same") == first
     assert store.find_revision_by_tree(session.id, "other") is None
 
     with pytest.raises(sqlite3.IntegrityError):
         store.add_revision(_revision(session.id, id=first.id, tree_fingerprint="different"), [])
+
+
+def test_same_semantic_tree_from_new_source_generation_is_a_new_snapshot(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    session = store.create_session(_session())
+    first = store.add_revision(
+        _revision(session.id, tree_fingerprint="same", source_fingerprint="source-a"),
+        [],
+    )
+    rebased = store.add_revision(
+        _revision(
+            session.id,
+            tree_fingerprint="same",
+            source_fingerprint="source-b",
+            base_sha="b" * 40,
+            head_sha="h" * 40,
+        ),
+        [],
+    )
+
+    assert rebased.id != first.id
+    assert rebased.revision_number == first.revision_number + 1
+    assert [item.id for item in store.list_revisions(session.id)] == [first.id, rebased.id]
+    assert store.find_revision_by_tree(session.id, "same") == rebased
+    assert store.find_revision_by_snapshot_identity(session.id, "same", "source-a") == first
+    assert store.find_revision_by_snapshot_identity(session.id, "same", "source-b") == rebased
 
 
 def test_losing_the_tree_race_adopts_the_rivals_revision_and_strands_no_artifacts(tmp_path: Path) -> None:
@@ -793,6 +1447,16 @@ def test_deleting_a_session_cascades_through_every_child_table(tmp_path: Path) -
         )
     )
     store.record_frontier(session.id, "local", revision.id)
+    store.upsert_relationship(
+        ReviewRelationship(
+            id="",
+            review_id=session.id,
+            kind="work_item",
+            relation="implements",
+            provider="linear",
+            external_id="ENG-431",
+        )
+    )
     store.record_anchor_event(annotation.id, revision.id, "identical_blob", "resolved", "", _anchor())
     store.record_delivery(DeliveryRecord(id="", annotation_id=annotation.id, target_type="markdown_bundle"))
 
@@ -803,6 +1467,7 @@ def test_deleting_a_session_cascades_through_every_child_table(tmp_path: Path) -
             table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             for table in (
                 "review_revisions",
+                "review_relationships",
                 "review_units",
                 "review_marks",
                 "review_frontiers",
@@ -1166,6 +1831,8 @@ def test_mark_events_and_activity_are_append_only_while_live_mark_is_latest(tmp_
         "mark.judgment",
         "mark.judgment",
     ]
+    # The first capture is "Snapshot 0" everywhere the reviewer reads it.
+    assert activity[1].summary == f"Snapshot {revision.revision_number - 1} recorded"
 
 
 def test_annotation_versions_track_thread_turn_ownership(tmp_path: Path) -> None:
@@ -1399,6 +2066,172 @@ def test_an_anchor_json_with_an_unknown_key_still_loads(tmp_path: Path) -> None:
 # ----- 7. deliveries ------------------------------------------------------- #
 
 
+def test_delivery_restart_recovery_reclaims_only_pre_dispatch_lease(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    session, revision = _seed(store)
+    annotation = store.add_annotation(
+        Annotation(id="", review_id=session.id, revision_id=revision.id, anchor=_anchor(), body="retry boundary")
+    )
+    operation_id = "fop-restart-boundary"
+    created, inserted = store.begin_delivery_operation(
+        (
+            DeliveryRecord(
+                id="",
+                annotation_id=annotation.id,
+                target_type="agent_session",
+                target_ref="claude:session-1",
+                state="prepared",
+                operation_id=operation_id,
+                revision_id=revision.id,
+                feedback_hash="feedback-hash",
+                annotation_version=1,
+            ),
+        )
+    )
+    assert inserted is True
+    assert created[0].state == "prepared"
+
+    leased, claimed = store.claim_delivery_target(operation_id, "claude:session-1")
+    assert claimed is True
+    assert leased[0].state == "leased"
+    second, claimed_again = store.claim_delivery_target(operation_id, "claude:session-1", lease_timeout_s=60)
+    assert claimed_again is False
+    assert second[0].state == "leased"
+
+    stale = (datetime.now(UTC) - timedelta(minutes=5)).isoformat()
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            "UPDATE deliveries SET updated_at = ? WHERE operation_id = ?",
+            (stale, operation_id),
+        )
+        conn.commit()
+    reclaimed, reclaimed_ok = store.claim_delivery_target(operation_id, "claude:session-1", lease_timeout_s=1)
+    assert reclaimed_ok is True
+    assert reclaimed[0].state == "leased"
+
+    dispatching, crossed = store.begin_delivery_dispatch(operation_id, "claude:session-1")
+    assert crossed is True
+    assert dispatching[0].state == "dispatching"
+    retry, retry_ok = store.claim_delivery_target(operation_id, "claude:session-1", lease_timeout_s=0)
+    assert retry_ok is False
+    assert retry[0].state == "dispatching"
+
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            "UPDATE deliveries SET updated_at = ? WHERE operation_id = ?",
+            (stale, operation_id),
+        )
+        conn.commit()
+    assert (
+        store.recover_stale_delivery_attempts(
+            revision.id,
+            (annotation.id,),
+            stale_after_s=1,
+        )
+        == 0
+    )
+    ambiguous = store.list_delivery_operation(operation_id)
+    assert len(ambiguous) == 1
+    assert ambiguous[0].state == "dispatching"
+    assert ambiguous[0].remote_ref == ""
+    assert ambiguous[0].operation_id == operation_id
+
+    refused, refused_ok = store.claim_delivery_target(
+        operation_id,
+        "claude:session-1",
+    )
+    assert refused_ok is False
+    assert len(refused) == 1
+    assert refused[0].state == "dispatching"
+    assert refused[0].operation_id == operation_id
+
+
+def test_competing_delivery_workers_only_one_can_own_the_pre_dispatch_lease(tmp_path: Path) -> None:
+    seed = _store(tmp_path)
+    session, revision = _seed(seed)
+    annotation = seed.add_annotation(
+        Annotation(id="", review_id=session.id, revision_id=revision.id, anchor=_anchor(), body="race once")
+    )
+    operation_id = "fop-concurrent-lease"
+    seed.begin_delivery_operation(
+        (
+            DeliveryRecord(
+                id="",
+                annotation_id=annotation.id,
+                target_type="agent_session",
+                target_ref="claude:session-1",
+                state="prepared",
+                operation_id=operation_id,
+                revision_id=revision.id,
+                feedback_hash="hash",
+                annotation_version=seed.annotation_version_number(annotation.id),
+            ),
+        )
+    )
+
+    stores = [ReviewStore(seed.root), ReviewStore(seed.root)]
+    start = threading.Barrier(3)
+    results: list[bool] = []
+    failures: list[BaseException] = []
+
+    def claim(store: ReviewStore) -> None:
+        try:
+            start.wait()
+            _rows, won = store.claim_delivery_target(operation_id, "claude:session-1", lease_timeout_s=60)
+            results.append(won)
+        except BaseException as exc:  # pragma: no cover - asserted empty below
+            failures.append(exc)
+
+    threads = [threading.Thread(target=claim, args=(store,)) for store in stores]
+    for thread in threads:
+        thread.start()
+    start.wait()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert failures == []
+    assert sorted(results) == [False, True]
+    assert all(not thread.is_alive() for thread in threads)
+    rows = seed.list_delivery_operation(operation_id)
+    assert len(rows) == 1
+    assert rows[0].state == "leased"
+
+
+def test_delivery_consumption_ack_updates_only_the_matching_remote_receipt(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    session, revision = _seed(store)
+    first = store.add_annotation(
+        Annotation(id="", review_id=session.id, revision_id=revision.id, anchor=_anchor(), body="first")
+    )
+    second = store.add_annotation(
+        Annotation(id="", review_id=session.id, revision_id=revision.id, anchor=_anchor(start_line=20), body="second")
+    )
+    store.record_delivery(
+        DeliveryRecord(
+            id="",
+            annotation_id=first.id,
+            target_type="agent_session",
+            target_ref="claude:session-1",
+            state="queued",
+            remote_ref="inbox:msg-one",
+        )
+    )
+    store.record_delivery(
+        DeliveryRecord(
+            id="",
+            annotation_id=second.id,
+            target_type="agent_session",
+            target_ref="claude:session-1",
+            state="queued",
+            remote_ref="inbox:msg-two",
+        )
+    )
+
+    assert store.acknowledge_delivery_remote_refs(("inbox:msg-one",)) == 1
+    assert store.list_deliveries(first.id)[0].state == "consumed"
+    assert store.list_deliveries(second.id)[0].state == "queued"
+
+
 def test_delivery_records_round_trip(tmp_path: Path) -> None:
     store = _store(tmp_path)
     session, revision = _seed(store)
@@ -1599,6 +2432,113 @@ def test_prune_clears_the_search_index_for_deleted_annotations(tmp_path: Path) -
     assert store.prune(older_than_days=0) == 1
     with sqlite3.connect(store.db_path) as conn:
         assert conn.execute("SELECT COUNT(*) FROM annotations_fts").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("status", ["open", "finished"])
+def test_delete_archived_session_refuses_retained_reviews(tmp_path: Path, status: str) -> None:
+    store = _store(tmp_path)
+    session, revision = _seed(store)
+    store.update_session(session.id, status=status)
+    rel, _, _ = store.write_packet_artifact(session.id, revision.id, b"payload")
+    with pytest.raises(ValueError, match="only archived"):
+        store.delete_archived_session(session.id)
+    assert store.get_session(session.id) is not None
+    assert store.latest_revision(session.id) is not None
+    assert (tmp_path / rel).exists()
+
+
+def test_delete_archived_session_cleans_children_search_and_artifacts(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    session, revision = _seed(store)
+    other = store.create_session(_session(status="archived"))
+    store.add_annotation(
+        Annotation(id="", review_id=session.id, revision_id=revision.id, anchor=_anchor(), body="delete this feedback")
+    )
+    rel, _, _ = store.write_packet_artifact(session.id, revision.id, b"payload")
+    store.update_session(session.id, status="archived")
+    assert store.delete_archived_session(session.id)
+    assert store.get_session(session.id) is None
+    assert store.list_revisions(session.id) == ()
+    assert store.list_annotations(session.id) == ()
+    assert not (tmp_path / rel).exists()
+    assert store.get_session(other.id) is not None
+    with sqlite3.connect(store.db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM annotations_fts").fetchone()[0] == 0
+    assert not store.delete_archived_session(session.id)
+
+
+def _tombstone(review_id: str, *, request_id: str = "req-1") -> ReviewDeletionTombstone:
+    return ReviewDeletionTombstone(
+        review_id=review_id,
+        repo_id="repo-alpha",
+        actor_id="user_admin",
+        request_id=request_id,
+        confirmation_sha256=hashlib.sha256(review_id.encode()).hexdigest(),
+        confirmed_by="id",
+    )
+
+
+def test_a_deletion_tombstone_is_chained_and_outlives_the_deleted_review(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    session, revision = _seed(store)
+    store.add_annotation(
+        Annotation(id="", review_id=session.id, revision_id=revision.id, anchor=_anchor(), body="delete this")
+    )
+    store.update_session(session.id, status="archived")
+    assert store.delete_archived_session(session.id, tombstone=_tombstone(session.id))
+    assert store.get_session(session.id) is None
+    [first] = store.deletion_tombstones(session.id)
+    assert (first.sequence, first.previous_sha256, first.actor_id, first.request_id) == (1, "", "user_admin", "req-1")
+    counts = dict(first.counts)
+    assert counts["review_sessions"] == 1 and counts["review_revisions"] == 1 and counts["annotations"] == 1
+    assert first.record_sha256 == deletion_tombstone_digest(first) and first.deleted_at
+
+    other, _ = _seed(store)
+    store.update_session(other.id, status="archived")
+    assert store.delete_archived_session(other.id, tombstone=_tombstone(other.id, request_id="req-2"))
+    second = store.deletion_tombstones()[-1]
+    assert (second.sequence, second.previous_sha256) == (2, first.record_sha256)
+    assert store.verify_deletion_tombstones() == ""
+
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute("UPDATE review_deletion_tombstones SET actor_id = 'someone-else' WHERE sequence = 1")
+    assert store.verify_deletion_tombstones() == "tombstone 1 was altered"
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute("DELETE FROM review_deletion_tombstones WHERE sequence = 1")
+    assert store.verify_deletion_tombstones() == "tombstone 1 is missing"
+
+
+def test_the_tombstone_and_the_deletion_commit_or_roll_back_together(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    session, revision = _seed(store)
+    store.add_annotation(
+        Annotation(id="", review_id=session.id, revision_id=revision.id, anchor=_anchor(), body="keep me")
+    )
+    store.update_session(session.id, status="archived")
+
+    def _fail(*_args: object, **_kwargs: object) -> None:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    # The deletion fails after the tombstone was written: neither survives.
+    monkeypatch.setattr(store, "_annotation_search_delete", _fail)
+    with pytest.raises(sqlite3.OperationalError):
+        store.delete_archived_session(session.id, tombstone=_tombstone(session.id))
+    assert store.get_session(session.id) is not None and store.deletion_tombstones() == ()
+    monkeypatch.undo()
+
+    # The tombstone cannot be written: nothing is deleted.
+    monkeypatch.setattr(store, "_write_deletion_tombstone", _fail)
+    with pytest.raises(sqlite3.OperationalError):
+        store.delete_archived_session(session.id, tombstone=_tombstone(session.id))
+    assert store.get_session(session.id) is not None
+    assert len(store.list_annotations(session.id)) == 1
+    monkeypatch.undo()
+
+    with pytest.raises(ValueError, match="must name the Review"):
+        store.delete_archived_session(session.id, tombstone=_tombstone("another-review"))
+    assert store.get_session(session.id) is not None and store.deletion_tombstones() == ()
 
 
 # ----- 11. concurrency ----------------------------------------------------- #
@@ -1895,6 +2835,20 @@ def test_prefixed_review_identity_migrates_without_losing_refs_or_frozen_blobs(t
             content_fingerprint="fp-1",
         )
     )
+    store.add_revision_attributions(
+        revision.id,
+        (
+            ReviewAttribution(
+                revision_id=revision.id,
+                scope="file",
+                scope_key="src/app.py",
+                host="claude",
+                session_id="session-author",
+                certainty="exact",
+                method="recorded_edit",
+            ),
+        ),
+    )
 
     def dashed(value: str) -> str:
         return f"{value[:8]}-{value[8:12]}-{value[12:16]}-{value[16:20]}-{value[20:]}"
@@ -1905,6 +2859,9 @@ def test_prefixed_review_identity_migrates_without_losing_refs_or_frozen_blobs(t
         conn.execute("PRAGMA foreign_keys = OFF")
         conn.execute("DELETE FROM review_meta WHERE key = 'review_identity_version'")
         conn.execute("UPDATE review_units SET revision_id = ? WHERE revision_id = ?", (old_revision, revision.id))
+        conn.execute(
+            "UPDATE review_attributions SET revision_id = ? WHERE revision_id = ?", (old_revision, revision.id)
+        )
         conn.execute(
             "UPDATE review_marks SET review_id = ?, reviewed_revision_id = ? WHERE review_id = ?",
             (old_review, old_revision, session.id),
@@ -1940,33 +2897,186 @@ def test_prefixed_review_identity_migrates_without_losing_refs_or_frozen_blobs(t
     assert migrated.resolve_session(f"r/{session.id}") == loaded_session
     assert migrated.resolve_revision(f"rr/{revision.id}") == loaded_revision
     assert any(mark.unit_key == "file:src/app.py" for mark in migrated.list_marks(session.id))
+    assert [
+        (item.revision_id, item.scope_key, item.session_id) for item in migrated.list_revision_attributions(revision.id)
+    ] == [(revision.id, "src/app.py", "session-author")]
     assert migrated.read_blob_artifact(session.id, revision.id) == {"src/app.py": "print('frozen')\n"}
     assert not legacy_dir.exists()
     assert (store.root / "review" / "artifacts" / session.id / revision.id).is_dir()
 
 
-def test_review_identity_is_bare_uuid_with_canonical_public_ref(tmp_path: Path) -> None:
+def test_review_identity_is_bare_uuid_with_short_public_ref(tmp_path: Path) -> None:
     store = _store(tmp_path)
     session = store.create_session(_session(source_ref="current"))
 
     assert len(session.id) == 32
     assert all(char in "0123456789abcdef" for char in session.id)
-    assert store.session_reference(session.id) == f"r/{session.id}"
+    short = store.short_session_reference(session.id)
+    assert len(short) == 8
+    assert all(char in "0123456789abcdef" for char in short)
+    assert store.session_reference(session.id) == f"r/{short}"
     assert store.resolve_session(session.id) == session
     assert store.resolve_session(f"r/{session.id}") == session
+    assert store.resolve_session(short) == session
+    assert store.resolve_session(f"r/{short}") == session
     assert store.resolve_session(f"r-{session.id}") is None
-    assert store.resolve_session(session.id[:8]) is None
 
 
-def test_revision_identity_is_bare_uuid_with_canonical_public_ref(tmp_path: Path) -> None:
+def test_revision_identity_is_bare_uuid_with_short_public_ref(tmp_path: Path) -> None:
     store = _store(tmp_path)
     session = store.create_session(_session())
     revision = store.add_revision(_revision(session.id), [_unit()])
 
     assert len(revision.id) == 32
     assert all(char in "0123456789abcdef" for char in revision.id)
-    assert store.revision_reference(revision.id) == f"rr/{revision.id}"
+    short = store.short_revision_reference(revision.id)
+    assert len(short) == 8
+    assert all(char in "0123456789abcdef" for char in short)
+    assert store.revision_reference(revision.id) == f"rr/{short}"
     assert store.resolve_revision(revision.id) == revision
     assert store.resolve_revision(f"rr/{revision.id}") == revision
+    assert store.resolve_revision(short) == revision
+    assert store.resolve_revision(f"rr/{short}") == revision
     assert store.resolve_revision(f"rr-{revision.id}") is None
-    assert store.resolve_revision(revision.id[:8]) is None
+
+
+# ----- pooled connections, stored derivations, bulk list reads ------------ #
+
+
+def test_pooled_store_reuses_connections_and_drops_one_that_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    session, _revision_row = _seed(store)
+    opened: list[sqlite3.Connection] = []
+    real_connect = sqlite3.connect
+
+    def counting_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        conn = real_connect(*args, **kwargs)  # type: ignore[arg-type]
+        opened.append(conn)
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", counting_connect)
+    for _ in range(20):
+        assert store.get_session(session.id) is not None
+    assert len(opened) <= 1
+
+    with pytest.raises(sqlite3.OperationalError):
+        with store._transaction() as conn:
+            conn.execute("SELECT * FROM no_such_table")
+    before = len(opened)
+    assert store.get_session(session.id) is not None
+    # The failed call's connection was closed, not returned to the pool.
+    assert len(opened) <= before + 1
+    assert all(not conn.in_transaction for conn in store._idle_connections)
+
+
+def test_derived_results_round_trip_replace_by_stamp_and_cascade(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    session, revision = _seed(store)
+    store.put_derived_results(
+        [
+            DerivedResult(session.id, revision.id, "progress", "alice", "s1", {"done": 1}),
+            DerivedResult(session.id, revision.id, "progress", "bob", "s1", {"done": 2}),
+            DerivedResult(session.id, revision.id, "title", "", "t1", {"title": "x"}),
+        ]
+    )
+    assert store.derived_results("progress", [revision.id]) == {
+        (revision.id, "alice"): ("s1", {"done": 1}),
+        (revision.id, "bob"): ("s1", {"done": 2}),
+    }
+    store.put_derived_results([DerivedResult(session.id, revision.id, "progress", "alice", "s2", {"done": 3})])
+    assert store.derived_results("progress", [revision.id])[(revision.id, "alice")] == ("s2", {"done": 3})
+    assert store.derived_results("progress", ["missing"]) == {}
+
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("DELETE FROM review_sessions WHERE id = ?", (session.id,))
+        assert conn.execute("SELECT COUNT(*) FROM review_derived").fetchone()[0] == 0
+
+
+def test_units_memo_serves_repeat_reads_and_follows_projection_updates(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    session = store.create_session(_session())
+    revision = store.add_revision(
+        _revision(session.id, packet_path=""),
+        [_unit(attention_rank=5), _unit("file:src/b.py", path="src/b.py", attention_rank=1)],
+    )
+    first = store.list_units(revision.id)
+    assert store.list_units(revision.id) is first
+    assert [unit.unit_key for unit in first] == ["file:src/b.py", "file:src/app.py"]
+
+    store.update_revision_projection(
+        revision.id,
+        packet_payload=b"enriched",
+        packet_schema_version=revision.packet_schema_version,
+        degraded=(),
+        provenance_host="",
+        provenance_model="",
+        provenance_session_id="",
+        provenance_certainty=revision.provenance_certainty,
+        units=[replace(unit, attention_rank=10 - unit.attention_rank) for unit in first],
+    )
+    # A second store (another process) sees the rewrite as well as this one.
+    for reader in (store, ReviewStore(tmp_path)):
+        assert [unit.unit_key for unit in reader.list_units(revision.id)] == ["file:src/app.py", "file:src/b.py"]
+
+
+def test_review_list_inputs_matches_the_single_review_reads(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    reviews = []
+    for index in range(3):
+        session = store.create_session(_session(reviewer_id="local" if index else "alice"))
+        older = store.add_revision(_revision(session.id), [_unit()])
+        if index != 2:
+            store.add_revision(_revision(session.id, tree_fingerprint="tree-b"), [_unit()])
+        store.set_mark(
+            ReviewMark(
+                review_id=session.id,
+                unit_key="file:src/app.py",
+                state="reviewed",
+                reviewed_revision_id=older.id,
+                content_fingerprint="fp-1",
+                reviewer_id=session.reviewer_id,
+            )
+        )
+        store.set_mark(
+            ReviewMark(
+                review_id=session.id,
+                unit_key="file:src/app.py",
+                state="reviewed",
+                reviewed_revision_id=older.id,
+                content_fingerprint="fp-1",
+                reviewer_id="someone-else",
+            )
+        )
+        store.add_annotation(
+            Annotation(id=new_annotation_id(), review_id=session.id, revision_id=older.id, anchor=_anchor(), body="b")
+        )
+        reviews.append(store.get_session(session.id))
+    sessions = [item for item in reviews if item is not None]
+
+    bulk = store.review_list_inputs(sessions)
+    for session in sessions:
+        latest = store.latest_revision(session.id)
+        assert latest is not None
+        assert bulk[session.id].revision == latest
+        assert bulk[session.id].attributions == store.list_revision_attributions(latest.id)
+        assert bulk[session.id].marks == store.list_marks(session.id, reviewer_id=session.reviewer_id)
+        assert bulk[session.id].annotations == store.list_annotations(session.id)
+
+
+def test_explicit_snapshot_publication_is_durable_and_idempotent(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    session = store.create_session(_session())
+    internal = store.add_revision(_revision(session.id, capture_kind="draft"), ())
+    saved = store.add_revision(_revision(session.id, capture_kind="draft", tree_fingerprint="tree-bbb"), ())
+
+    store.publish_snapshot(session.id, saved.id)
+    store.publish_snapshot(session.id, saved.id)
+
+    assert store.published_snapshot_ids(session.id) == {saved.id}
+    assert len([event for event in store.list_activity_events(session.id) if event.kind == "snapshot.published"]) == 1
+    reopened = _store(tmp_path)
+    assert reopened.published_snapshot_ids(session.id) == {saved.id}
+    assert internal.id not in reopened.published_snapshot_ids(session.id)

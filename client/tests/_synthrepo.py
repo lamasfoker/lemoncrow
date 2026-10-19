@@ -29,12 +29,14 @@ two measurements are comparable and a failing mutation can be replayed.
 
 from __future__ import annotations
 
+import os
 import random
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
-__all__ = ["LANGUAGES", "SynthRepo", "generate_repository"]
+__all__ = ["LANGUAGES", "SynthRepo", "ensure_repository_commit", "generate_repository"]
 
 #: Extension -> share of files. Roughly the mix of a polyglot monorepo: a large
 #: application language, a large front end, two systems languages, and the
@@ -151,14 +153,67 @@ def render(extension: str, ordinal: int, size: int) -> bytes:
     return "".join(parts).encode("utf-8")
 
 
+def ensure_repository_commit(root: Path) -> str:
+    """Make ``root`` a real committed Git repository and return its HEAD.
+
+    The generation index is keyed by an immutable Git base plus a worktree
+    overlay. A fake ``.git/HEAD`` makes every file look untracked and therefore
+    turns a warm scale run into tens of thousands of overlay writes. Use a real,
+    deterministic baseline commit so the benchmark exercises the production
+    generation path rather than that fallback.
+    """
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_DATE": "2026-09-14T00:00:00+00:00",
+        "GIT_COMMITTER_DATE": "2026-09-14T00:00:00+00:00",
+        "GIT_OPTIONAL_LOCKS": "0",
+    }
+    subprocess.run(["git", "init", "-q"], cwd=root, env=env, check=True, timeout=60)
+    head = subprocess.run(
+        ["git", "rev-parse", "--verify", "HEAD^{commit}"],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        check=False,
+        timeout=60,
+    )
+    if head.returncode != 0:
+        subprocess.run(["git", "add", "-A"], cwd=root, env=env, check=True, timeout=300)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=LemonCrow Scale",
+                "-c",
+                "user.email=scale@lemoncrow.local",
+                "commit",
+                "-q",
+                "--no-gpg-sign",
+                "-m",
+                "synthetic enterprise-scale baseline",
+            ],
+            cwd=root,
+            env=env,
+            check=True,
+            timeout=300,
+        )
+    resolved = subprocess.run(
+        ["git", "rev-parse", "--verify", "HEAD^{commit}"],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        check=True,
+        timeout=60,
+    )
+    return resolved.stdout.decode("ascii").strip()
+
+
 def generate_repository(root: Path, *, files: int = 50_000, seed: int = 20260914) -> SynthRepo:
     """Write a deterministic synthetic repository of ``files`` source files."""
     if files < 1:
         raise ValueError("files must be >= 1")
     rng = random.Random(seed)
     root.mkdir(parents=True, exist_ok=True)
-    (root / ".git").mkdir(exist_ok=True)
-    (root / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
     (root / ".gitignore").write_text(
         # The ignore rules a real repository carries: enough of them that the
         # per-entry ignore decision is a measurable cost rather than a no-op.
@@ -224,6 +279,8 @@ def generate_repository(root: Path, *, files: int = 50_000, seed: int = 20260914
         noise.mkdir(exist_ok=True)
         for index in range(200):
             (noise / f"artifact_{index:04d}.o").write_bytes(f"object {index}\n".encode())
+
+    ensure_repository_commit(root)
 
     return SynthRepo(
         root=root,

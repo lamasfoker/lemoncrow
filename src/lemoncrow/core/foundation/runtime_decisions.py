@@ -163,7 +163,11 @@ class NullRuntimeDecisionSink:
     """Explicit no-op sink for call sites where instrumentation is disabled."""
 
     def record_runtime_decision(self, event: RuntimeDecisionEvent) -> None:
-        del event
+        # Ledger/recorder instrumentation is off, but the per-call runtime
+        # trace is its own opt-out (LEMONCROW_RUNTIME_TRACE) and still sees it.
+        from lemoncrow.core.foundation.runtime_trace import record_decision
+
+        record_decision(event)
 
 
 __all__ = [

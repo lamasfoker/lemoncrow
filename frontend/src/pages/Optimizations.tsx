@@ -1,3 +1,5 @@
+import { Button as UiButton } from "../components/ui/button";
+import { Tip } from "../components/ui/tooltip";
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { HelpCircle } from "lucide-react";
@@ -20,6 +22,7 @@ import {
   Slider,
   SnippetCard,
   Switch,
+  ToggleGroup,
   cx,
 } from "../components/WorkbenchUI";
 import { useTimeRange } from "../lib/TimeRangeContext";
@@ -59,33 +62,33 @@ function fmtPolicyLabel(value: string): string {
   return value.replaceAll("_", " ").replaceAll("-", " ");
 }
 
-function confidenceTone(value: string): "emerald" | "amber" | "red" {
-  if (value === "high") return "emerald";
-  if (value === "medium") return "amber";
-  return "red";
+function confidenceTone(value: string): "success" | "warning" | "destructive" {
+  if (value === "high") return "success";
+  if (value === "medium") return "warning";
+  return "destructive";
 }
 
-function severityTone(value: string): "emerald" | "amber" | "red" | "neutral" {
-  if (value === "high") return "red";
-  if (value === "medium") return "amber";
-  if (value === "low") return "emerald";
+function severityTone(value: string): "success" | "warning" | "destructive" | "neutral" {
+  if (value === "high") return "destructive";
+  if (value === "medium") return "warning";
+  if (value === "low") return "success";
   return "neutral";
 }
 
-function qualityTone(score: number): "emerald" | "cyan" | "amber" | "red" {
-  if (score >= 0.98) return "emerald";
-  if (score >= 0.95) return "cyan";
-  if (score >= 0.92) return "amber";
-  return "red";
+function qualityTone(score: number): "success" | "info" | "warning" | "destructive" {
+  if (score >= 0.98) return "success";
+  if (score >= 0.95) return "info";
+  if (score >= 0.92) return "warning";
+  return "destructive";
 }
 
 function deltaTone(
   value: number,
   lowerIsBetter: boolean
-): "emerald" | "red" | "neutral" {
+): "success" | "destructive" | "neutral" {
   if (value === 0) return "neutral";
   const improved = lowerIsBetter ? value < 0 : value > 0;
-  return improved ? "emerald" : "red";
+  return improved ? "success" : "destructive";
 }
 
 function collectSessionEvidence(
@@ -139,12 +142,15 @@ export function candidateOrder(
 
 function Hint({ text }: { text: string }) {
   return (
-    <span
-      title={text}
-      className="inline-flex h-5 w-5 cursor-help items-center justify-center border border-neutral-700 text-neutral-400"
-    >
-      <HelpCircle size={12} />
-    </span>
+    <Tip content={text}>
+      <span
+        tabIndex={0}
+        aria-label={text}
+        className="inline-flex h-5 w-5 cursor-help items-center justify-center border border-neutral-700 text-neutral-400"
+      >
+        <HelpCircle size={12} />
+      </span>
+    </Tip>
   );
 }
 
@@ -167,14 +173,14 @@ export function CandidateSummaryCard({
     candidate.estimated_quality - currentCandidate.estimated_quality;
 
   return (
-    <article className="border border-neutral-800 bg-neutral-950/60 p-5">
+    <article className="rounded-lg border border-border/70 bg-background/60 p-4">
       <div className="flex items-start justify-between gap-3">
         <div>
-          <div className="text-[10px] font-mono uppercase tracking-[0.22em] text-neutral-400">
+          <div className="text-caption font-mono uppercase tracking-[0.22em] text-neutral-400">
             {label}
           </div>
           <div className="mt-2 flex items-center gap-2">
-            <h2 className="text-xl font-semibold text-neutral-100">
+            <h2 className="text-xl font-semibold text-foreground">
               {candidate.policy.name}
             </h2>
             <Hint text={note} />
@@ -186,11 +192,11 @@ export function CandidateSummaryCard({
             <Chip tone={qualityTone(candidate.estimated_quality)}>
               quality floor {fmtPercent(candidate.policy.quality_floor)}
             </Chip>
-            {badge && <Chip tone="amber">{badge}</Chip>}
+            {badge && <Chip tone="warning">{badge}</Chip>}
           </div>
         </div>
         <div className="text-right">
-          <div className="text-2xl font-semibold text-neutral-100">
+          <div className="text-2xl font-semibold text-foreground">
             {fmtUsd(candidate.weekly_cost_usd)}
           </div>
           <div className="mt-1 text-xs text-neutral-400">weekly</div>
@@ -231,8 +237,8 @@ export function CandidateSummaryCard({
       </div>
 
       <div className="mt-5 grid gap-4 xl:grid-cols-2">
-        <div className="border border-neutral-800 bg-black/20 p-4">
-          <div className="text-[10px] font-mono uppercase tracking-widest text-neutral-400">
+        <div className="rounded-lg border border-border/70 bg-background/60 p-4">
+          <div className="text-caption font-mono uppercase tracking-widest text-neutral-400">
             Routing
           </div>
           <div className="mt-3 grid gap-2 text-sm text-neutral-300">
@@ -248,10 +254,10 @@ export function CandidateSummaryCard({
           </div>
         </div>
         <div
-          className="border border-neutral-800 bg-black/20 p-4"
+          className="rounded-lg border border-border/70 bg-background/60 p-4"
           title={`Preserve: ${candidate.policy.compaction.preserve.join(", ")}`}
         >
-          <div className="text-[10px] font-mono uppercase tracking-widest text-neutral-400">
+          <div className="text-caption font-mono uppercase tracking-widest text-neutral-400">
             Compaction
           </div>
           <div className="mt-3 grid gap-2 text-sm text-neutral-300">
@@ -305,28 +311,28 @@ export function CandidateOptions({
           const isCurrent = candidate.id === currentCandidateId;
           const isRecommended = candidate.id === recommendedCandidateId;
           return (
-            <button
+            <UiButton unstyled
               key={candidate.id}
               type="button"
               onClick={() => onSelect(candidate.id)}
               className={cx(
-                "border p-4 text-left transition",
+                "rounded-lg border p-4 text-left transition-colors",
                 selected
-                  ? "border-amber-500/60 bg-amber-950/15"
-                  : "border-neutral-800 bg-neutral-950/60 hover:border-neutral-700"
+                  ? "border-border bg-neutral-800/70"
+                  : "border-border bg-background/60 hover:bg-muted/40"
               )}
             >
               <div className="flex flex-wrap items-center gap-2">
-                <div className="text-sm font-semibold text-neutral-100">
+                <div className="text-sm font-semibold text-foreground">
                   {candidate.policy.name}
                 </div>
                 {isCurrent && <Chip tone="neutral">Current</Chip>}
-                {isRecommended && <Chip tone="amber">Recommended</Chip>}
+                {isRecommended && <Chip tone="warning">Recommended</Chip>}
               </div>
               <div className="mt-2 text-xs uppercase tracking-widest text-neutral-400">
                 {fmtPolicyLabel(candidate.policy.preset)}
               </div>
-              <div className="mt-4 text-2xl font-semibold text-neutral-100">
+              <div className="mt-4 text-2xl font-semibold text-foreground">
                 {fmtUsd(candidate.weekly_cost_usd)}
               </div>
               <div className="mt-1 text-xs text-neutral-400">per week</div>
@@ -335,7 +341,7 @@ export function CandidateOptions({
                 <div>Latency {candidate.latency_mult.toFixed(2)}x</div>
                 <div>Escalation {fmtPercent(candidate.escalation_rate)}</div>
               </div>
-            </button>
+            </UiButton>
           );
         })}
       </div>
@@ -363,7 +369,7 @@ function CandidateDetail({
 
   return (
     <section className="grid gap-4 xl:grid-cols-[0.88fr_1.12fr]">
-      <article className="border border-neutral-800 bg-neutral-950/60 p-5">
+      <article className="rounded-lg border border-border/70 bg-background/60 p-4">
         <SectionHeader
           eyebrow="Advanced details"
           title={headerOverride ?? candidate.policy.name}
@@ -386,10 +392,10 @@ function CandidateDetail({
           />
         </div>
         <div
-          className="mt-5 border border-neutral-800 bg-black/20 p-4"
+          className="mt-5 rounded-lg border border-border/70 bg-background/60 p-4"
           title={`Preserve: ${candidate.policy.compaction.preserve.join(", ")}`}
         >
-          <div className="text-[10px] font-mono uppercase tracking-widest text-neutral-400">
+          <div className="text-caption font-mono uppercase tracking-widest text-neutral-400">
             Policy details
           </div>
           <div className="mt-3 grid gap-2 text-sm text-neutral-300">
@@ -410,7 +416,7 @@ function CandidateDetail({
       </article>
 
       <div className="grid gap-4">
-        <article className="border border-neutral-800 bg-neutral-950/60 p-5">
+        <article className="rounded-lg border border-border/70 bg-background/60 p-4">
           <SectionHeader
             eyebrow="Compaction breakdown"
             title="Compaction"
@@ -421,7 +427,7 @@ function CandidateDetail({
           <div className="mt-4 overflow-x-auto">
             <table className="w-full text-left text-sm">
               <thead>
-                <tr className="border-b border-neutral-800 text-[10px] uppercase tracking-widest text-neutral-400">
+                <tr className="border-b border-border text-caption uppercase tracking-widest text-neutral-400">
                   <th className="py-3 pr-4">Compaction type</th>
                   <th className="py-3 pr-4">Enabled</th>
                   <th className="py-3 text-right">Weekly savings</th>
@@ -443,7 +449,7 @@ function CandidateDetail({
                         {COMPACTION_LABELS[key] ?? fmtPolicyLabel(key)}
                       </td>
                       <td className="py-3 pr-4">
-                        <Chip tone={enabled ? "emerald" : "neutral"}>
+                        <Chip tone={enabled ? "success" : "neutral"}>
                           {enabled ? "On" : "Off"}
                         </Chip>
                       </td>
@@ -458,7 +464,7 @@ function CandidateDetail({
           </div>
         </article>
 
-        <article className="border border-neutral-800 bg-neutral-950/60 p-5">
+        <article className="rounded-lg border border-border/70 bg-background/60 p-4">
           <SectionHeader
             eyebrow="Routing breakdown"
             title="Routing"
@@ -468,19 +474,19 @@ function CandidateDetail({
           />
           <div className="mt-4 grid gap-3 md:grid-cols-3">
             {routingRows.length === 0 ? (
-              <div className="border border-neutral-800 bg-black/20 p-4 text-sm text-neutral-400 md:col-span-3">
+              <div className="rounded-lg border border-border/70 bg-background/60 p-4 text-sm text-neutral-400 md:col-span-3">
                 No routing distribution was available for this option.
               </div>
             ) : (
               routingRows.map(([tier, share]) => (
                 <div
                   key={tier}
-                  className="border border-neutral-800 bg-black/20 p-4"
+                  className="rounded-lg border border-border/70 bg-background/60 p-4"
                 >
-                  <div className="text-[10px] font-mono uppercase tracking-widest text-neutral-400">
+                  <div className="text-caption font-mono uppercase tracking-widest text-neutral-400">
                     {tier}
                   </div>
-                  <div className="mt-2 text-xl font-semibold text-neutral-100">
+                  <div className="mt-2 text-xl font-semibold text-foreground">
                     {fmtPercent(share)}
                   </div>
                   <div className="mt-2 text-xs text-neutral-400">of turns</div>
@@ -510,7 +516,7 @@ function SessionsBehindRecommendation({
       />
 
       {evidence.length === 0 ? (
-        <section className="border border-neutral-800 bg-neutral-950/60 p-5 text-sm text-neutral-400">
+        <section className="rounded-lg border border-border/70 bg-background/60 p-4 text-sm text-neutral-400">
           No concrete session examples were available in this window.
         </section>
       ) : (
@@ -518,7 +524,7 @@ function SessionsBehindRecommendation({
           {evidence.slice(0, 6).map((session) => (
             <article
               key={`${session.recommendationId}-${session.trace_id}`}
-              className="border border-neutral-800 bg-neutral-950/60 p-4"
+              className="rounded-lg border border-border/70 bg-background/60 p-4"
               title={[
                 session.reason,
                 session.tools?.length
@@ -531,7 +537,7 @@ function SessionsBehindRecommendation({
             >
               <div className="flex items-start justify-between gap-3">
                 <div>
-                  <div className="text-sm font-semibold text-neutral-100">
+                  <div className="text-sm font-semibold text-foreground">
                     {session.recommendationTitle}
                   </div>
                   <div className="mt-1 font-mono text-xs text-neutral-400">
@@ -548,7 +554,7 @@ function SessionsBehindRecommendation({
                   label="Estimated savings"
                   value={fmtUsd(session.estimatedUsdSaved)}
                   detail={fmtTok(session.estimatedTokensSaved)}
-                  tone="emerald"
+                  tone="success"
                 />
                 <MetricCard
                   label="Trace cost"
@@ -580,7 +586,7 @@ function SessionsBehindRecommendation({
 
               <Link
                 to={`/runs?trace=${encodeURIComponent(session.trace_id)}`}
-                className="mt-4 inline-flex border border-neutral-700 px-3 py-1.5 text-[10px] font-mono uppercase tracking-widest text-neutral-300 transition hover:border-amber-500/50 hover:text-amber-300"
+                className="mt-4 inline-flex border border-neutral-700 px-3 py-1.5 text-caption font-mono uppercase tracking-widest text-neutral-300 transition hover:text-amber-300"
               >
                 Open in Sessions
               </Link>
@@ -600,14 +606,14 @@ function NextActions({
   selectedCandidate: OptimizationAdvisorCandidate;
 }) {
   const applyCommand = summary.advisor.has_recommendation
-    ? "lc optimize apply --recommended"
-    : "lc optimize apply --preset balanced";
+    ? "lc usage optimize apply --recommended"
+    : "lc usage optimize apply --preset balanced";
   const shadowPolicy =
     summary.advisor.has_recommendation &&
     summary.advisor.recommended_candidate_id
       ? "recommended"
       : selectedCandidate.policy.preset;
-  const benchmarkCommand = `lc optimize apply --preset ${selectedCandidate.policy.preset} && lc benchmark run`;
+  const benchmarkCommand = `lc usage optimize apply --preset ${selectedCandidate.policy.preset} && lc benchmark run`;
 
   return (
     <section className="space-y-4">
@@ -627,7 +633,7 @@ function NextActions({
         />
         <SnippetCard
           title="Shadow"
-          body={`lc optimize shadow --policy ${shadowPolicy} --days 7`}
+          body={`lc usage optimize shadow --policy ${shadowPolicy} --days 7`}
           caption="Test policy in parallel"
         />
         <SnippetCard
@@ -679,9 +685,9 @@ function PolicySandbox({
         }
       />
 
-      <div className="grid gap-6 xl:grid-cols-[1fr_0.7fr]">
-        <div className="grid gap-6 border border-neutral-800 bg-neutral-950/60 p-6 md:grid-cols-2">
-          <div className="space-y-8">
+      <div className="grid gap-4 xl:grid-cols-[1fr_0.7fr]">
+        <div className="grid gap-4 rounded-lg border border-border/70 bg-background/60 p-4 md:grid-cols-2">
+          <div className="space-y-4">
             <Slider
               label="Quality floor"
               value={policy.quality_floor}
@@ -708,36 +714,31 @@ function PolicySandbox({
               }
             />
             <div className="space-y-3">
-              <label className="text-[10px] font-mono uppercase tracking-widest text-neutral-400">
+              <label className="text-caption font-mono uppercase tracking-widest text-neutral-400">
                 Confidence required
               </label>
-              <div className="flex gap-2">
-                {["low", "medium", "high"].map((level) => (
-                  <button
-                    key={level}
-                    type="button"
-                    onClick={() =>
-                      setPolicy((p: OptimizationAdvisorPolicy) => ({
-                        ...p,
-                        confidence_required: level as any,
-                      }))
-                    }
-                    className={cx(
-                      "flex-1 border py-1.5 text-[10px] font-mono uppercase tracking-widest transition",
-                      policy.confidence_required === level
-                        ? "border-amber-500 bg-amber-950/20 text-amber-200"
-                        : "border-neutral-800 bg-black/20 text-neutral-400 hover:border-neutral-700"
-                    )}
-                  >
-                    {level}
-                  </button>
-                ))}
-              </div>
+              <ToggleGroup
+                aria-label="Confidence required"
+                value={policy.confidence_required}
+                onChange={(value) =>
+                  setPolicy((p: OptimizationAdvisorPolicy) => ({
+                    ...p,
+                    confidence_required: value as OptimizationAdvisorPolicy["confidence_required"],
+                  }))
+                }
+                size="xs"
+                className="grid grid-cols-3"
+                options={[
+                  { value: "low", label: "Low" },
+                  { value: "medium", label: "Medium" },
+                  { value: "high", label: "High" },
+                ]}
+              />
             </div>
           </div>
 
-          <div className="space-y-6">
-            <div className="text-[10px] font-mono uppercase tracking-widest text-neutral-400">
+          <div className="space-y-4">
+            <div className="text-caption font-mono uppercase tracking-widest text-neutral-400">
               Compaction features
             </div>
             <div className="grid gap-4">
@@ -791,10 +792,10 @@ function OptimizationHistory({
           <Hint text="Historical advisor snapshots and their recorded impact." />
         }
       />
-      <div className="overflow-x-auto border border-neutral-800 bg-neutral-950/60">
+      <div className="overflow-x-auto border border-border bg-background/60">
         <table className="w-full text-left text-sm">
           <thead>
-            <tr className="border-b border-neutral-800 text-[10px] uppercase tracking-widest text-neutral-400">
+            <tr className="border-b border-border text-caption uppercase tracking-widest text-neutral-400">
               <th className="px-5 py-3">Date</th>
               <th className="px-5 py-3">Confidence</th>
               <th className="px-5 py-3">Sessions</th>
@@ -804,7 +805,7 @@ function OptimizationHistory({
           </thead>
           <tbody className="divide-y divide-neutral-900">
             {history.slice(0, 10).map((item, idx) => (
-              <tr key={idx} className="hover:bg-white/[0.02]">
+              <tr key={idx} className="hover:bg-muted/45">
                 <td className="px-5 py-3 text-neutral-400">
                   {new Date(item.recorded_at).toLocaleDateString()}
                 </td>
@@ -881,64 +882,64 @@ function OptimizationComparison({
       </div>
 
       <div className="grid gap-4 xl:grid-cols-2">
-        <article className="border border-neutral-800 bg-neutral-950/60 p-5">
-          <div className="text-[10px] font-mono uppercase tracking-widest text-neutral-400">
+        <article className="rounded-lg border border-border/70 bg-background/60 p-4">
+          <div className="text-caption font-mono uppercase tracking-widest text-neutral-400">
             Baseline (Before)
           </div>
           <div className="mt-4 grid grid-cols-2 gap-4">
             <div>
               <div className="text-xs text-neutral-400">Traces</div>
-              <div className="text-xl font-semibold text-neutral-100">
+              <div className="text-xl font-semibold text-foreground">
                 {impact.before.trace_count}
               </div>
             </div>
             <div>
               <div className="text-xs text-neutral-400">Avg Cost</div>
-              <div className="text-xl font-semibold text-neutral-100">
+              <div className="text-xl font-semibold text-foreground">
                 {fmtUsd(impact.before.avg_cost_usd)}
               </div>
             </div>
             <div>
               <div className="text-xs text-neutral-400">Avg Tokens</div>
-              <div className="text-xl font-semibold text-neutral-100">
+              <div className="text-xl font-semibold text-foreground">
                 {fmtTok(impact.before.avg_tokens)}
               </div>
             </div>
             <div>
               <div className="text-xs text-neutral-400">Cache leverage</div>
-              <div className="text-xl font-semibold text-neutral-100">
+              <div className="text-xl font-semibold text-foreground">
                 {fmtPercent(impact.before.avg_cache_leverage)}
               </div>
             </div>
           </div>
         </article>
 
-        <article className="border border-neutral-800 bg-neutral-950/60 p-5">
-          <div className="text-[10px] font-mono uppercase tracking-widest text-neutral-400">
+        <article className="rounded-lg border border-border/70 bg-background/60 p-4">
+          <div className="text-caption font-mono uppercase tracking-widest text-neutral-400">
             Current / Shadow (After)
           </div>
           <div className="mt-4 grid grid-cols-2 gap-4">
             <div>
               <div className="text-xs text-neutral-400">Traces</div>
-              <div className="text-xl font-semibold text-neutral-100">
+              <div className="text-xl font-semibold text-foreground">
                 {impact.after.trace_count}
               </div>
             </div>
             <div>
               <div className="text-xs text-neutral-400">Avg Cost</div>
-              <div className="text-xl font-semibold text-neutral-100">
+              <div className="text-xl font-semibold text-foreground">
                 {fmtUsd(impact.after.avg_cost_usd)}
               </div>
             </div>
             <div>
               <div className="text-xs text-neutral-400">Avg Tokens</div>
-              <div className="text-xl font-semibold text-neutral-100">
+              <div className="text-xl font-semibold text-foreground">
                 {fmtTok(impact.after.avg_tokens)}
               </div>
             </div>
             <div>
               <div className="text-xs text-neutral-400">Cache leverage</div>
-              <div className="text-xl font-semibold text-neutral-100">
+              <div className="text-xl font-semibold text-foreground">
                 {fmtPercent(impact.after.avg_cache_leverage)}
               </div>
             </div>
@@ -969,7 +970,7 @@ function SupportingEvidence({
               ? `avg score ${outcomes.route_avg_score.toFixed(3)}`
               : "no routing decisions observed"
           }
-          tone="cyan"
+          tone="info"
         />
         <MetricCard
           label="Route avg score"
@@ -988,7 +989,7 @@ function SupportingEvidence({
               ? `avg score ${outcomes.compact_avg_score.toFixed(3)}`
               : "no compaction events observed"
           }
-          tone="violet"
+          tone="neutral"
         />
         <MetricCard
           label="Compact avg score"
@@ -1022,7 +1023,7 @@ function SupportingEvidence({
                 : "hover"
             }
             tone={
-              summary.advisor.golden.failures.length === 0 ? "emerald" : "red"
+              summary.advisor.golden.failures.length === 0 ? "success" : "destructive"
             }
           />
         </div>
@@ -1030,7 +1031,7 @@ function SupportingEvidence({
           label="Reread savings"
           value={fmtTok(summary.reread_telemetry.total_tokens_saved)}
           detail={fmtUsd(summary.reread_telemetry.total_cost_saved_usd)}
-          tone="cyan"
+          tone="info"
         />
         <MetricCard
           label="Routine reroute"
@@ -1038,12 +1039,12 @@ function SupportingEvidence({
             summary.model_routing_simulation.estimated_cost_saved_usd
           )}
           detail={`${summary.model_routing_simulation.candidate_count} candidate traces`}
-          tone="violet"
+          tone="neutral"
         />
       </div>
 
       <div className="grid gap-4 xl:grid-cols-[0.9fr_1.1fr]">
-        <article className="border border-neutral-800 bg-neutral-950/60 p-5">
+        <article className="rounded-lg border border-border/70 bg-background/60 p-4">
           <SectionHeader
             eyebrow="Coverage"
             title="Task mix"
@@ -1063,12 +1064,12 @@ function SupportingEvidence({
               ([bucket, count]) => (
                 <div
                   key={bucket}
-                  className="border border-neutral-800 bg-black/20 p-3"
+                  className="rounded-md border border-border/70 bg-background/60 p-3"
                 >
-                  <div className="text-[10px] font-mono uppercase tracking-widest text-neutral-400">
+                  <div className="text-caption font-mono uppercase tracking-widest text-neutral-400">
                     {bucket}
                   </div>
-                  <div className="mt-2 text-xl font-semibold text-neutral-100">
+                  <div className="mt-2 text-xl font-semibold text-foreground">
                     {count.toLocaleString()}
                   </div>
                 </div>
@@ -1077,16 +1078,16 @@ function SupportingEvidence({
           </div>
         </article>
 
-        <article className="border border-neutral-800 bg-neutral-950/60 p-5">
+        <article className="rounded-lg border border-border/70 bg-background/60 p-4">
           <SectionHeader eyebrow="Observed wins" title="Top levers" />
           <div className="mt-4 grid gap-3 md:grid-cols-3">
             {summary.auto_optimizations.slice(0, 3).map((item) => (
               <div
                 key={item.id}
-                className="border border-neutral-800 bg-black/20 p-3"
+                className="rounded-md border border-border/70 bg-background/60 p-3"
                 title={`${fmtTok(item.tokens_saved)} saved across ${item.session_count.toLocaleString()} sessions`}
               >
-                <div className="text-sm font-semibold text-neutral-100">
+                <div className="text-sm font-semibold text-foreground">
                   {item.title}
                 </div>
                 <div className="mt-2 text-xs text-neutral-400">
@@ -1099,7 +1100,7 @@ function SupportingEvidence({
       </div>
 
       {summary.external_optimizations?.payload?.overview != null && (
-        <article className="border border-neutral-800 bg-neutral-950/60 p-5">
+        <article className="rounded-lg border border-border/70 bg-background/60 p-4">
           <SectionHeader eyebrow="External analyzer" title="Codeburn" />
           <div className="mt-4 grid gap-4 md:grid-cols-4">
             <MetricCard
@@ -1113,7 +1114,7 @@ function SupportingEvidence({
                 summary.external_optimizations.payload.overview.health_grade
               }
               detail={`${summary.external_optimizations.payload.overview.health_score}/100`}
-              tone="cyan"
+              tone="info"
             />
             <MetricCard
               label="External savings"
@@ -1125,13 +1126,13 @@ function SupportingEvidence({
                 summary.external_optimizations.payload.overview
                   .estimated_tokens_saved
               )}
-              tone="emerald"
+              tone="success"
             />
             <MetricCard
               label="Issues"
               value={summary.external_optimizations.payload.overview.issue_count.toString()}
               detail={summary.external_optimizations.period}
-              tone="amber"
+              tone="warning"
             />
           </div>
         </article>
@@ -1150,22 +1151,39 @@ export default function Optimizations() {
   const [showSandbox, setShowSandbox] = useState(false);
 
   useEffect(() => {
+    let cancelled = false;
     setLoading(true);
     api
       .optimizationsSummary(days)
       .then((payload) => {
+        if (cancelled) return;
         setSummary(payload);
         setErr(null);
       })
-      .catch((error) => setErr(String(error)))
-      .finally(() => setLoading(false));
+      .catch((error) => {
+        if (!cancelled) setErr(error instanceof Error ? error.message : String(error));
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [days]);
 
   useEffect(() => {
+    let cancelled = false;
     api
       .outcomesSummary(range)
-      .then(setOutcomes)
-      .catch(() => setOutcomes(null));
+      .then((payload) => {
+        if (!cancelled) setOutcomes(payload);
+      })
+      .catch(() => {
+        if (!cancelled) setOutcomes(null);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [range]);
 
   useEffect(() => {
@@ -1235,17 +1253,17 @@ export default function Optimizations() {
     [summary, outcomes]
   );
 
-  if (err) return <div className="p-6 text-red-300">Error: {err}</div>;
+  if (err) return <div role="alert" className="p-4 text-body leading-6 text-muted-foreground">{err}</div>;
   if (!summary || loading || !currentCandidate || !selectedCandidate) {
     return (
-      <div className="p-6 italic text-neutral-400">
+      <div className="p-4 text-muted-foreground">
         Loading optimizations...
       </div>
     );
   }
 
   return (
-    <div className="space-y-8">
+    <div className="space-y-4">
       <section className="grid gap-4 md:grid-cols-4">
         <MetricCard
           label="Sessions analysed"
@@ -1269,7 +1287,7 @@ export default function Optimizations() {
           label="Current weekly cost"
           value={"-" + fmtUsd(currentCandidate.weekly_cost_usd)}
           detail={currentCandidate.policy.name}
-          tone="red"
+          tone="destructive"
         />
         <div title={summary.advisor.message}>
           <MetricCard
@@ -1283,7 +1301,7 @@ export default function Optimizations() {
                   )
                 : "hover for note"
             }
-            tone={summary.advisor.has_recommendation ? "emerald" : "amber"}
+            tone={summary.advisor.has_recommendation ? "success" : "warning"}
           />
         </div>
       </section>
@@ -1306,7 +1324,7 @@ export default function Optimizations() {
             const isRecommended =
               candidate.policy.preset === recommendedCandidate?.policy.preset;
             return (
-              <button
+              <UiButton unstyled
                 key={candidate.id}
                 type="button"
                 onClick={() => {
@@ -1314,18 +1332,18 @@ export default function Optimizations() {
                   setShowSandbox(false);
                 }}
                 className={cx(
-                  "border p-4 text-left transition",
+                  "rounded-lg border p-4 text-left transition-colors",
                   selected
-                    ? "border-amber-500/60 bg-amber-950/15"
-                    : "border-neutral-800 bg-neutral-950/60 hover:border-neutral-700"
+                    ? "border-border bg-neutral-800/70"
+                    : "border-border bg-background/60 hover:bg-muted/40"
                 )}
               >
                 <div className="flex flex-wrap items-center gap-2">
-                  <div className="text-sm font-semibold text-neutral-100">
+                  <div className="text-sm font-semibold text-foreground">
                     {candidate.policy.name}
                   </div>
                   {isCurrent && <Chip tone="neutral">Current</Chip>}
-                  {isRecommended && <Chip tone="amber">Recommended</Chip>}
+                  {isRecommended && <Chip tone="warning">Recommended</Chip>}
                 </div>
                 <div className="mt-2 text-xs uppercase tracking-widest text-neutral-400">
                   {fmtPolicyLabel(candidate.policy.preset)}
@@ -1347,7 +1365,7 @@ export default function Optimizations() {
                       <div
                         className={cx(
                           "mt-4 text-2xl font-semibold",
-                          isSaving ? "text-emerald-300" : "text-neutral-100"
+                          isSaving ? "text-emerald-300" : "text-foreground"
                         )}
                       >
                         {isSaving ? "+" : ""}
@@ -1357,7 +1375,7 @@ export default function Optimizations() {
                         savings / week
                       </div>
                       {hasBreakdown && (
-                        <div className="mt-3 space-y-1 border-t border-neutral-800 pt-3 text-xs">
+                        <div className="mt-3 space-y-1 border-t border-border pt-3 text-xs">
                           <div className="flex justify-between text-neutral-400">
                             <span>Read</span>
                             <span className="font-mono text-neutral-300">
@@ -1392,27 +1410,27 @@ export default function Optimizations() {
                   <div>Latency {candidate.latency_mult.toFixed(2)}x</div>
                   <div>Escalation {fmtPercent(candidate.escalation_rate)}</div>
                 </div>
-              </button>
+              </UiButton>
             );
           })}
 
-          <button
+          <UiButton unstyled
             type="button"
             onClick={() => setShowSandbox(true)}
             className={cx(
-              "border p-4 text-left transition",
+              "rounded-lg border p-4 text-left transition-colors",
               showSandbox
-                ? "border-amber-500/60 bg-amber-950/15"
-                : "border-neutral-800 bg-neutral-950/60 hover:border-neutral-700"
+                ? "border-border bg-neutral-800/70"
+                : "border-border bg-background/60 hover:bg-muted/40"
             )}
           >
-            <div className="text-sm font-semibold text-neutral-100">
+            <div className="text-sm font-semibold text-foreground">
               Advanced
             </div>
             <div className="mt-2 text-xs uppercase tracking-widest text-neutral-400">
               Custom Tuning
             </div>
-            <div className="mt-4 text-2xl font-semibold text-neutral-100">
+            <div className="mt-4 text-2xl font-semibold text-foreground">
               Sandbox
             </div>
             <div className="mt-1 text-xs text-neutral-400">
@@ -1421,7 +1439,7 @@ export default function Optimizations() {
             <div className="mt-4 space-y-2 text-sm text-neutral-300 italic">
               Adjust quality floors, compaction triggers, and routing.
             </div>
-          </button>
+          </UiButton>
         </div>
       </section>
 

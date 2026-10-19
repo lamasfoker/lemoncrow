@@ -12,7 +12,7 @@
   --n-200: 229 229 229;
   --n-300: 212 212 212;
   --n-400: 163 163 163;
-  --n-500: 115 115 115;
+  --n-500: 135 135 135; /* muted text: ≥4.5:1 on n-950…n-900 */
   --n-600: 82 82 82;
   --n-700: 64 64 64;
   --n-800: 38 38 38;
@@ -38,18 +38,46 @@
   --surface-raised: 13 13 13;
   --surface-tint: 15 15 15;
   --surface-overlay: 20 20 20;
+
+  /* shadcn semantic tokens — aliases onto the themed ramps, so one set serves both themes. */
+  --background: var(--n-950);
+  --foreground: var(--n-100);
+  --card: var(--surface-raised);
+  --card-foreground: var(--n-100);
+  /* anchored floating layers (menus, selects, popovers, tooltips) sit one step above the page */
+  --popover: var(--surface-overlay);
+  --popover-foreground: var(--n-200);
+  --primary: var(--n-100);
+  --primary-foreground: var(--n-950);
+  --secondary: var(--n-900);
+  --secondary-foreground: var(--n-300);
+  --muted: var(--n-900);
+  --muted-foreground: var(--n-500);
+  --accent: var(--n-800);
+  --accent-foreground: var(--n-50);
+  --destructive: var(--red-500);
+  --destructive-foreground: var(--red-200);
+  --success: var(--emerald-500);
+  --success-foreground: var(--emerald-200);
+  --warning: var(--amber-500);
+  --warning-foreground: var(--amber-200);
+  --info: var(--cyan-500);
+  --info-foreground: var(--cyan-200);
+  --border: var(--n-800);
+  --input: var(--n-700);
+  --ring: var(--n-500);
 }
 
 :root.light {
   color-scheme: light;
 
-  /* neutral ramp — inverted (preserves every fg/bg contrast pairing on light) */
+  /* neutral ramp — inverted (preserves every fg/bg contrast pairing on light; n-500 is tuned per theme for AA muted text) */
   --n-50: 10 10 10;
   --n-100: 23 23 23;
   --n-200: 38 38 38;
   --n-300: 64 64 64;
   --n-400: 82 82 82;
-  --n-500: 115 115 115;
+  --n-500: 107 107 107; /* muted text: ≥4.5:1 on n-950…n-900 */
   --n-600: 163 163 163;
   --n-700: 212 212 212;
   --n-800: 229 229 229;
@@ -62,7 +90,7 @@
   --surface-code: 247 247 248;
   --surface-raised: 255 255 255;
   --surface-tint: 250 250 250;
-  --surface-overlay: 240 240 240;
+  --surface-overlay: 255 255 255;
 }
 
 html,
@@ -106,16 +134,54 @@ html {
   scroll-behavior: smooth;
 }
 
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
 ::selection {
   background-color: rgb(var(--n-500) / 0.22);
   color: rgb(var(--n-100));
 }
 
+/* The Review visual system is the global application chrome. */
+.workbench-shell {
+  --workbench-ui-font: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --workbench-code-font: ui-monospace, "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-family: var(--workbench-ui-font);
+  font-feature-settings: "kern" 1, "liga" 1;
+  font-size: 12px;
+  line-height: 1.4;
+  accent-color: rgb(var(--brand-400));
+  caret-color: rgb(var(--brand-400));
+}
+
+.workbench-shell input,
+.workbench-shell select,
+.workbench-shell textarea,
+.workbench-shell button {
+  font-family: inherit;
+}
+
+.workbench-shell code,
+.workbench-shell pre,
+.workbench-shell kbd,
+.workbench-shell .font-mono {
+  font-family: var(--workbench-code-font);
+}
+
+/* Review-like focus: controls get a quiet neutral outline; text fields keep their own border treatment. */
 .workbench-shell :where(
-  input,
-  select,
-  textarea,
   button,
+  a,
   summary,
   [role="button"],
   [role="menuitem"],
@@ -127,95 +193,18 @@ html {
   [role="checkbox"],
   [role="radio"]
 ):focus-visible {
+  outline: 2px solid rgb(var(--ring));
+  outline-offset: 2px;
+}
+
+/* A highlighted menu item already shows focus through its background; no second ring. */
+.workbench-shell [role="menuitem"][data-highlighted]:focus-visible {
   outline: none;
-  border-color: rgb(var(--n-500) / 0.55) !important;
-  box-shadow: inset 0 0 0 1px rgb(var(--n-500) / 0.12) !important;
 }
 
-.workbench-shell a:focus-visible {
+/* Text fields draw their own focus ring (border + ring token), so the outline is suppressed. */
+.workbench-shell :where(input, select, textarea):focus-visible {
   outline: none;
-  text-decoration-line: underline;
-  text-decoration-color: rgb(var(--n-400) / 0.75);
-  text-decoration-thickness: 1px;
-  text-underline-offset: 3px;
-}
-.workbench-shell input,
-.workbench-shell select,
-.workbench-shell textarea {
-  background-color: rgb(var(--n-900));
-  border-color: rgb(var(--n-700));
-  color: rgb(var(--n-200));
-  font-family:
-    "Hack Nerd Font Mono", "Hack Nerd Font", "Droid Sans Mono", monospace;
-  font-feature-settings:
-    "liga" 1,
-    "calt" 1;
-}
-
-.workbench-shell select option {
-  background-color: rgb(var(--n-900));
-  color: rgb(var(--n-200));
-}
-
-.workbench-shell input::placeholder,
-.workbench-shell textarea::placeholder {
-  color: rgb(var(--n-500));
-}
-
-/* Code blocks - terminal style with Nerd Font */
-.workbench-shell code,
-.workbench-shell pre {
-  background-color: rgb(var(--surface-code));
-  border: 1px solid rgb(var(--n-800));
-  color: rgb(var(--n-200));
-  font-family:
-    "Hack Nerd Font Mono", "Hack Nerd Font", "Droid Sans Mono", monospace;
-  font-feature-settings:
-    "liga" 1,
-    "calt" 1;
-}
-
-/* Links */
-.workbench-shell a {
-  color: inherit;
-}
-
-.workbench-shell a:hover {
-  text-decoration: underline;
-}
-
-/* Table styles */
-.workbench-shell table {
-  border-color: rgb(var(--n-800));
-}
-
-.workbench-shell th,
-.workbench-shell td {
-  border-color: rgb(var(--n-800));
-}
-
-/* Button base */
-.workbench-shell button {
-  color: rgb(var(--n-200));
-  border-color: rgb(var(--n-700));
-}
-
-.workbench-shell button:hover {
-  background-color: rgb(var(--n-700));
-}
-
-#root {
-  background-color: rgb(var(--n-950));
-}
-
-/* The Review visual system is the global application chrome. */
-.workbench-shell {
-  font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  font-feature-settings: "kern" 1, "liga" 1;
-}
-
-.workbench-shell :where(button, input, select, textarea) {
-  font-family: inherit;
 }
 
 .workbench-shell :where(button, input, select, textarea, [role="button"], [role="tab"]) {
@@ -227,11 +216,22 @@ html {
   letter-spacing: normal;
 }
 
-.workbench-shell * {
-  box-shadow: none !important;
+/* Plain links inherit chrome color; explicit shared Button colors take precedence. */
+:where(.workbench-shell a) {
+  color: inherit;
 }
 
-/* Terminal-style borders for cards */
+.workbench-shell table,
+.workbench-shell th,
+.workbench-shell td {
+  border-color: rgb(var(--n-800));
+}
+
+#root {
+  background-color: rgb(var(--n-950));
+}
+
+/* Legacy class kept for compatibility, but rendered in the same neutral panel language as Review. */
 .terminal-card {
   border: 1px solid rgb(var(--n-800) / 0.7);
   border-radius: 0.5rem;
@@ -245,22 +245,22 @@ html {
 /* Status indicator styles */
 .status-active::before {
   content: "● ";
-  color: #10b981;
+  color: rgb(var(--emerald-500));
 }
 
 .status-inactive::before {
   content: "◦ ";
-  color: #6b7280;
+  color: rgb(var(--n-500));
 }
 
 .status-error::before {
   content: "✗ ";
-  color: #ef4444;
+  color: rgb(var(--red-500));
 }
 
 .status-warning::before {
   content: "⚠ ";
-  color: #f59e0b;
+  color: rgb(var(--amber-500));
 }
 
 /* ===== Accent palettes (themed: dark = native ramp, light = inverted) ===== */

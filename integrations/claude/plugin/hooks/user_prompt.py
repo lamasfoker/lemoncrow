@@ -625,29 +625,30 @@ def _emit_ui_messages(ui_messages: list[str], additional_context: str | None = N
     sys.stdout.flush()
 
 
-def _review_inbox_context(session_id: str) -> str | None:
-    """Claim exact-session Review feedback and inject it once into Claude."""
+def _review_inbox_context(session_id: str) -> tuple[str | None, tuple[str, ...]]:
+    """Lease exact-session Review feedback for one Claude prompt turn."""
 
     if not session_id:
-        return None
+        return None, ()
     try:
-        from lemoncrow.pro.capabilities.review.session_inbox import claim_session_messages
+        from lemoncrow.pro.capabilities.review.session_inbox import lease_session_messages
 
-        messages = claim_session_messages(
+        messages = lease_session_messages(
             _lemoncrow_root(),
             host="claude",
             session_id=session_id,
         )
     except Exception:
-        return None
+        return None, ()
     if not messages:
-        return None
+        return None, ()
     body = "\n\n---\n\n".join(item.message for item in messages)
     # Bound pathological review bundles without hiding normal feedback. The
     # canonical comments remain durable in Review if the hook has to truncate.
     if len(body) > 64_000:
         body = body[:64_000] + "\n\n…(additional Review feedback remains in LemonCrow Review)"
-    return '<lemoncrow_review_feedback source="exact-session-inbox">\n' f"{body}\n" "</lemoncrow_review_feedback>"
+    context = '<lemoncrow_review_feedback source="exact-session-inbox">\n' f"{body}\n" "</lemoncrow_review_feedback>"
+    return context, tuple(item.id for item in messages)
 
 
 # ---------------------------------------------------------------------------
@@ -690,16 +691,20 @@ def _frontload_context(prompt: str, payload: dict[str, Any]) -> str | None:
     old_handler = signal.signal(signal.SIGALRM, _timeout)
     signal.alarm(_FRONTLOAD_TIMEOUT_S)
     try:
-        from lemoncrow.pro.capabilities.code_context.engine import (
-            CodeContextEngine,
-            _default_db_path,
+        # The advanced engine is private: reach it only through the public
+        # provider seam, which raises ProEngineUnavailable (caught below) when
+        # the enterprise runtime is absent.
+        from lemoncrow.core.capabilities.code_intelligence_provider import (
+            create_code_intelligence_provider,
         )
+        from lemoncrow.core.foundation.paths import resolve_workspace_store_dir
 
         # Only an already-indexed workspace qualifies — indexing is not the
         # hook's job, and an empty store must not be created as a side effect.
-        if not _default_db_path(Path(workspace).resolve()).exists():
+        index_db = resolve_workspace_store_dir(workspace_root=Path(workspace).resolve()) / "code_context.sqlite"
+        if not index_db.exists():
             return None
-        engine = CodeContextEngine(workspace, autosync_enabled=False)
+        engine = create_code_intelligence_provider(workspace, autosync_enabled=False)
         result = engine.tool_explore(prompt, max_files=4, auto_index=False)
         if not (result.get("files") or result.get("related_symbols")):
             return None
@@ -781,25 +786,46 @@ def main() -> int:
                 transcript_path=transcript_path,
             )
     if session_id and _NOOP_PROMPT not in prompt:
-        # Feeds mcp_server.py's convergence-spiral detector: it reads
-        # sessions/<session_id>/stats.json's `turns` counter (maintained here,
-        # and already the Codex parity path's own turn counter) to reset its
-        # gather-streak counters on a genuinely new user turn -- a fresh
-        # question needs fresh exploration, so the old "searches/reads, 0
-        # edits" count must not carry over and misfire.
+        # Feeds mcp_server.py's convergence-spiral detector and renews the same
+        # low-frequency live-Review watcher lease used by Codex/OpenCode.
         with contextlib.suppress(Exception):
-            from lemoncrow.core.capabilities.plugin_runtime import update_session_stats
+            from lemoncrow.core.capabilities.plugin_runtime import (
+                _seed_live_review_prepare,
+                session_stats_path,
+                update_session_stats,
+            )
 
-            update_session_stats(_lemoncrow_root(), payload)
+            stats = update_session_stats(_lemoncrow_root(), payload)
+            workspace = str(payload.get("cwd") or os.environ.get("CLAUDE_WORKSPACE_ROOT") or os.getcwd())
+            if _seed_live_review_prepare(
+                _lemoncrow_root(),
+                payload,
+                stats,
+                host="claude",
+                workspace=workspace,
+            ):
+                stats_path = session_stats_path(_lemoncrow_root(), session_id)
+                stats_path.parent.mkdir(parents=True, exist_ok=True)
+                stats_path.write_text(json.dumps(stats, indent=2), encoding="utf-8")
     ui_messages: list[str] = []
     # Folds the last_user_prompt persist into a single session-state RMW.
     compact_msg = _maybe_emit_compaction_advice(prompt, transcript_path, stored_prompt, session_id)
     if compact_msg:
         ui_messages.append(compact_msg)
-    review_ctx = _review_inbox_context(session_id)
+    review_ctx, review_inbox_ids = _review_inbox_context(session_id)
     frontload_ctx = _frontload_context(prompt, payload)
     injected = "\n\n".join(item for item in (review_ctx, frontload_ctx) if item) or None
     _emit_ui_messages(ui_messages, injected)
+    if review_inbox_ids:
+        with contextlib.suppress(ImportError, OSError, TypeError, ValueError):
+            from lemoncrow.pro.capabilities.review.session_inbox import ack_session_messages
+
+            ack_session_messages(
+                _lemoncrow_root(),
+                host="claude",
+                session_id=session_id,
+                message_ids=review_inbox_ids,
+            )
 
     with contextlib.suppress(OSError, TypeError, ValueError):
         if session_id:

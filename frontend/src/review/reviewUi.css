@@ -5,12 +5,29 @@
   --review-border: rgb(var(--n-800) / 0.85);
   --review-surface: rgb(var(--surface-raised));
   --review-muted: rgb(var(--n-400));
+  --review-cta-fill: 238 231 216;
+  --review-cta-hover: 247 240 225;
+  --review-cta-text: 42 36 27;
+  --review-cta-border: 219 207 186;
+  --review-cta-finish-border: 151 119 76;
+  --review-cta-disabled-fill: 51 48 43;
+  --review-cta-disabled-text: 177 169 155;
   font-family: var(--review-ui-font);
   font-feature-settings: "kern" 1, "liga" 1;
-  font-size: 13px;
-  line-height: 1.5;
+  font-size: 12px;
+  line-height: 1.4;
   accent-color: rgb(var(--brand-400));
   caret-color: rgb(var(--brand-400));
+}
+
+:root.light .review-app {
+  --review-cta-fill: 23 23 23;
+  --review-cta-hover: 38 38 38;
+  --review-cta-text: 250 250 250;
+  --review-cta-border: 23 23 23;
+  --review-cta-finish-border: 38 38 38;
+  --review-cta-disabled-fill: 82 82 82;
+  --review-cta-disabled-text: 245 245 245;
 }
 
 .review-app input,
@@ -40,75 +57,35 @@
 
 .review-app :where(input, select, textarea):focus-visible {
   outline: none;
-  box-shadow: none;
 }
 
 .review-shell {
-  @apply bg-neutral-950 text-neutral-200;
+  @apply bg-background text-neutral-200;
 }
 
 .review-panel {
-  @apply rounded-lg border border-neutral-800/70 bg-neutral-950/95 shadow-[0_16px_48px_rgba(0,0,0,0.22)];
+  @apply rounded-lg border border-border/70 bg-background/95 shadow-[0_16px_48px_rgba(0,0,0,0.22)];
 }
 
 .review-panel-raised {
-  @apply rounded-lg border border-neutral-800/70 bg-neutral-900/65 shadow-[0_18px_54px_rgba(0,0,0,0.28)];
+  @apply rounded-lg border border-border/70 bg-muted/65 shadow-[0_18px_54px_rgba(0,0,0,0.28)];
 }
 
 .review-divider {
-  @apply border-neutral-800/70;
+  @apply border-border/70;
 }
 
 .review-kicker {
-  @apply text-[11px] font-semibold text-neutral-400;
+  @apply text-label font-semibold text-neutral-400;
 }
 
 .review-muted {
-  @apply text-[12px] leading-5 text-neutral-400;
+  @apply text-body leading-5 text-neutral-400;
 }
 
-.review-toolbar-button {
-  @apply inline-flex h-9 shrink-0 items-center justify-center gap-2 rounded-md border border-neutral-800/80 bg-neutral-900/55 px-3 text-[12px] font-medium text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-800/80 hover:text-neutral-50 disabled:cursor-not-allowed disabled:opacity-40;
-}
-
-.review-toolbar-button-primary {
-  @apply inline-flex h-9 shrink-0 items-center justify-center gap-2 rounded-md border border-neutral-200 bg-neutral-100 px-3.5 text-[12px] font-semibold text-neutral-950 transition-colors hover:border-neutral-200 hover:bg-neutral-200 disabled:cursor-not-allowed disabled:opacity-40;
-}
-
-.review-icon-button {
-  @apply inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-transparent text-neutral-400 transition-colors hover:border-neutral-800/80 hover:bg-neutral-900/80 hover:text-neutral-50 disabled:cursor-not-allowed disabled:opacity-40;
-}
-
-.review-compact-action {
-  @apply inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-md border border-transparent px-2 text-[12px] font-medium text-neutral-400 transition-colors hover:border-neutral-800/80 hover:bg-neutral-900/75 hover:text-neutral-50 disabled:cursor-not-allowed disabled:opacity-40;
-}
-
-.review-segment {
-  @apply inline-flex overflow-hidden rounded-md border border-neutral-800/80 bg-neutral-950;
-}
-
-.review-segment-button {
-  @apply px-2.5 py-1.5 text-[12px] font-medium text-neutral-400 transition-colors hover:bg-neutral-900 hover:text-neutral-50 focus-visible:z-10;
-}
-
-.review-segment-button-active {
-  @apply bg-neutral-800 text-neutral-100;
-}
-
-.review-pill {
-  @apply inline-flex items-center gap-1 rounded-md border border-neutral-800/70 bg-neutral-900/60 px-2 py-0.5 text-[11px] font-medium text-neutral-400;
-}
-
-.review-menu {
-  @apply rounded-lg border border-neutral-800/80 bg-neutral-950/95 p-1 shadow-2xl shadow-black/35;
-}
-
-.review-menu-item {
-  @apply flex w-full items-center gap-2 rounded-md px-3 py-2.5 text-left text-[12px] text-neutral-300 transition-colors hover:bg-neutral-900/85 hover:text-neutral-50 disabled:cursor-not-allowed disabled:opacity-40;
-}
-
+/* Buttons, menus, segments, pills and sheets are UI primitives now (src/components/ui). */
 .review-field {
-  @apply rounded-md border border-neutral-700/80 bg-neutral-900/55 px-3 py-2 text-[13px] text-neutral-200 placeholder:text-neutral-400 transition-colors hover:border-neutral-600 focus:border-neutral-400;
+  @apply rounded-md border border-input bg-secondary/90 px-2.5 py-1.5 text-body text-neutral-200 placeholder:text-muted-foreground transition-[color,border-color,box-shadow];
   outline: none;
   box-shadow: none;
 }
@@ -116,9 +93,9 @@
 .review-field:focus,
 .review-field:focus-within,
 .review-field:focus-visible {
-  border-color: rgb(var(--n-400) / 0.9);
+  border-color: rgb(var(--ring));
   outline: none;
-  box-shadow: none;
+  box-shadow: 0 0 0 2px rgb(var(--ring) / 0.15);
 }
 
 /* Keep the outline search glyph and clear action out of the text/placeholder.
@@ -127,14 +104,6 @@
 .review-outline-search-field {
   padding-left: 2rem;
   padding-right: 2rem;
-}
-
-.review-sheet-backdrop {
-  @apply fixed inset-0 z-[90] flex bg-black/50 backdrop-blur-[2px];
-}
-
-.review-sheet {
-  @apply border border-neutral-800/80 bg-neutral-950 shadow-2xl shadow-black/35;
 }
 
 .review-state-reviewed {
@@ -146,7 +115,7 @@
 }
 
 .review-attention-action {
-  @apply inline-flex h-6 shrink-0 items-center gap-1.5 rounded-md border border-current bg-black/10 px-2 text-[10px] font-medium text-current opacity-80 transition-colors hover:bg-black/20 hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-40;
+  @apply inline-flex h-6 shrink-0 items-center gap-1.5 rounded-md border border-current bg-black/10 px-2 text-caption font-medium text-current opacity-80 transition-colors hover:bg-black/20 hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-40;
 }
 
 .review-attention-action-primary {
@@ -154,19 +123,35 @@
 }
 
 /* Review chrome stays quiet; the change title and the next action lead. */
-/* Review chrome stays quiet; the change title and the next action lead. */
+.review-reader-primary {
+  border-color: rgb(var(--review-cta-border));
+  background-color: rgb(var(--review-cta-fill));
+  color: rgb(var(--review-cta-text));
+}
+.review-reader-primary:hover:not(:disabled):not([aria-disabled="true"]) {
+  background-color: rgb(var(--review-cta-hover));
+}
+.review-reader-primary[data-finish="true"]:not(:disabled):not([aria-disabled="true"]) {
+  border-color: rgb(var(--review-cta-finish-border));
+}
+.review-reader-primary:is(:disabled, [aria-disabled="true"]) {
+  border-color: rgb(var(--review-cta-disabled-fill));
+  background-color: rgb(var(--review-cta-disabled-fill));
+  color: rgb(var(--review-cta-disabled-text));
+  opacity: 1;
+}
 .review-reader-toolbar {
   display: flex;
   align-items: center;
-  gap: 12px;
-  min-height: 48px;
-  padding: 7px 20px;
+  gap: 8px;
+  min-height: 40px;
+  padding: 4px 12px;
 }
 
 .review-reader-identity {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 7px;
   flex: 1;
   min-width: 0;
   overflow: hidden;
@@ -179,7 +164,7 @@
   text-overflow: ellipsis;
   white-space: nowrap;
   text-align: left;
-  font-size: 15px;
+  font-size: 14px;
   font-weight: 600;
   letter-spacing: -0.015em;
   color: rgb(var(--n-100));
@@ -213,16 +198,24 @@
 }
 
 .review-reader-revision { order: 4; flex-shrink: 0; }
-.review-reader-progress { font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
-.review-reader-progress > span { color: var(--review-muted); }
-.review-reader-progress { font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
-.review-reader-progress > span { color: var(--review-muted); }
+.review-reader-commit-actions {
+  display: flex;
+  min-width: 0;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 6px;
+}
+.review-reader-menu-slot {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+}
 
 .review-outline {
   display: flex;
   flex-direction: column;
   flex-shrink: 0;
-  width: 256px;
+  width: var(--outline-width, 232px);
   border-right: 1px solid var(--review-border);
   background: rgb(var(--surface-tint));
 }
@@ -233,9 +226,44 @@
   box-shadow: none;
 }
 
-.review-target-header { min-height: 42px; padding: 6px 10px; font-size: 12px; }
-.review-target-header .review-icon-button { width: 30px; height: 30px; }
-.review-target-coverage { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--review-muted); }
+.review-target-header { min-height: 34px; padding: 4px 8px; font-size: 11px; }
+.review-target-coverage { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; color: var(--review-muted); }
+
+.review-target-end-actions {
+  display: flex;
+  min-height: 24px;
+  width: 100%;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 1px;
+  border-top: 1px solid rgb(var(--n-800) / 0.45);
+  padding: 1px 4px;
+  opacity: 0.28;
+  transition: opacity 120ms ease, background-color 120ms ease;
+}
+.review-target-end-actions:hover,
+.review-target-end-actions:focus-within {
+  background: rgb(var(--surface-tint) / 0.35);
+  opacity: 1;
+}
+.review-target-end-label {
+  margin-right: 3px;
+  font-size: 9px;
+  color: rgb(var(--n-500));
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* The sticky dock is the one visible horizontal scrollbar for Review diffs.
+   Pierre's inner panes remain scrollable/synchronizable without rendering
+   competing scrollbar chrome in every hunk/split pane. */
+[data-lc-review-inner-scroll="true"] {
+  scrollbar-width: none !important;
+}
+[data-lc-review-inner-scroll="true"]::-webkit-scrollbar {
+  width: 0 !important;
+  height: 0 !important;
+}
 
 /* Annotations are reading surfaces, with one boundary per thread. */
 .review-annotations {
@@ -243,8 +271,8 @@
   z-index: 4;
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  padding: 16px clamp(12px, 3vw, 32px);
+  gap: 4px;
+  padding: 4px 0;
   min-width: 0;
   white-space: normal;
   font-family: var(--review-ui-font);
@@ -254,60 +282,234 @@
 .review-thread,
 .review-composer {
   width: 100%;
-  max-width: 880px;
+  max-width: none;
   min-width: 0;
-  border: 1px solid var(--review-border);
-  border-radius: 12px;
-  background: var(--review-surface);
+  border: 1px solid var(--review-thread-border, var(--review-border));
+  border-radius: 8px;
+  background: var(--review-thread-bg, var(--review-surface));
 }
 
-.review-thread-blocking { border-color: rgb(var(--amber-700) / 0.65); }
-.review-thread-resolved { background: rgb(var(--surface-tint)); }
+.review-thread {
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.12);
+}
+
+.review-inline-annotation-stack {
+  width: 100%;
+  min-width: 0;
+}
+
+.review-inline-annotation-stack > * {
+  width: 100%;
+  max-width: none;
+}
+
+/*
+ * Inline comments are an inserted review surface, not tinted diff rows.
+ * GitHub, Graphite and Critique all make the discussion block itself opaque
+ * and visually separate from the code. Source colour belongs in the full-width
+ * header band; the message body stays neutral and maximally readable.
+ */
+.review-thread-src-human {
+  --review-thread-bg: rgb(var(--surface));
+  --review-thread-bg-resolved: rgb(var(--surface-tint));
+  --review-thread-header-bg: rgb(var(--amber-500) / 0.11);
+  --review-thread-header-border: rgb(var(--amber-500) / 0.24);
+  --review-thread-border: rgb(var(--n-700) / 0.9);
+}
+.review-thread-src-lemoncrow {
+  --review-thread-bg: rgb(var(--surface));
+  --review-thread-bg-resolved: rgb(var(--surface-tint));
+  --review-thread-header-bg: rgb(var(--emerald-500) / 0.105);
+  --review-thread-header-border: rgb(var(--emerald-500) / 0.24);
+  --review-thread-border: rgb(var(--n-700) / 0.9);
+}
+.review-thread-src-author,
+.review-thread-src-ai_review {
+  --review-thread-bg: rgb(var(--surface));
+  --review-thread-bg-resolved: rgb(var(--surface-tint));
+  --review-thread-header-bg: rgb(var(--violet-500) / 0.105);
+  --review-thread-header-border: rgb(var(--violet-500) / 0.24);
+  --review-thread-border: rgb(var(--n-700) / 0.9);
+}
+
+.review-thread-blocking {
+  --review-thread-header-bg: rgb(var(--amber-500) / 0.15);
+  --review-thread-header-border: rgb(var(--amber-500) / 0.36);
+}
+.review-thread-resolved {
+  background: var(--review-thread-bg-resolved, rgb(var(--surface-tint)));
+  opacity: 0.78;
+}
 
 .review-thread-heading {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
-  min-height: 44px;
-  padding: 10px 16px;
-  border-bottom: 1px solid var(--review-border);
-  font-size: 11px;
+  gap: 5px;
+  min-height: 24px;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--review-thread-header-border, var(--review-thread-border, var(--review-border)));
+  background: var(--review-thread-header-bg, rgb(var(--surface-tint)));
+  font-size: 10px;
 }
 
 .review-thread-source { font-size: 10px; font-weight: 600; letter-spacing: 0.035em; }
-.review-thread-author { font-size: 12px; font-weight: 600; color: rgb(var(--n-200)); overflow-wrap: anywhere; }
+.review-thread-author { font-size: 11px; font-weight: 600; color: rgb(var(--n-200)); overflow-wrap: anywhere; }
 .review-thread-symbol { overflow-wrap: anywhere; color: var(--review-muted); }
 .review-thread-date { color: var(--review-muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
-.review-thread-content { display: flex; flex-direction: column; gap: 12px; padding: 16px; min-width: 0; }
-.review-thread-title { font-size: 14px; font-weight: 600; line-height: 1.5; color: rgb(var(--n-100)); overflow-wrap: anywhere; }
-.review-thread-body { max-width: 75ch; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14px; line-height: 1.65; color: rgb(var(--n-200)); }
-.review-thread-anchor { width: fit-content; max-width: 100%; border-width: 1px; border-radius: 5px; padding: 2px 7px; font-size: 11px; overflow-wrap: anywhere; }
-.review-thread-anchor.text-neutral-500 { color: var(--review-muted); }
-.review-thread-evidence { font-size: 12px; color: var(--review-muted); overflow-wrap: anywhere; }
-.review-thread-evidence summary { width: fit-content; padding-block: 4px; }
-.review-thread-replies { display: flex; flex-direction: column; gap: 16px; border-top: 1px solid var(--review-border); padding-top: 16px; }
-.review-thread-reply { padding-left: 12px; border-left: 1px solid var(--review-border); }
-.review-thread-actions { display: flex; gap: 6px; border-top: 1px solid var(--review-border); padding-top: 10px; margin-bottom: -4px; }
+.review-thread-content { display: flex; flex-direction: column; gap: 4px; padding: 6px 8px; min-width: 0; }
+.review-thread-title { font-size: 13px; font-weight: 600; line-height: 1.35; color: rgb(var(--n-100)); overflow-wrap: anywhere; }
+.review-thread-body { max-width: 82ch; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; line-height: 1.4; color: rgb(var(--n-200)); }
+.review-thread-anchor { width: fit-content; max-width: 100%; border-width: 1px; border-radius: 5px; padding: 0 5px; font-size: 10px; overflow-wrap: anywhere; }
+.review-thread-anchor.text-muted-foreground { color: var(--review-muted); }
+.review-thread-evidence { font-size: 11px; color: var(--review-muted); overflow-wrap: anywhere; }
+.review-thread-evidence summary { width: fit-content; padding-block: 3px; }
+.review-thread-replies { display: flex; flex-direction: column; gap: 6px; border-top: 1px solid var(--review-border); padding-top: 6px; }
+.review-thread-reply { padding-left: 9px; border-left: 1px solid var(--review-border); }
+.review-thread-actions { display: flex; gap: 4px; border-top: 1px solid var(--review-border); padding-top: 4px; margin-bottom: -2px; }
 
-.review-composer { display: flex; flex-direction: column; gap: 12px; padding: 16px; }
-.review-composer-heading { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; color: rgb(var(--n-200)); overflow-wrap: anywhere; }
-.review-composer-input { display: block; width: 100%; min-height: 112px; resize: vertical; font-size: 14px; line-height: 1.65; background: rgb(var(--surface)); }
-.review-composer-options { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
-.review-composer-kind { min-height: 32px; padding: 5px 10px; border-width: 1px; border-radius: 6px; font-size: 12px; font-weight: 500; transition: background-color 150ms, border-color 150ms, color 150ms; }
-.review-composer-source-actions { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px; margin-left: 4px; padding-left: 8px; border-left: 1px solid var(--review-border); }
+.review-composer {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 5px;
+  border-radius: 8px;
+}
+.review-composer-heading {
+  display: flex;
+  min-height: 18px;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.25;
+  color: rgb(var(--n-200));
+  overflow-wrap: anywhere;
+}
+.review-composer-heading > svg { width: 14px; height: 14px; }
+.review-composer-input {
+  display: block;
+  width: 100%;
+  min-height: 40px;
+  height: 40px;
+  max-height: 220px;
+  resize: vertical;
+  border: 1px solid var(--review-border);
+  border-radius: 6px;
+  padding: 4px 7px;
+  font-size: 12px;
+  line-height: 1.35;
+  color: rgb(var(--n-200));
+  background: rgb(var(--surface));
+  outline: none;
+  box-shadow: none;
+}
+.review-composer-input:focus-visible {
+  border-color: rgb(var(--ring));
+  outline: none;
+  box-shadow: none;
+}
+.review-composer-options {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  margin-top: -2px;
+}
+.review-composer-kind {
+  display: inline-flex;
+  height: 22px;
+  min-height: 22px;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 0 6px;
+  border-width: 1px;
+  border-radius: 5px;
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 1;
+  white-space: nowrap;
+  transition: background-color 150ms, border-color 150ms, color 150ms, box-shadow 150ms;
+}
+.review-composer-kind[aria-pressed="true"] {
+  background: rgb(var(--surface-tint));
+  box-shadow: inset 0 0 0 1px rgb(var(--n-700) / 0.08);
+}
+.review-composer-source-actions {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  margin-left: 2px;
+  padding-left: 6px;
+  border-left: 1px solid var(--review-border);
+}
 .review-composer-kind-source { background: rgb(var(--surface-tint)); }
 .review-composer-kind-source:hover { background: rgb(var(--surface-raised)); }
-.review-composer-mark { display: flex; align-items: center; gap: 8px; font-size: 12px; color: rgb(var(--rose-300)); }
+.review-composer-mark { display: flex; align-items: center; gap: 5px; font-size: 10px; color: rgb(var(--rose-300)); }
 
 .review-source-composer {
   gap: 10px;
-  max-width: 960px;
+  max-width: none;
   border-radius: 10px;
   background: rgb(var(--surface-raised));
 }
 .review-source-composer-proposal { border-color: rgb(var(--violet-900) / 0.65); }
 .review-source-composer-edit { border-color: rgb(var(--sky-900) / 0.65); }
+.review-source-quick {
+  gap: 5px;
+  max-width: none;
+  border-color: rgb(var(--sky-900) / 0.55);
+  background: rgb(var(--surface-raised));
+  padding: 10px;
+}
+.review-quick-edit-heading { display: flex; min-width: 0; flex-wrap: wrap; align-items: center; gap: 6px; padding-inline: 2px; font-size: 11px; }
+.review-code-editor {
+  width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid rgb(var(--n-700) / 0.9);
+  border-radius: 6px;
+  background: rgb(var(--surface-sunken));
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+/* CodeMirror's structural rules must survive before its runtime theme is injected. */
+.review-code-editor .cm-editor {
+  display: flex !important;
+  flex-direction: column;
+  width: 100%;
+  min-width: 0;
+  min-height: var(--review-code-editor-min-height);
+  max-height: var(--review-code-editor-max-height);
+  background: transparent;
+  color: rgb(var(--n-200));
+  font-size: 13px;
+}
+.review-code-editor .cm-scroller {
+  display: flex !important;
+  align-items: flex-start !important;
+  flex: 1 1 auto;
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  font-family: var(--review-code-font);
+  line-height: 20px;
+  scrollbar-width: thin;
+}
+.review-code-editor .cm-gutters { display: flex !important; }
+.review-code-editor .cm-lineNumbers .cm-gutterElement { min-width: 3ch; }
+.review-code-editor .cm-content {
+  display: block;
+  min-height: var(--review-code-editor-content-height);
+  margin: 0;
+  padding: 10px 12px;
+  white-space: pre;
+  outline: none;
+}
+.review-code-editor .cm-line { display: block; padding: 0; }
+.review-quick-edit-footer { display: flex; min-width: 0; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 6px; }
 .review-source-composer-heading { min-width: 0; gap: 7px; }
 .review-source-location {
   max-width: min(56ch, 55%);
@@ -352,7 +554,9 @@
   line-height: 1.55;
   color: rgb(var(--n-400));
 }
-.review-source-edit-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px; }
+.review-source-edit-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr)); gap: 12px; }
+.review-source-expanded .review-source-edit-grid { grid-template-columns: minmax(0, 1fr); }
+.review-source-expanded .review-source-original { min-height: 0; max-height: 160px; }
 .review-source-pane { min-width: 0; }
 .review-source-pane-label {
   margin-bottom: 4px;
@@ -367,8 +571,8 @@
 .review-source-replacement {
   display: block;
   width: 100%;
-  min-height: 118px;
-  max-height: 280px;
+  min-height: 96px;
+  max-height: 240px;
   overflow: auto;
   border: 1px solid rgb(var(--n-800) / 0.9);
   border-radius: 6px;
@@ -380,7 +584,7 @@
 }
 .review-app .review-source-original { border: 1px solid rgb(var(--n-800) / 0.9); background: rgb(var(--surface-sunken)); white-space: pre; color: rgb(var(--n-500)); }
 .review-source-replacement { resize: vertical; color: rgb(var(--n-200)); }
-.review-source-intent { display: block; width: 100%; min-height: 58px; resize: vertical; font-size: 11px; }
+.review-source-intent { display: block; width: 100%; min-height: 48px; resize: vertical; font-size: 10px; }
 .review-source-preview-heading {
   display: flex;
   align-items: center;
@@ -392,7 +596,7 @@
   text-transform: uppercase;
   color: rgb(var(--n-500));
 }
-.review-source-preview-heading > :last-child { font-weight: 400; letter-spacing: 0; text-transform: none; color: rgb(var(--n-600)); }
+.review-source-preview-heading > :last-child { font-weight: 400; letter-spacing: 0; text-transform: none; color: rgb(var(--n-500)); }
 .review-proposal-patch {
   display: block;
   max-height: 320px;
@@ -422,31 +626,103 @@
   color: rgb(var(--amber-300));
 }
 
-.review-composer-mark input { width: 16px; height: 16px; flex-shrink: 0; }
-.review-composer-footer { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; border-top: 1px solid var(--review-border); padding-top: 12px; }
-.review-composer-shortcut { margin-right: auto; font-size: 11px; color: var(--review-muted); }
-.review-composer-shortcut kbd { font-family: inherit; }
+.review-composer-mark input { width: 14px; height: 14px; flex-shrink: 0; }
+.review-composer-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  border-top: 1px solid var(--review-border);
+  padding-top: 4px;
+}
+.review-composer-shortcut { margin-right: auto; font-size: 10px; color: var(--review-muted); }
+.review-composer-shortcut kbd {
+  border: 1px solid rgb(var(--n-700) / 0.55);
+  border-radius: 4px;
+  background: rgb(var(--surface-tint));
+  padding: 0 3px;
+  font-family: inherit;
+  font-size: 10px;
+  color: rgb(var(--n-400));
+}
 
-.review-comments-filters { padding: 12px 20px; border-bottom: 1px solid var(--review-border); overflow-x: auto; flex-shrink: 0; }
-.review-comments-filters .review-segment { display: flex; width: max-content; border: 0; gap: 4px; overflow: visible; background: transparent; }
-.review-comments-filters .review-segment-button { border-radius: 6px; }
-.review-comments-filters .review-segment-button > span { color: var(--review-muted); font-variant-numeric: tabular-nums; }
-.review-comments-empty { display: flex; flex-direction: column; align-items: center; gap: 16px; padding: 64px 20px; color: var(--review-muted); font-size: 14px; }
-.review-feedback-toolbar { display: flex; align-items: center; gap: 12px; padding: 16px 20px; }
+.review-comments-filters { padding: 8px 12px; border-bottom: 1px solid var(--review-border); overflow: visible; flex-shrink: 0; }
+.review-comments-empty { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 40px 14px; color: var(--review-muted); font-size: 12px; }
+.review-feedback-toolbar { display: flex; align-items: center; gap: 8px; padding: 10px 12px; }
 
 
 .review-directory-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1.8fr) minmax(140px, 0.65fr) 100px 140px;
+  grid-template-columns: minmax(0, 1.45fr) minmax(360px, 1.25fr) 100px 140px;
 }
 .review-hosted-inbox-grid {
   display: grid;
   grid-template-columns: minmax(0, 1.65fr) minmax(170px, 0.95fr) 84px 64px 112px;
 }
 
+/* One optional context row under the header: the most severe signal owns the
+   row, the rest become chips. Replaces the historical / attention / source /
+   revision-advanced bars that used to stack above the diff. */
+.review-context-strip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 30px;
+  padding: 2px 12px;
+  border-bottom-width: 1px;
+  font-size: 11px;
+  flex-shrink: 0;
+}
+.review-context-strip[data-signal="source"][data-tone="amber"] {
+  box-shadow: inset 0 1px 0 rgb(251 191 36 / 0.08), inset 3px 0 0 rgb(245 158 11 / 0.55);
+}
+.review-context-label { flex-shrink: 0; display: inline-flex; align-items: baseline; gap: 5px; font-weight: 650; white-space: nowrap; }
+.review-context-detail { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.review-context-detail > * + * { margin-left: 5px; }
+.review-context-chips { display: inline-flex; min-width: 0; flex-shrink: 1; align-items: center; gap: 4px; overflow: hidden; }
+.review-context-actions { display: inline-flex; flex-shrink: 0; align-items: center; gap: 4px; }
+.review-context-chip {
+  @apply inline-flex h-5 max-w-[220px] shrink-0 items-center gap-1 rounded-md border bg-transparent px-1.5 text-caption font-medium transition-colors disabled:cursor-default;
+}
+.review-context-action {
+  @apply inline-flex h-6 shrink-0 items-center rounded-md border px-2 text-caption font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-45;
+}
+.review-context-action-primary {
+  @apply inline-flex h-6 shrink-0 items-center rounded-md border px-2 text-caption font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-45;
+}
+
+/* Header Development action: count plus a quiet live dot for newer work. */
+.review-live-dot {
+  position: relative;
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: rgb(var(--sky-400));
+}
+.review-live-dot[data-active="true"]::after {
+  content: "";
+  position: absolute;
+  inset: -3px;
+  border-radius: 999px;
+  border: 1px solid rgb(var(--sky-400) / 0.6);
+  animation: review-live-ping 1.8s cubic-bezier(0.16, 1, 0.3, 1) infinite;
+}
+@keyframes review-live-ping {
+  0% { transform: scale(0.6); opacity: 0.9; }
+  100% { transform: scale(1.8); opacity: 0; }
+}
+
+.review-mobile-change-nav { display: none; }
+.review-reader-commit-actions,
+.review-reader-menu-slot { display: contents; }
+.review-surface-header { min-width: 0; }
+.review-surface-title { flex: 0 1 auto; }
+.review-surface-mode { flex-shrink: 0; }
+
 @media (max-width: 1023px) {
-  .review-reader-progress { display: none; }
-  .review-outline { width: 224px; }
+  .review-outline { width: var(--outline-width, 224px); }
 }
 
 @media (max-width: 767px) {
@@ -456,44 +732,345 @@
 }
 
 @media (max-width: 639px) {
-  .review-reader-toolbar { display: grid; grid-template-columns: 36px minmax(0, 1fr) auto; gap: 6px; padding: 10px 12px; }
-  .review-reader-identity { grid-column: 2 / 4; }
-  .review-reader-toolbar > nav { grid-column: 1; grid-row: 2; }
-  .review-reader-toolbar > details { grid-column: 3; grid-row: 2; }
+  /* Mobile Review is a different composition, not the desktop shell squeezed
+     narrower. Keep the change title dominant and move secondary state into the
+     context/footer surfaces. */
+  .review-reader-toolbar {
+    display: grid;
+    grid-template-columns: 32px minmax(0, 1fr) auto;
+    gap: 5px 7px;
+    min-height: 0;
+    padding: 6px 8px;
+  }
+  .review-reader-identity {
+    grid-column: 2;
+    grid-row: 1;
+    min-height: 32px;
+    gap: 4px;
+  }
+  /* Row 2 carries only the persistent views (Brief | Code | Map when earned),
+     labelled and evenly sized: nothing on it is ever found by scrolling. */
+  .review-reader-toolbar > nav {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    min-width: 0;
+    overflow: visible;
+  }
+  .review-reader-views {
+    display: grid !important;
+    grid-auto-flow: column;
+    grid-auto-columns: minmax(0, 1fr);
+    width: 100%;
+    margin-right: 0 !important;
+  }
+  .review-reader-views > button { min-height: 32px; justify-content: center; }
+  .review-tool-label { display: inline !important; }
+  .review-reader-menu-slot {
+    display: block;
+    grid-column: 3;
+    grid-row: 1;
+    align-self: center;
+    justify-self: end;
+  }
+  /* The sticky bottom dock: the primary action / Next first, then the
+     Changes / Activity / Comments / Status / Ask entry points as one labelled
+     row of equal cells. It wraps; it never scrolls sideways. */
+  .review-mobile-dock {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    flex-shrink: 0;
+    padding: 6px 8px calc(6px + env(safe-area-inset-bottom));
+    border-top: 1px solid rgb(var(--n-800) / 0.9);
+    background: rgb(var(--background) / 0.98);
+  }
+  .review-mobile-dock:empty { display: none; }
+  .review-reader-commit-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    min-width: 0;
+    overflow-x: visible;
+  }
+  .review-reader-commit-actions > * { flex-shrink: 0; }
+  .review-reader-commit-actions > div:has(> .review-reader-primary) { flex: 1 1 100%; }
+  .review-reader-commit-actions > div > .review-reader-primary { flex: 1 1 auto; }
+  .review-reader-tools {
+    display: grid;
+    grid-auto-flow: column;
+    grid-auto-columns: minmax(0, 1fr);
+    gap: 4px;
+    width: 100%;
+    min-width: 0;
+  }
+  .review-reader-tools > * { min-width: 0; }
+  .review-reader-tools > button {
+    min-height: 40px;
+    flex-direction: column;
+    justify-content: center;
+    gap: 1px;
+    padding-inline: 2px;
+    overflow: hidden;
+  }
+  .review-reader-tools > button > span {
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 11px;
+  }
+  .review-reader-tools .review-mobile-change-nav {
+    display: inline-flex;
+    min-height: 40px;
+    flex-direction: column;
+    justify-content: center;
+    gap: 1px;
+    padding: 0 2px;
+    font-size: 11px;
+  }
   .review-reader-title { font-size: 14px; }
-  .review-reader-authorship { display: inline-flex; min-width: 0; }
-  .review-reader-author,
-  .review-reader-source-context,
-  .review-reader-repo-context { display: none; }
-  .review-reader-mode-context { margin-left: 0; border-left: 0; padding-left: 0; }
-  .review-reader-primary { grid-column: 2; grid-row: 2; justify-self: end; max-width: 100%; height: auto; min-height: 36px; padding-block: 6px; white-space: normal; }
-  .review-outline { position: absolute; inset: 0 auto 0 0; z-index: 45; width: min(280px, calc(100% - 48px)); box-shadow: 12px 0 28px rgb(0 0 0 / 0.2); }
+  .review-reader-authorship,
+  .review-reader-revision { display: none; }
+  .review-reader-primary {
+    order: -1;
+    flex: 1 1 100%;
+    height: auto;
+    min-height: 34px;
+    max-width: none;
+    justify-content: center;
+    padding-block: 5px;
+    white-space: normal;
+  }
+
+  /* Context / Ask own the whole content area on a phone: one full-height
+     secondary panel at a time, never a sliver beside the Brief. */
+  .review-secondary-rail {
+    position: absolute !important;
+    inset: 0 !important;
+    z-index: 50 !important;
+    width: 100% !important;
+    border-left-width: 0 !important;
+    box-shadow: none !important;
+  }
+
+  /* Mobile opens Change navigation from the dock; no permanent left rail. */
+  .review-outline-collapsed { display: none !important; }
+  .review-outline {
+    position: absolute;
+    inset: 0 auto 0 0;
+    z-index: 45;
+    width: min(300px, calc(100% - 40px));
+    max-width: none;
+    box-shadow: 12px 0 28px rgb(0 0 0 / 0.2);
+  }
+
   .review-target-label { flex-wrap: wrap; }
   .review-target-coverage { flex-basis: 100%; padding-left: 12px; }
   .review-target-header { flex-wrap: wrap; }
   .review-target-header > div:first-child { flex-basis: 100%; }
   .review-target-header > div:last-child { margin-left: auto; }
-  .review-annotations { padding: 12px 8px; }
-  .review-thread-heading, .review-thread-content, .review-composer { padding: 12px; }
+  .review-annotations { padding: 8px 6px; }
+  .review-thread-heading, .review-thread-content, .review-composer { padding: 8px; }
   .review-composer-shortcut { display: none; }
   .review-composer-input { font-size: 16px; }
+  /* Zoom-safe text entry: iOS zooms any field under 16px on focus. Sheets and
+     dialogs portal outside .review-app, so they are covered explicitly. */
+  .review-app :is(input:not([type="checkbox"]):not([type="radio"]), textarea, select),
+  [role="dialog"] :is(input:not([type="checkbox"]):not([type="radio"]), textarea, select) { font-size: 16px !important; }
   .review-composer-source-actions { width: 100%; margin-left: 0; margin-top: 4px; padding-left: 0; padding-top: 8px; border-left: 0; border-top: 1px solid var(--review-border); }
   .review-source-edit-grid { grid-template-columns: minmax(0, 1fr); }
   .review-source-location { max-width: 45%; }
   .review-source-replacement, .review-source-intent { font-size: 16px; }
+  .review-code-editor .cm-editor { font-size: 16px; }
   .review-feedback-toolbar { flex-wrap: wrap; padding: 12px; }
   .review-feedback-toolbar > div:first-child { flex-basis: 100%; }
   .review-attention-bar { flex-wrap: wrap; }
+
+  .review-context-strip {
+    min-height: 30px;
+    flex-wrap: nowrap;
+    overflow: hidden;
+    padding: 4px 8px;
+    gap: 5px;
+  }
+  .review-context-label {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .review-context-detail {
+    min-width: 0;
+    flex-basis: auto;
+    order: initial;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .review-context-strip[data-signal="running-draft"] .review-context-detail { display: none; }
+  .review-context-chips {
+    margin-left: auto;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .review-context-chips::-webkit-scrollbar { display: none; }
+  .review-context-actions { order: initial; flex-wrap: nowrap; }
+
+  .review-mobile-change-nav {
+    display: inline-flex;
+    min-height: 28px;
+    align-items: center;
+    border: 1px solid rgb(var(--n-700) / 0.75);
+    border-radius: 6px;
+    padding: 0 8px;
+    font-weight: 650;
+    color: rgb(var(--n-200));
+    background: rgb(var(--surface-tint));
+  }
+
+  /* Surface headers become kind/status, title, then view controls. */
+  .review-surface-header {
+    display: grid !important;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 5px 8px;
+    min-height: 0 !important;
+    padding: 7px 9px !important;
+  }
+  .review-surface-kind {
+    grid-column: 1;
+    grid-row: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .review-surface-status {
+    grid-column: 2;
+    grid-row: 1;
+    justify-self: end;
+  }
+  .review-surface-title {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    width: 100%;
+    min-width: 0;
+  }
+  .review-surface-title > * { width: 100%; max-width: 100%; }
+  .review-surface-spacer { display: none; }
+  .review-surface-meta {
+    grid-column: 1 / -1;
+  }
+  .review-surface-mode {
+    grid-column: 1 / -1;
+    display: grid !important;
+    width: 100%;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .review-surface-mode > button {
+    min-height: 32px;
+    justify-content: center;
+    padding-inline: 10px;
+  }
+
+  /* Unrun checks stay compact instead of reserving a half-screen canvas. */
+  .review-service-preview,
+  .review-api-preview { padding: 9px !important; }
+  .review-service-preview-heading,
+  .review-api-preview-heading {
+    margin-bottom: 8px !important;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding-bottom: 8px !important;
+  }
+  .review-service-preview-heading > div,
+  .review-api-preview-heading > div {
+    min-width: 0;
+    flex: 1 1 180px;
+  }
+  .review-service-preview-heading > button,
+  .review-api-preview-heading > button {
+    min-height: 34px;
+    height: 34px !important;
+    padding-inline: 10px;
+  }
+  .review-api-preview-heading { flex-wrap: wrap; }
+  .review-api-preview-heading > div { min-width: 0; }
+  .review-surface-run-message {
+    margin-bottom: 8px !important;
+    padding: 7px 9px !important;
+    line-height: 1.45;
+  }
+  .review-surface-result-empty {
+    min-height: 54px !important;
+    border-color: rgb(var(--n-800) / 0.7);
+    background: rgb(var(--surface-tint) / 0.28);
+  }
+  .review-service-preview .grid.grid-cols-2,
+  .review-api-preview .grid.grid-cols-2 {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  /* Inbox becomes a card list instead of a two-column desktop table. */
+  .review-inbox-toolbar {
+    display: grid !important;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 8px !important;
+  }
+  .review-inbox-search {
+    grid-column: 1 / -1;
+    width: 100%;
+    max-width: none !important;
+    min-width: 0 !important;
+    height: 38px !important;
+  }
+  .review-inbox-search button { padding-inline: 12px; }
+  .review-inbox-filter { min-width: 0; }
+  .review-inbox-filter > * { width: 100%; }
+  .review-inbox-environment { justify-self: start; }
+  .review-directory-heading { display: none !important; }
+  .review-directory-grid.review-directory-row {
+    display: block;
+    min-height: 0;
+    padding: 12px;
+    border-top: 0;
+    border-bottom: 1px solid rgb(var(--n-800) / 0.8);
+  }
+  .review-directory-grid.review-directory-row:last-child { border-bottom: 0; }
+  .review-directory-row > div:first-child { padding-right: 0; }
+  .review-directory-row > div:first-child > div:first-child { align-items: flex-start; }
+  .review-directory-row > div:first-child > div:first-child > span {
+    white-space: normal;
+    overflow: visible;
+    text-overflow: clip;
+    line-height: 1.35;
+  }
+  .review-directory-row > div:first-child > div:nth-child(2) {
+    margin-top: 4px;
+    padding-left: 20px;
+    white-space: normal;
+  }
+  .review-inbox-next {
+    margin-top: 10px;
+    padding: 9px 0 0 !important;
+    border-top: 1px solid rgb(var(--n-800) / 0.55);
+  }
+  .review-inbox-next > div:first-child {
+    overflow: visible;
+    white-space: normal;
+    font-size: 12px;
+  }
+  .review-inbox-next > div:nth-child(2) {
+    margin-top: 3px;
+    flex-wrap: wrap;
+    overflow: visible;
+    white-space: normal;
+  }
 }
 
 @media (pointer: coarse) {
-  .review-app .review-icon-button,
-  .review-app .review-compact-action,
-  .review-app .review-toolbar-button,
-  .review-app .review-toolbar-button-primary,
-  .review-app .review-segment-button,
   .review-composer-kind { min-height: 44px; }
-  .review-app .review-icon-button { min-width: 44px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -507,7 +1084,7 @@
 .review-horizontal-scrollbar {
   height: 14px;
   overscroll-behavior-x: contain;
-  scrollbar-color: rgb(82 82 91) rgb(10 10 10 / 0.96);
+  scrollbar-color: rgb(var(--n-600)) rgb(var(--n-900) / 0.96);
   scrollbar-width: auto;
   box-shadow: 0 -1px 0 rgb(255 255 255 / 0.025);
 }
@@ -517,15 +1094,15 @@
 }
 
 .review-horizontal-scrollbar::-webkit-scrollbar-track {
-  background: rgb(10 10 10 / 0.96);
+  background: rgb(var(--n-900) / 0.96);
 }
 
 .review-horizontal-scrollbar::-webkit-scrollbar-thumb {
-  border: 3px solid rgb(10 10 10 / 0.96);
+  border: 3px solid rgb(var(--n-900) / 0.96);
   border-radius: 999px;
-  background: rgb(82 82 91);
+  background: rgb(var(--n-600));
 }
 
 .review-horizontal-scrollbar::-webkit-scrollbar-thumb:hover {
-  background: rgb(113 113 122);
+  background: rgb(var(--n-500));
 }

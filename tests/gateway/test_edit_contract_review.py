@@ -43,6 +43,7 @@ def _setup_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     (tmp_path / "db" / "client.py").write_text(_CLIENT, encoding="utf-8")
 
 
+@pytest.mark.private_engine
 @_requires_astgrep
 def test_edit_surfaces_parallel_consumer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _setup_workspace(tmp_path, monkeypatch)
@@ -112,6 +113,7 @@ def test_no_literal_removed_attaches_nothing(tmp_path: Path, monkeypatch: pytest
     assert "FIXME" not in result
 
 
+@pytest.mark.private_engine
 @_requires_astgrep
 def test_edit_surfaces_symbol_consumer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # Symbol counterpart of the literal pass: renaming a module-level constant must
@@ -146,6 +148,7 @@ def test_edit_surfaces_symbol_consumer(tmp_path: Path, monkeypatch: pytest.Monke
     assert "pkg/config.py" not in all_paths  # edited file excluded
 
 
+@pytest.mark.private_engine
 @_requires_astgrep
 def test_edit_surfaces_signature_change_caller(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # A def that gains a REQUIRED parameter must surface the call sites in other files

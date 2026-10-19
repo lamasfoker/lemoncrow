@@ -54,6 +54,7 @@ from .models import (
     EvidenceRecord,
     EvidenceStatus,
     ImpactSite,
+    ProvenanceAttribution,
     ProvenanceCertainty,
     ProvenanceRecord,
     ProvenanceStatus,
@@ -413,7 +414,7 @@ def _run_ledger_head(store_root: Path, session_id: str | None) -> str:
 
 
 def _session_dirs(store_root: Path) -> dict[str, Path]:
-    """Return ``{session_id: directory}`` for every session under *store_root*.
+    """Return session-id and host-qualified lookup keys for stored sessions.
 
     One walk of ``sessions/YYYY/MM/DD/<host>/<id>`` rather than
     :func:`find_session_dir`'s glob per lookup: the exact-edit pass asks about
@@ -430,6 +431,7 @@ def _session_dirs(store_root: Path) -> dict[str, Path]:
         for path in sorted(sessions_root.glob("*/*/*/*/*")):
             if path.is_dir():
                 out.setdefault(path.name, path)
+                out.setdefault(f"{path.parent.name.strip().lower()}:{path.name}", path)
     except OSError:
         return out
     return out
@@ -594,6 +596,76 @@ def _exact_edit_anchor(
     return _Correlation(record, trace, _reads_degraded(record))
 
 
+def collect_exact_file_attributions(
+    store_root: Path,
+    repo_root: Path,
+    packet_paths: Sequence[str],
+    *,
+    head_commit_time: datetime | None,
+) -> tuple[ProvenanceAttribution, ...]:
+    """Return every exact edit-time author claim scoped to changed files.
+
+    Unlike the revision-level correlator this intentionally does not choose a
+    winner. If two exact sessions edited one file, both rows are preserved and
+    downstream feedback routing treats that scope as ambiguous instead of
+    silently assigning it to whichever session happened to be active later.
+    """
+
+    targets = tuple(item for item in packet_paths if str(item).strip())
+    if not targets:
+        return ()
+    candidates, _degraded = _load_candidates(store_root, _anchor(head_commit_time))
+    directories = _session_dirs(store_root)
+    if not candidates or not directories:
+        return ()
+    plain = [name for name in (_basename(_normalize(item)) for item in targets) if name]
+    needles = frozenset(plain) | frozenset(json.dumps(name)[1:-1] for name in plain)
+    root = _normalize(str(repo_root))
+    out: dict[tuple[str, str, str], ProvenanceAttribution] = {}
+    seen: set[tuple[str, str]] = set()
+    for trace in candidates:
+        session_id = (trace.session_id or "").strip()
+        trace_host = (trace.host or "").strip().lower()
+        identity = (trace_host, session_id)
+        if not session_id or identity in seen:
+            continue
+        seen.add(identity)
+        directory = directories.get(f"{trace_host}:{session_id}") if trace_host else None
+        if directory is None:
+            directory = directories.get(session_id)
+        if directory is None:
+            continue
+        recorded, event_host, event_model = _recorded_edits(directory / "run.json", needles)
+        workspace_is_repo = _same_workspace(trace, repo_root)
+        in_repo = tuple(item for item in recorded if _under_repo(root, item, workspace_is_repo=workspace_is_repo))
+        hits = _match_paths(in_repo, targets)
+        if not hits:
+            continue
+        projected = _record_from_trace(
+            trace,
+            status="matched",
+            confidence=1.0,
+            certainty="exact",
+            reason="recorded at edit time",
+        )
+        host = (projected.host or event_host or "").strip().lower()
+        model = (projected.model or event_model or "").strip()
+        if not host:
+            continue
+        for path in hits:
+            key = (path, host, session_id)
+            out[key] = ProvenanceAttribution(
+                scope="file",
+                scope_key=path,
+                host=host,
+                session_id=session_id,
+                model=model,
+                certainty="exact",
+                method="recorded_edit",
+            )
+    return tuple(out[key] for key in sorted(out))
+
+
 # --------------------------------------------------------------------------- #
 # Scoring                                                                     #
 # --------------------------------------------------------------------------- #
@@ -718,6 +790,7 @@ def _correlate(
     head_sha: str,
     head_commit_time: datetime | None,
     session_id: str | None = None,
+    session_id_is_hint: bool = False,
 ) -> _Correlation:
     """Run the whole correlation once, keeping the winning trace for the caller."""
 
@@ -728,7 +801,7 @@ def _correlate(
     except OSError:
         root = repo_root
 
-    if session_id:
+    if session_id and not session_id_is_hint:
         # The user's escape hatch from the heuristic: explicit means explicit,
         # so a miss reports the miss instead of quietly scoring instead.
         trace = load_trace_for_session(store_root, session_id)
@@ -971,6 +1044,7 @@ def collect_provenance(
     head_sha: str,
     head_commit_time: datetime | None,
     session_id: str | None = None,
+    session_id_is_hint: bool = False,
 ) -> tuple[ProvenanceRecord, tuple[EvidenceRecord, ...], tuple[str, ...]]:
     """Return ``(record, evidence, degraded)`` -- the packet orchestrator's hook.
 
@@ -987,6 +1061,7 @@ def collect_provenance(
             head_sha=head_sha,
             head_commit_time=head_commit_time,
             session_id=session_id,
+            session_id_is_hint=session_id_is_hint,
         )
     except Exception:
         # The contract is total. An unexpected failure costs a degradation

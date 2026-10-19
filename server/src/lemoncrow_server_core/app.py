@@ -1,7 +1,7 @@
 """Shared HTTP handlers for the LemonCrow server engine.
 
-The class in this module deliberately does not own authentication, RBAC,
-entitlement, quota, hosted Review, or deployment wiring.  Those are composition
+The class in this module deliberately does not own authentication,
+authorization, commercial policy, or deployment wiring.  Those are composition
 concerns supplied by subclasses.  Session/view/index/dispatch behavior lives
 here once so local and hosted servers cannot drift.
 """
@@ -11,9 +11,15 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextvars
 import logging
+import multiprocessing
+import os
+import re
+import time
 import zlib
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ProcessPoolExecutor
 from contextlib import nullcontext
 from dataclasses import replace
 from functools import partial
@@ -40,20 +46,23 @@ from .http.wire import (
     require_str_array,
     sse_frame,
 )
-from .index.analysis import analyze
+from .index.analysis import analyze_foreground
 from .index.boundary import addressable
 from .index.contracts import (
     AnalysisArtifact,
+    IndexBackend,
     ManifestEntry,
     RepoIdentityClaim,
     sha256_hex,
     validate_digest,
     validate_path,
 )
+from .index.deferred import cancel_deferred_view, enqueue_deferred_view
 from .index.manifest import required_digests
 from .matrix import Site, require_server_side, site_of
 from .protocol import RESULT_REUSE_CAPABILITY, negotiate, server_identity
-from .sessions import Session, require_acknowledged_revision
+from .read_budget import ReadBudget, read_budget
+from .sessions import Session, SessionAccess, require_acknowledged_revision
 from .workspace import WorkspaceStatus
 
 __all__ = [
@@ -66,6 +75,95 @@ __all__ = [
 
 _LOG: Final[logging.Logger] = logging.getLogger("lemoncrow.server")
 _T = TypeVar("_T")
+_ANALYSIS_PARALLEL_MIN_FILES: Final[int] = 192
+#: Large enough to amortize process-pool serialization/scheduling, small enough
+#: for two workers to keep sharing a heterogeneous upload batch. On the 250k
+#: scale fixture's representative 1,000-file sample, 32-file chunks were ~10%
+#: faster than the previous 8-file chunks while preserving the same artifacts.
+_ANALYSIS_CHUNK_FILES: Final[int] = 32
+_READ_PATH_SUFFIX: Final[re.Pattern[str]] = re.compile(
+    r":(?:L?\d+(?:-L?\d*)?|full|minified|summary|outline|head=\d+|tail=\d+)(?:=(?:true|1))?$"
+)
+_READ_PATH_KEYS: Final[tuple[str, ...]] = ("path", "file_path", "filePath")
+#: Renewal times kept for session-bound Views before stale ones are dropped.
+_VIEW_RENEWALS_KEPT: Final[int] = 4096
+
+
+def _requested_lease_s(body: Mapping[str, Any], default_s: float, max_s: float) -> float:
+    """The lease a View opens with: the client's request, capped, else the default."""
+    requested = body.get("lease_s")
+    if requested is None:
+        return default_s
+    if isinstance(requested, bool) or not isinstance(requested, (int, float)) or not 0 < requested:
+        raise ServerError(ErrorCode.PAYLOAD_INVALID, "lease_s must be a positive number of seconds")
+    return min(float(requested), max_s)
+
+
+def _exact_read_paths(arguments: Mapping[str, Any]) -> tuple[str, ...] | None:
+    """Exact repository paths named by a ``read`` call, else ``None``.
+
+    ``None`` deliberately means "use the complete workspace". Only request
+    shapes whose filesystem scope is explicit are eligible for lazy path
+    materialization; symbol-only reads and malformed/ambiguous shapes retain
+    the existing whole-tree behavior.
+    """
+
+    def normalized(raw: object) -> str | None:
+        if not isinstance(raw, str) or not raw:
+            return None
+        path = _READ_PATH_SUFFIX.sub("", raw)
+        try:
+            return validate_path(path)
+        except ServerError:
+            return None
+
+    files = arguments.get("files")
+    paths: list[str] = []
+    if files is not None:
+        if not isinstance(files, list) or not files:
+            return None
+        for item in files:
+            if isinstance(item, str):
+                path = normalized(item)
+            elif isinstance(item, Mapping):
+                raw = next((item.get(key) for key in _READ_PATH_KEYS if item.get(key)), None)
+                path = normalized(raw)
+            else:
+                return None
+            if path is None:
+                return None
+            paths.append(path)
+    else:
+        raw = next((arguments.get(key) for key in _READ_PATH_KEYS if arguments.get(key)), None)
+        path = normalized(raw)
+        if path is None:
+            return None
+        paths.append(path)
+    return tuple(dict.fromkeys(paths))
+
+
+def build_analysis_executor(dispatch_workers: int) -> ProcessPoolExecutor | None:
+    """A conservative process pool for CPU-bound Layer-1 derivation.
+
+    Layer-1 analysis is dominated by Python semantic/trigram work, so threads do
+    not improve throughput. Spawn avoids forking live SQLite connections and
+    server threads. Two workers nearly saturate the measured 2-CPU deployment
+    while keeping child-process memory bounded; larger hosts can be revisited
+    from evidence rather than multiplying server memory by default.
+    """
+    process_cpu_count = getattr(os, "process_cpu_count", os.cpu_count)
+    workers = min(2, max(1, int(dispatch_workers)), max(1, process_cpu_count() or 1))
+    if workers < 2:
+        return None
+    return ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn"))
+
+
+def _analyze_chunk(items: Sequence[tuple[str, str, bytes]]) -> tuple[AnalysisArtifact, ...]:
+    # Upload acknowledgement needs complete lexical/symbol evidence, but ANN
+    # chunk vectors are already a deferred semantic-layer concern. Keeping them
+    # off this foreground path materially shortens first sync for large repos.
+    return tuple(analyze_foreground(digest, profile, data) for digest, profile, data in items)
+
 
 HEADER_VIEW: Final[str] = "X-LemonCrow-View"
 HEADER_REVISION: Final[str] = "X-LemonCrow-View-Revision"
@@ -168,9 +266,9 @@ def _decode_blob(raw: Mapping[str, Any], *, limit: int) -> bytes:
 class CoreServerRoutes:
     """Shared session/tool/view/blob handlers; composition is supplied outside."""
 
-    def core_route_defs(self) -> tuple[web.RouteDef, ...]:
-        """Routes owned by the shared engine, independent of deployment mode."""
-        return (
+    def core_route_defs(self, *, include_tools: bool = True) -> tuple[web.RouteDef, ...]:
+        """Routes owned by the shared engine. Tool execution is Runtime-owned."""
+        base = (
             web.get("/healthz", self.health),
             web.get("/readyz", self.ready),
             web.get("/.well-known/lemoncrow-server.json", self.discovery),
@@ -179,8 +277,16 @@ class CoreServerRoutes:
             web.get("/v1/sessions/{session_id}", self.session_status),
             web.post("/v1/sessions/{session_id}/cancel", self.session_cancel),
             web.delete("/v1/sessions/{session_id}", self.session_close),
-            web.get("/v1/tools", self.tool_list),
-            web.post("/v1/tools/{name}", self.tool_call),
+        )
+        tools = (
+            (
+                web.get("/v1/tools", self.tool_list),
+                web.post("/v1/tools/{name}", self.tool_call),
+            )
+            if include_tools
+            else ()
+        )
+        sync = (
             web.post("/v1/views/open", self.view_open),
             web.post("/v1/views/{view_id}/manifest-chunks", self.view_manifest_chunks),
             web.post("/v1/views/{view_id}/missing", self.view_missing),
@@ -189,6 +295,7 @@ class CoreServerRoutes:
             web.post("/v1/views/{view_id}/close", self.view_close),
             web.post("/v1/blobs", self.blobs_upload),
         )
+        return (*base, *tools, *sync)
 
     def _storage_budget(
         self,
@@ -316,6 +423,30 @@ class CoreServerRoutes:
     async def _forget_view_owner(self, org_id: str, view_id: str) -> None:
         self.view_owners.forget(org_id, view_id)
 
+    def _content_subject_for_view(self, principal: Principal, repo_id: str) -> str:
+        """Return the opaque content scope used by the public single-user engine."""
+        del principal, repo_id
+        return ""
+
+    def _record_content_provenance(
+        self, org_id: str, repo_id: str, content_subject: str, digests: Sequence[str]
+    ) -> int:
+        """Record verified bytes in the composition-selected opaque content scope."""
+        return self.backend.provenance.record(org_id, repo_id, content_subject, digests)
+
+    def _note_view_scope(self, *, org_id: str, view_id: str, repo_id: str) -> None:
+        """Composition hook for deployments that maintain external view scope state."""
+        del org_id, view_id, repo_id
+
+    def _forget_view_scope(self, org_id: str, view_id: str) -> None:
+        """Composition hook paired with _note_view_scope."""
+        del org_id, view_id
+
+    def _resolved_session_access(self, principal: Principal, session: Session) -> SessionAccess:
+        """Access token used after a session has already resolved for this caller."""
+        del session
+        return self._access(principal)
+
     async def _session_store_call(self, fn: Callable[..., _T], /, *args: Any, **kwargs: Any) -> _T:
         """Run a session-store operation without penalizing local mode.
 
@@ -332,8 +463,51 @@ class CoreServerRoutes:
     ) -> Session:
         """Resolve through the subclass's subject-aware `_session` boundary."""
         if not bool(getattr(self.sessions, "io_bound", False)):
-            return self._session(request, principal, session_id)
-        return await self._in_worker(partial(self._session, request, principal, session_id))
+            session = self._session(request, principal, session_id)
+        else:
+            session = await self._in_worker(partial(self._session, request, principal, session_id))
+        await self._keep_view_leased(session)
+        return session
+
+    def _view_lease_renewals(self) -> dict[str, float]:
+        renewals: dict[str, float] | None = getattr(self, "_view_lease_renewed_at", None)
+        if renewals is None:
+            renewals = {}
+            self._view_lease_renewed_at = renewals
+        return renewals
+
+    def _note_view_leased(self, view_id: str) -> None:
+        renewals = self._view_lease_renewals()
+        now = time.monotonic()
+        renewals[view_id] = now
+        if len(renewals) > _VIEW_RENEWALS_KEPT:
+            # Forgetting a View only costs it one early renewal.
+            horizon = now - self.config.view_lease_s
+            for stale in [key for key, at in renewals.items() if at < horizon]:
+                del renewals[stale]
+
+    async def _keep_view_leased(self, session: Session) -> None:
+        """Extend the lease of the View an active session is bound to.
+
+        Renews once the lease is half spent, so an active View costs one write
+        per half lease. A lapsed or closed View is not revived; the request
+        that uses it reports that, and the client reopens it.
+        """
+        view_id = session.view_id
+        if not view_id or not self._view_lease_due(view_id):
+            return
+        try:
+            await self._authority_call(self.backend.views.renew, session.org_id, view_id, self.config.view_lease_s)
+        except ServerError:
+            self._view_lease_renewals().pop(view_id, None)
+
+    def _view_lease_due(self, view_id: str) -> bool:
+        """Whether *view_id*'s lease is half spent; claims the renewal when it is."""
+        renewed_at = self._view_lease_renewals().get(view_id)
+        if renewed_at is not None and time.monotonic() - renewed_at < self.config.view_lease_s / 2:
+            return False
+        self._note_view_leased(view_id)
+        return True
 
     async def _close_session_store(self, access: Any, session_id: str) -> bool:
         return await self._session_store_call(self.sessions.close, access, session_id)
@@ -346,6 +520,26 @@ class CoreServerRoutes:
 
     async def discovery(self, request: web.Request) -> web.StreamResponse:
         return json_response(self._server_identity())
+
+    async def review_manifest(self, request: web.Request) -> web.StreamResponse:
+        """The Review capability manifest on the Review API, for callers that skip the handshake.
+
+        The same document as discovery's ``product_capabilities.review``, plus
+        the protocol window, so a Reader or terminal call can check skew and
+        gate a feature in one authenticated read.
+        """
+        self._principal(request)
+        identity = self._server_identity()
+        capabilities = identity.get("product_capabilities")
+        review = capabilities.get("review") if isinstance(capabilities, Mapping) else None
+        return json_response(
+            {
+                "protocol_version": identity["protocol_version"],
+                "supported_protocol_versions": identity["supported_protocol_versions"],
+                "deployment": identity.get("deployment") or {},
+                "product_capabilities": {"review": review if isinstance(review, Mapping) else {}},
+            }
+        )
 
     async def handshake(self, request: web.Request) -> web.StreamResponse:
         """Negotiate before authenticating, so a stale client learns *why*.
@@ -390,10 +584,10 @@ class CoreServerRoutes:
         target = body.get("request_id")
         tenant = self._tenant(request, principal, session)
         if target is None:
-            count = self.cancels.cancel_session(session.session_id)
+            count = await self.cancels.cancel_session_async(session.session_id)
             self._emit("session.cancel", AuditDecision.ALLOW, tenant, counts={"cancelled": count})
             return json_response({"cancelled": count})
-        cancelled = self.cancels.cancel(session.session_id, validate_opaque_id(target, "request_id"))
+        cancelled = await self.cancels.cancel_async(session.session_id, validate_opaque_id(target, "request_id"))
         self._emit("session.cancel", AuditDecision.ALLOW, tenant, counts={"cancelled": int(cancelled)})
         return json_response({"cancelled": 1 if cancelled else 0})
 
@@ -419,9 +613,9 @@ class CoreServerRoutes:
             # there" answer is a success, and that answer must not depend on
             # whether somebody else's session happens to be behind the id.
             return json_response({"closed": False, "cancelled": 0})
-        cancelled = self.cancels.cancel_session(session.session_id)
+        cancelled = await self.cancels.cancel_session_async(session.session_id)
         closed = await self._close_session_store(
-            self._access(principal, cross_subject=session.subject != principal.subject),
+            self._resolved_session_access(principal, session),
             session.session_id,
         )
         self.blob_miss.forget_session(session.session_id)
@@ -512,7 +706,7 @@ class CoreServerRoutes:
         )
 
         async with self.gate.hold(principal.org_id):
-            with self.cancels.track(session.session_id, tenant.request_id) as token:
+            async with self.cancels.track_async(session.session_id, tenant.request_id) as token:
                 if self.result_reuse.matches(body.get("reuse_validator"), reuse_validator):
                     self._emit(
                         "tool.invoke",
@@ -647,6 +841,36 @@ class CoreServerRoutes:
         if self.workspace_resolver is not None:
             root = self.workspace_resolver(invocation.tenant)
             return replace(invocation, workspace_root=root), None
+
+        # Native index tools can explicitly prove that their authoritative
+        # answer does not require a filesystem tree. Keep this capability on
+        # the dispatcher rather than a server-side tool-name allowlist: wrappers
+        # that still reach the public registry retain full materialization by
+        # default, and a future native tool has to opt in at its implementation
+        # boundary before it can bypass the workspace isolation layer.
+        requires_workspace = getattr(self.dispatcher, "requires_workspace", None)
+        if callable(requires_workspace) and not requires_workspace(invocation):
+            view_id = invocation.tenant.view_id
+            if view_id is None:
+                return invocation, None
+            revision = int(invocation.tenant.view_revision or 0)
+            status = CoreServerRoutes._content_status(self, invocation.tenant.org_id, view_id, revision)
+            if status is None and hasattr(self, "backend"):
+                # Sync normally populated this already. A cold/restarted route
+                # can still recover the same fact without creating tens of
+                # thousands of filesystem entries. Lightweight binder test
+                # doubles intentionally omit the backend and keep the old
+                # no-status behavior.
+                await asyncio.get_running_loop().run_in_executor(
+                    self._executor,
+                    CoreServerRoutes._still_missing,
+                    self,
+                    invocation.tenant.principal,
+                    view_id,
+                )
+                status = CoreServerRoutes._content_status(self, invocation.tenant.org_id, view_id, revision)
+            return invocation, status
+
         materializer = self.workspace
         if materializer is None:
             return invocation, None
@@ -658,49 +882,65 @@ class CoreServerRoutes:
             return replace(invocation, workspace_root=str(materializer.empty_root)), None
         org_id = invocation.tenant.org_id
         revision = int(invocation.tenant.view_revision or 0)
-        materialized = await asyncio.get_running_loop().run_in_executor(
-            self._executor,
-            materializer.materialize,
-            org_id,
-            view_id,
-            revision,
-        )
+        exact_paths = _exact_read_paths(invocation.arguments) if invocation.tool == "read" else None
+        if exact_paths is not None and hasattr(self, "backend"):
+            for path in exact_paths:
+                entry = await CoreServerRoutes._authority_call(self, self.backend.views.entry, org_id, view_id, path)
+                if entry is None:
+                    # A read path may name a directory (or another non-file
+                    # selector). Only exact manifest entries are safe for
+                    # path-scoped materialization.
+                    exact_paths = None
+                    break
+        if exact_paths is None:
+            materialize = partial(materializer.materialize, org_id, view_id, revision)
+        else:
+            materialize = partial(materializer.materialize_paths, org_id, view_id, revision, exact_paths)
+        materialized = await asyncio.get_running_loop().run_in_executor(self._executor, materialize)
         return replace(invocation, workspace_root=str(materialized.root)), materialized.status
 
     async def _dispatch(self, invocation: ToolInvocation, token: Any) -> ToolResult:
-        """Run the synchronous dispatcher off the event loop, with a deadline.
+        """Run off the event loop; abandoned database reads release their snapshots."""
+        deadline_s = self.config.limits.tool_deadline_s
+        budget = ReadBudget(deadline=time.monotonic() + deadline_s)
 
-        Cancellation stops the *response*; it cannot interrupt a call already
-        running inside the worker thread. The abandoned thread is bounded by
-        ``dispatch_workers`` and by the tool deadline, and the client is told
-        the truth (``cancelled``) rather than being left waiting.
-        """
+        def dispatch() -> ToolResult:
+            with read_budget(budget):
+                budget.check()
+                return self.dispatcher.dispatch(invocation)
+
         loop = asyncio.get_running_loop()
-        work: asyncio.Future[ToolResult] = loop.run_in_executor(self._executor, self.dispatcher.dispatch, invocation)
+        work: asyncio.Future[ToolResult] = loop.run_in_executor(self._executor, dispatch)
         waiter: asyncio.Future[None] = asyncio.ensure_future(token.wait())
         racing: set[asyncio.Future[Any]] = {work, waiter}
         try:
             done, _pending = await asyncio.wait(
                 racing,
-                timeout=self.config.limits.tool_deadline_s,
+                timeout=deadline_s,
                 return_when=asyncio.FIRST_COMPLETED,
             )
+            if work in done:
+                return work.result()
+            if waiter in done:
+                raise ServerError(
+                    ErrorCode.CANCELLED,
+                    "request was cancelled by the client",
+                    details={"tool": invocation.tool},
+                )
+            raise ServerError(
+                ErrorCode.DEADLINE_EXCEEDED,
+                "tool call exceeded the server deadline",
+                details={"tool": invocation.tool, "deadline_s": deadline_s},
+            )
         finally:
+            budget.cancelled.set()
+            if not work.done():
+                work.cancel()
+            elif not work.cancelled():
+                # Consume a failure racing with cancellation of the handler.
+                work.exception()
             if not waiter.done():
                 waiter.cancel()
-        if work in done:
-            return work.result()
-        if waiter in done:
-            raise ServerError(
-                ErrorCode.CANCELLED,
-                "request was cancelled by the client",
-                details={"tool": invocation.tool},
-            )
-        raise ServerError(
-            ErrorCode.DEADLINE_EXCEEDED,
-            "tool call exceeded the server deadline",
-            details={"tool": invocation.tool, "deadline_s": self.config.limits.tool_deadline_s},
-        )
 
     async def _stream(
         self,
@@ -754,17 +994,10 @@ class CoreServerRoutes:
         claim = RepoIdentityClaim.from_json(require_object(body, "repo_identity"))
         repo_id = await self._authority_call(self.backend.repos.canonical_repo_id, principal.org_id, claim)
         chunk_ids = require_str_array(body, "manifest_chunks", max_len=4096)
-        # Which demonstrated possession this view may read content through, and
-        # the one moment it can be decided. The repository identity is the
-        # client's own claim -- a root-commit fingerprint is no harder to learn
-        # than a digest -- so claiming a colleague's repository must not inherit
-        # their content. It does not: unless a binding names this repository as
-        # a sharing unit, the view is scoped to what its opener has themselves
-        # demonstrated, and a blob a colleague uploaded reads exactly like one
-        # nobody has ever held. Fixed here rather than per request because the
-        # derived layers and the materialized tree are cached per view, and a
-        # reach that widened for one caller would still be cached for the next.
-        shared = self.authorizer.scoped.shares_repository(principal, principal.org_id, repo_id)
+        # The shared engine stores an opaque content scope on the View. The
+        # public local composition uses one default scope; other compositions
+        # may choose a narrower or shared scope before the View is opened.
+        content_subject = self._content_subject_for_view(principal, repo_id)
         result = await self._authority_call(
             self.backend.views.open,
             org_id=principal.org_id,
@@ -772,10 +1005,11 @@ class CoreServerRoutes:
             base_revision=require_str(body, "base_revision", max_len=128),
             manifest_root=validate_digest(body.get("manifest_root"), "manifest_root"),
             chunk_ids=chunk_ids,
-            lease_s=self.config.view_lease_s,
-            content_subject="" if shared else principal.subject,
+            lease_s=_requested_lease_s(body, self.config.view_lease_s, self.config.view_lease_max_s),
+            content_subject=content_subject,
             owner_subject=principal.subject,
         )
+        self._note_view_leased(result.state.view_id)
         grant = self.local_fs.negotiate(
             require_object(body, "local_fs") or None,
             session_granted="local_fs" in session.capabilities,
@@ -802,12 +1036,10 @@ class CoreServerRoutes:
             view_id=result.state.view_id,
             subject=principal.subject,
         )
-        # And this is where the view sits in the org -> team -> repo tree. It
-        # is the one moment the data plane knows the repository a view belongs
-        # to, and without it the scope directory stays empty: repository- and
-        # team-scoped bindings would reach nothing, so the only sharing grant
-        # expressible would be a per-view one.
-        self.authorizer.scoped.note_view(
+        # Deployment-specific scope placement is a composition concern. Local
+        # mode has nothing to record; managed deployments install their policy
+        # through this hook.
+        self._note_view_scope(
             org_id=principal.org_id,
             view_id=result.state.view_id,
             repo_id=repo_id,
@@ -836,11 +1068,23 @@ class CoreServerRoutes:
             },
         )
         payload = result.to_wire()
+        if result.state.manifest_complete and self.backend.warm_generation is not None:
+            # Hosted nodes can hydrate an immutable generation bundle before
+            # the first query. A miss/stale bundle is only an optimization miss;
+            # normal deferred derivation remains the source of correctness.
+            await self._authority_call(
+                self.backend.warm_generation,
+                principal.org_id,
+                result.state.view_id,
+            )
         # Layer-2 says what the view declares; the boundary below it says which
         # of those it may actually read. The join happens here so no store ever
         # answers a question about content outside the asking view's scope --
         # another tenant's, or a colleague's in this one.
-        payload["missing_digests"] = await self._in_worker(self._still_missing, principal, result.state.view_id)
+        missing = await self._in_worker(self._still_missing, principal, result.state.view_id)
+        payload["missing_digests"] = missing
+        if result.state.manifest_complete and not missing:
+            enqueue_deferred_view(self.backend, principal.org_id, result.state.view_id)
         payload["layers"] = await self._authority_call(
             self.degradation.layer_report, org_id=principal.org_id, view_id=result.state.view_id
         )
@@ -884,18 +1128,20 @@ class CoreServerRoutes:
                 self._local_fs_complete_revisions.move_to_end(key)
             return 0
 
+        backend = self.backend.for_repository(org_id, state.repo_id)
         filled = self.local_fs.fill(
             grant,
             org_id=org_id,
             entries=entries,
-            content=self.backend.content,
-            analysis=self.backend.analysis,
+            content=backend.content,
+            analysis=backend.analysis,
             needed=outstanding,
+            analyze_batch=self._derive_analysis_artifacts_sync,
         )
-        self.backend.provenance.record(
+        self._record_content_provenance(
             org_id,
             state.repo_id,
-            principal.subject,
+            state.content_subject,
             filled.filled,
         )
         if state.manifest_complete and not (set(outstanding) - set(filled.filled)):
@@ -925,9 +1171,11 @@ class CoreServerRoutes:
 
         A same-host fill reads and hashes the developer checkout. On the loop
         that stalls every request, health checks included, and clients see
-        ``timed out`` instead of an answer.
+        ``timed out`` instead of an answer. The work runs in a copy of the
+        caller's context, as ``asyncio.to_thread`` does.
         """
-        return await asyncio.get_running_loop().run_in_executor(self._executor, fn, *args)
+        context = contextvars.copy_context()
+        return await asyncio.get_running_loop().run_in_executor(self._executor, partial(context.run, fn, *args))
 
     async def _authority_call(self, fn: Callable[..., _T], /, *args: Any, **kwargs: Any) -> _T:
         """Call an authoritative store without penalizing local storage.
@@ -947,9 +1195,64 @@ class CoreServerRoutes:
             return fn(*args, **kwargs)
         return await self._in_worker(partial(fn, *args, **kwargs))
 
+    def _derive_analysis_artifacts_sync(
+        self, pending: Sequence[tuple[str, str, bytes]]
+    ) -> tuple[AnalysisArtifact, ...]:
+        """CPU-bound Layer-1 derivation for callers already off the event loop."""
+        if not pending:
+            return ()
+        executor = getattr(self, "_analysis_executor", None)
+        if executor is None or len(pending) < _ANALYSIS_PARALLEL_MIN_FILES:
+            return _analyze_chunk(pending)
+        chunks = tuple(
+            tuple(pending[start : start + _ANALYSIS_CHUNK_FILES])
+            for start in range(0, len(pending), _ANALYSIS_CHUNK_FILES)
+        )
+        try:
+            futures = tuple(executor.submit(_analyze_chunk, chunk) for chunk in chunks)
+            parts = tuple(future.result() for future in futures)
+        except Exception as exc:
+            # The process pool is an optimization only. A broken/unavailable
+            # worker must cost throughput, never correctness or availability.
+            _LOG.warning("parallel Layer-1 analysis unavailable; falling back inline: %s", exc)
+            return _analyze_chunk(pending)
+        return tuple(artifact for part in parts for artifact in part)
+
+    async def _derive_analysis_artifacts(
+        self, pending: Sequence[tuple[str, str, bytes]]
+    ) -> tuple[AnalysisArtifact, ...]:
+        """Derive one validated upload batch, parallel only when it pays."""
+        if not pending:
+            return ()
+        executor = getattr(self, "_analysis_executor", None)
+        # Serial derivation is pure CPU (parsing, AST walks); it runs on a
+        # worker thread so the event loop keeps serving while a batch analyzes.
+        if executor is None or len(pending) < _ANALYSIS_PARALLEL_MIN_FILES:
+            return await asyncio.to_thread(_analyze_chunk, pending)
+        chunks = tuple(
+            tuple(pending[start : start + _ANALYSIS_CHUNK_FILES])
+            for start in range(0, len(pending), _ANALYSIS_CHUNK_FILES)
+        )
+        loop = asyncio.get_running_loop()
+        try:
+            parts = await asyncio.gather(*(loop.run_in_executor(executor, _analyze_chunk, chunk) for chunk in chunks))
+        except Exception as exc:
+            # Parallel derivation is purely an optimization. If a worker cannot
+            # start/import or the pool becomes broken, preserve correctness and
+            # availability by deriving the already-validated bounded batch here.
+            _LOG.warning("parallel Layer-1 analysis unavailable; falling back inline: %s", exc)
+            return await asyncio.to_thread(_analyze_chunk, pending)
+        return tuple(artifact for part in parts for artifact in part)
+
     def _search_prewarm_work(self, principal: Principal, view_id: str) -> None:
         workspace = self.workspace
         prewarm = getattr(self.dispatcher, "prewarm_workspace", None)
+        # A native index dispatcher may expose a filesystem accelerator while
+        # explicitly declaring that it is optional. In that composition, eager
+        # prewarm would reconstruct the entire repository during sync and erase
+        # the cold-start benefit of workspace-independent search.
+        if getattr(self.dispatcher, "eager_workspace_prewarm", True) is False:
+            return
         if workspace is None or not callable(prewarm):
             return
         try:
@@ -982,10 +1285,50 @@ class CoreServerRoutes:
 
         Computed from the view's own membership after any same-host fill, so the
         answer is identical whether the bytes arrived by upload or off disk.
+        The same pass records an exact content-completeness status for native
+        workspace-free tools. That preserves the old degradation contract
+        without reconstructing a filesystem tree merely to count missing paths.
         """
         self._fill_from_local_fs(principal, view_id)
         org_id = principal.org_id
-        return self._outstanding(org_id, view_id, self._required_entries(org_id, view_id))
+        state = self.backend.views.get(org_id, view_id)
+        bound_backend = self.backend.for_view(org_id, view_id)
+        reachability = bound_backend.view_content_reachability
+        if reachability is not None:
+            summary = reachability(org_id, view_id, self.config.limits.max_indexed_content_bytes)
+            missing = list(summary.missing_digests)
+            required_paths = summary.required_paths
+            missing_paths = summary.missing_paths
+        else:
+            entries = self._required_entries(org_id, view_id)
+            missing = self._outstanding(org_id, view_id, entries)
+            missing_set = set(missing)
+            required_paths = len(entries)
+            missing_paths = sum(1 for entry in entries if entry.content_digest in missing_set)
+        over_cap_paths = max(0, state.entry_count - required_paths)
+        absent_paths = over_cap_paths + missing_paths
+        status = WorkspaceStatus(
+            view_revision=state.view_revision,
+            member_paths=state.entry_count,
+            materialized_paths=max(0, state.entry_count - absent_paths),
+            absent_paths=absent_paths,
+            over_cap_paths=over_cap_paths,
+        )
+        cache = getattr(self, "_content_status_by_view", None)
+        if cache is None:
+            cache = {}
+            self._content_status_by_view = cache
+        cache[(org_id, view_id)] = status
+        return missing
+
+    def _content_status(self, org_id: str, view_id: str, view_revision: int) -> WorkspaceStatus | None:
+        cache = getattr(self, "_content_status_by_view", None)
+        if not isinstance(cache, dict):
+            return None
+        status = cache.get((org_id, view_id))
+        if isinstance(status, WorkspaceStatus) and status.view_revision == view_revision:
+            return status
+        return None
 
     async def view_manifest_chunks(self, request: web.Request) -> web.StreamResponse:
         principal = self._principal(request)
@@ -995,6 +1338,15 @@ class CoreServerRoutes:
         await self._owned_view(request, principal, session, view_id)
         body = await self._body(request)
         entries = _manifest_entries(body, limit=self.config.limits.max_manifest_entries_per_chunk)
+        raw_completion_check = body.get("completion_check")
+        if raw_completion_check is not None and not isinstance(raw_completion_check, bool):
+            raise ServerError(
+                ErrorCode.PAYLOAD_INVALID,
+                "completion_check must be a boolean",
+                details={"field": "completion_check"},
+                action=AgentAction.FIX_REQUEST,
+            )
+        completion_check = raw_completion_check is not False
         state = await self._authority_call(
             self.backend.views.put_manifest_chunk,
             org_id=principal.org_id,
@@ -1005,10 +1357,16 @@ class CoreServerRoutes:
         tenant = self._tenant(request, principal, session, view_id=view_id, view_revision=state.view_revision)
         self._emit("view.manifest_chunk", AuditDecision.ALLOW, tenant, counts={"entries": len(entries)})
         payload = state.to_wire()
-        missing_digests = await self._in_worker(self._still_missing, principal, view_id)
-        payload["missing_digests"] = missing_digests
-        if not missing_digests:
-            self._schedule_search_refresh(principal, view_id)
+        if completion_check:
+            missing_digests = await self._in_worker(self._still_missing, principal, view_id)
+            payload["missing_digests"] = missing_digests
+            if not missing_digests:
+                self._schedule_search_refresh(principal, view_id)
+        else:
+            # New clients make one explicit completion query after the entire
+            # manifest stream. Returning an empty placeholder keeps the response
+            # shape stable without doing an O(View) scan per intermediate chunk.
+            payload["missing_digests"] = []
         return json_response(payload)
 
     async def view_missing(self, request: web.Request) -> web.StreamResponse:
@@ -1054,6 +1412,8 @@ class CoreServerRoutes:
         undeclared = [digest for digest in asked if digest not in declared]
         if not outstanding:
             current = self.backend.views.get(principal.org_id, view_id)
+            if current.manifest_complete:
+                enqueue_deferred_view(self.backend, principal.org_id, view_id)
             if current.view_revision == 0:
                 await self._prewarm_search(principal, view_id)
             else:
@@ -1096,7 +1456,10 @@ class CoreServerRoutes:
             counts={"entries": len(entries), "removed": len(removed)},
         )
         payload = state.to_wire()
-        payload["missing_digests"] = await self._in_worker(self._still_missing, principal, view_id)
+        missing = await self._in_worker(self._still_missing, principal, view_id)
+        payload["missing_digests"] = missing
+        if state.manifest_complete and not missing:
+            enqueue_deferred_view(self.backend, principal.org_id, view_id)
         return json_response(payload)
 
     async def view_query(self, request: web.Request) -> web.StreamResponse:
@@ -1186,14 +1549,18 @@ class CoreServerRoutes:
         # workspace accounting with one refused request. It refuses like every
         # other view route now.
         await self._owned_view(request, principal, session, view_id)
+        cancel_deferred_view(self.backend, view_id)
         await self._authority_call(self.backend.views.close, principal.org_id, view_id)
         self.backend.links.forget(principal.org_id, view_id)
         self.backend.semantic.forget(principal.org_id, view_id)
         await self._forget_view_owner(principal.org_id, view_id)
-        self.authorizer.scoped.forget_view(principal.org_id, view_id)
+        self._forget_view_scope(principal.org_id, view_id)
         self._local_fs_grants.pop((principal.org_id, view_id), None)
         self._local_fs_repo_fingerprints.pop((principal.org_id, view_id), None)
         self._local_fs_complete_revisions.pop((principal.org_id, view_id), None)
+        content_status = getattr(self, "_content_status_by_view", None)
+        if isinstance(content_status, dict):
+            content_status.pop((principal.org_id, view_id), None)
         if self.workspace is not None:
             forget_accelerator = getattr(self.dispatcher, "forget_workspace", None)
             if callable(forget_accelerator):
@@ -1214,6 +1581,7 @@ class CoreServerRoutes:
         prepared: Sequence[tuple[str, Mapping[str, Any], str]],
         artifacts: Mapping[tuple[str, str], AnalysisArtifact],
         budget: Any,
+        backend: IndexBackend | None = None,
     ) -> list[str]:
         """Commit one validated upload batch, on a worker for remote content.
 
@@ -1221,19 +1589,28 @@ class CoreServerRoutes:
         reads the ContentStore before and after the write, so a remote object
         catalogue must not enter/exit that context on aiohttp's event loop.
         """
+        backend = self.backend if backend is None else backend
         stored: list[str] = []
+        batch = getattr(backend.analysis, "batch", None)
         with budget:
-            for digest, raw, profile in prepared:
-                data = _decode_blob(raw, limit=self.config.limits.max_blob_bytes)
-                ref = self.backend.content.put(org_id, digest, data)
-                self.backend.analysis.ensure(
-                    org_id,
-                    digest,
-                    profile,
-                    data,
-                    artifact=artifacts[(digest, profile)],
-                )
-                stored.append(ref.digest)
+            # The request is already bounded by max_blobs_per_request and
+            # max_request_bytes. Keep the validated upload batch in one durable
+            # analysis transaction instead of committing once per file; the
+            # latter turns a large cold sync into extreme SQLite/WAL write
+            # amplification. Stores without a bulk transaction keep their
+            # existing behavior through nullcontext().
+            with batch() if callable(batch) else nullcontext():
+                for digest, raw, profile in prepared:
+                    data = _decode_blob(raw, limit=self.config.limits.max_blob_bytes)
+                    ref = backend.content.put(org_id, digest, data)
+                    backend.analysis.ensure(
+                        org_id,
+                        digest,
+                        profile,
+                        data,
+                        artifact=artifacts[(digest, profile)],
+                    )
+                    stored.append(ref.digest)
         return stored
 
     async def blobs_upload(self, request: web.Request) -> web.StreamResponse:
@@ -1252,10 +1629,29 @@ class CoreServerRoutes:
             await self._owned_view(request, principal, session, view_id)
         body = await self._body(request)
         raw_blobs = require_array(body, "blobs", max_len=self.config.limits.max_blobs_per_request)
-
+        raw_completion_check = body.get("completion_check")
+        if raw_completion_check is not None and not isinstance(raw_completion_check, bool):
+            raise ServerError(
+                ErrorCode.PAYLOAD_INVALID,
+                "completion_check must be a boolean",
+                details={"field": "completion_check"},
+                action=AgentAction.FIX_REQUEST,
+            )
+        # Omitted means a legacy client: retain the old post-upload completion
+        # scan. New clients mark intermediate batches false and only the final
+        # batch true, reducing large sync from O(batches * view) to one O(view)
+        # completion check without changing old-client semantics.
+        completion_check = raw_completion_check is not False
+        backend = (
+            self.backend.for_view(principal.org_id, view_id)
+            if view_id is not None
+            else self.backend.for_unbound(principal.org_id)
+        )
         prepared: list[tuple[str, Mapping[str, Any], str]] = []
         contents: dict[str, int] = {}
         artifacts: dict[tuple[str, str], AnalysisArtifact] = {}
+        pending_analysis: list[tuple[str, str, bytes]] = []
+        pending_keys: set[tuple[str, str]] = set()
         indexed_bytes = 0
         total = 0
         # Validate the whole batch before writing any part of it.
@@ -1279,16 +1675,21 @@ class CoreServerRoutes:
             # Retain the bounded wire payload rather than all decompressed
             # blobs. Decode each again at commit, one blob at a time.
             prepared.append((digest, raw, profile))
-            contents[digest] = self.backend.content.storage_size(principal.org_id, data)
+            contents[digest] = backend.content.storage_size(principal.org_id, data)
             key = (digest, profile)
-            if key in artifacts:
+            if key in artifacts or key in pending_keys:
                 continue
-            artifact = self.backend.analysis.get(principal.org_id, digest, profile)
+            artifact = backend.analysis.get(principal.org_id, digest, profile)
             if artifact is None:
-                artifact = analyze(digest, profile, data)
-                indexed_bytes += self.backend.analysis.storage_size(principal.org_id, artifact)
+                pending_keys.add(key)
+                pending_analysis.append((digest, profile, data))
+            else:
+                artifacts[key] = artifact
+        for artifact in await self._derive_analysis_artifacts(pending_analysis):
+            key = (artifact.digest, artifact.parser_profile)
             artifacts[key] = artifact
-        missing = await self._content_call(self.backend.content.missing, principal.org_id, tuple(contents))
+            indexed_bytes += backend.analysis.storage_size(principal.org_id, artifact)
+        missing = await self._content_call(backend.content.missing, principal.org_id, tuple(contents))
         content_bytes = sum(contents[digest] for digest in missing)
         budget = self._storage_budget(
             request,
@@ -1303,22 +1704,19 @@ class CoreServerRoutes:
             prepared,
             artifacts,
             budget,
+            backend,
         )
 
-        # This is one of exactly two places where possession is *demonstrated*:
-        # the bytes arrived, the store hashed them and refused the ones that did
-        # not match. The row is attributed to the engineer who sent them and to
-        # the repository their open view belongs to, which is what later makes
-        # the digest addressable there and nowhere else. An upload with no view
-        # bound records nothing: it is still stored and still deduplicated, but
-        # there is no repository to attribute it to, and an unattributable row
-        # would read exactly like the repository-wide scope.
+        # This is one of exactly two places where possession is demonstrated:
+        # bytes arrived and were verified. Provenance is recorded against the
+        # opaque content scope fixed on the bound View. An upload with no View
+        # bound records no provenance.
         recorded = 0
         if view_id is not None and stored:
 
             def record_possession() -> int:
-                repo_id = self.backend.views.get(principal.org_id, view_id).repo_id
-                return self.backend.provenance.record(principal.org_id, repo_id, principal.subject, stored)
+                state = self.backend.views.get(principal.org_id, view_id)
+                return self._record_content_provenance(principal.org_id, state.repo_id, state.content_subject, stored)
 
             recorded = await self._authority_call(record_possession)
 
@@ -1329,13 +1727,15 @@ class CoreServerRoutes:
             tenant,
             counts={"blobs": len(stored), "bytes": total, "provenance_rows": recorded},
         )
-        if view_id is not None:
+        if view_id is not None and completion_check:
             try:
                 outstanding = await self._in_worker(self._still_missing, principal, view_id)
             except Exception:
                 outstanding = ["unknown"]
             if not outstanding:
                 current = self.backend.views.get(principal.org_id, view_id)
+                if current.manifest_complete:
+                    enqueue_deferred_view(self.backend, principal.org_id, view_id)
                 if current.view_revision == 0:
                     await self._prewarm_search(principal, view_id)
                 else:

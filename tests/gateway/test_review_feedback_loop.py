@@ -104,6 +104,7 @@ def test_human_feedback_to_agent_revision_reopens_only_changed_work(
     build = PacketBuild(packet=replace(built.packet, provenance=exact), blobs=built.blobs)
     session = open_or_create_session(store, repo_root, rng, title=build.packet.title)
     first = snapshot_revision(store, session, repo_root, rng, store_root=store_root, build=build)
+    store.publish_snapshot(session.id, first.id)
 
     app = FastAPI()
     register_review_api(
@@ -120,7 +121,7 @@ def test_human_feedback_to_agent_revision_reopens_only_changed_work(
         marked = client.post(
             f"/api/reviews/{session.id}/marks",
             headers=headers,
-            json={"path": path, "state": "reviewed"},
+            json={"path": path, "state": "reviewed", "expected_revision_id": first.id},
         )
         assert marked.status_code == 200, marked.text
 
@@ -132,6 +133,7 @@ def test_human_feedback_to_agent_revision_reopens_only_changed_work(
             "start_line": 1,
             "body": "keep the public function stable while fixing the behavior",
             "kind": "request_change",
+            "expected_revision_id": first.id,
         },
     )
     assert annotation.status_code == 201, annotation.text
@@ -178,7 +180,7 @@ def test_human_feedback_to_agent_revision_reopens_only_changed_work(
     refreshed = client.post(f"/api/reviews/{session.id}/refresh", headers=headers)
     assert refreshed.status_code == 200, refreshed.text
     body = refreshed.json()
-    assert body["revision"]["revision_number"] == 2
+    assert body["revision"]["revision_number"] == 1
     assert _reopened(body) == ["src/a.py"]
     assert _settled(body) == ["src/b.py"]
 

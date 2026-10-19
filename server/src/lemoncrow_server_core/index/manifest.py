@@ -72,11 +72,17 @@ MANIFEST_FORMAT: Final[str] = "lemoncrow-manifest/1"
 _ROW_SEPARATOR: Final[str] = "\x00"
 _DEFAULT_CHUNK_ROWS: Final[int] = 2_000
 
-#: Never walked. These are LemonCrow/Git runtime state, not repository source.
-#: In particular, ``.lc-worktrees`` may contain many complete nested checkouts;
-#: indexing them would duplicate the corpus and poison ranking for the parent
-#: workspace even when the repository did not add an explicit ignore rule.
-_NEVER_WALK: Final[frozenset[str]] = frozenset({".git", ".lc-worktrees", ".lemoncrow"})
+#: Never walked. These are LemonCrow/Git/host-agent runtime state, not
+#: repository source. In particular, ``.lc-worktrees`` and ``.claude`` may each
+#: contain complete nested checkouts; indexing them would duplicate the corpus
+#: and poison ranking for the parent workspace even when the repository did not
+#: add an explicit ignore rule.
+_NEVER_WALK: Final[frozenset[str]] = frozenset({".git", ".claude", ".lc-worktrees", ".lemoncrow"})
+
+#: The one committed file under ``.lemoncrow/`` that is repository source:
+#: server-side Review reads surface providers and runtimes from the captured
+#: tree. Mirrors ``lemoncrow_client.config.REVIEW_CONFIG_PATH``.
+_REVIEW_CONFIG_PATH: Final[str] = ".lemoncrow/review.yaml"
 
 
 def canonical_rows(entries: Iterable[ManifestEntry]) -> tuple[str, ...]:
@@ -423,6 +429,10 @@ def _descend(
             name = child.name
             child_relative = f"{relative}/{name}" if relative else name
             if name in _NEVER_WALK:
+                if child_relative == _REVIEW_CONFIG_PATH.split("/", 1)[0] and _walk_review_config(
+                    child, counters, size_cap=size_cap, max_files=max_files, read_limit=read_limit
+                ):
+                    return True
                 continue
             if child.is_symlink():
                 counters.symlinks += 1
@@ -436,6 +446,15 @@ def _descend(
                 counters.ignored += 1
                 continue
             if is_dir:
+                # A nested Git checkout (submodule, linked worktree, or independent
+                # repository) is a repository boundary, not a directory in this
+                # View. Descending into it turns every file behind a gitlink into a
+                # bogus parent-repository overlay and makes warm sync proportional
+                # to the nested repository size.
+                nested_git = Path(child.path) / ".git"
+                if nested_git.exists() or nested_git.is_symlink():
+                    counters.ignored += 1
+                    continue
                 if _descend(
                     Path(child.path),
                     child_relative,
@@ -462,6 +481,32 @@ def _descend(
     finally:
         if pushed:
             stack.pop()
+
+
+def _walk_review_config(
+    state_dir: os.DirEntry[str], counters: _Counters, *, size_cap: int, max_files: int, read_limit: int
+) -> bool:
+    """Mirror of the client: walk only the committed Review config, ignore rules aside."""
+
+    try:
+        if not state_dir.is_dir(follow_symlinks=False):
+            return False
+        path = Path(state_dir.path) / _REVIEW_CONFIG_PATH.split("/", 1)[1]
+        info = path.lstat()
+    except OSError:
+        return False
+    if not stat.S_ISREG(info.st_mode):
+        return False
+    if len(counters.files) >= max_files:
+        return True
+    walked = _walk_file(path, _REVIEW_CONFIG_PATH, size_cap=size_cap, read_limit=read_limit)
+    if walked is None:
+        counters.unreadable += 1
+        return False
+    if not walked.uploadable:
+        counters.oversize += 1
+    counters.files.append(walked)
+    return False
 
 
 def _walk_file(path: Path, relative: str, *, size_cap: int, read_limit: int) -> WalkedFile | None:

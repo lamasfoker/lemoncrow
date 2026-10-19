@@ -2,3 +2,6 @@ node_modules
 dist
 *.tsbuildinfo
 .env.local
+# Playwright browser harness output (npm run test:e2e)
+test-results/
+playwright-report/

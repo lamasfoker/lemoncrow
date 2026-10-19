@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -52,6 +53,87 @@ console.log(JSON.stringify(output))
 
     output = json.loads(result.stdout)
     assert output["parts"][0]["text"] == "Update auth.py and billing.py together"
+
+
+def test_shared_nudge_helper_uses_lemoncode_host_marker_for_exact_inbox(tmp_path: Path) -> None:
+    from lemoncrow.pro.capabilities.review.session_inbox import enqueue_session_message
+
+    plugin_dir = tmp_path / "plugins"
+    plugin_dir.mkdir()
+    helper = plugin_dir / "lemoncrow_nudge.py"
+    shutil.copy2(PLUGINS / "lemoncrow_nudge.py", helper)
+    (plugin_dir / ".lemoncrow-host").write_text("lemoncode\n", encoding="utf-8")
+
+    root = tmp_path / ".lemoncrow"
+    enqueue_session_message(
+        root,
+        host="lemoncode",
+        session_id="lemon-review",
+        message="Apply LemonCode annotation ann-marker.",
+    )
+    enqueue_session_message(
+        root,
+        host="opencode",
+        session_id="lemon-review",
+        message="wrong host feedback",
+    )
+    env = os.environ.copy()
+    env["LEMONCROW_ROOT"] = str(root)
+    env.pop("LEMONCROW_AGENT", None)
+    env.pop("LEMONCODE_SESSION_ID", None)
+    env.pop("LEMONCODE_CLI", None)
+
+    result = subprocess.run(
+        [sys.executable, str(helper)],
+        input=json.dumps({"session_id": "lemon-review", "prompt": "Continue", "cwd": str(tmp_path)}),
+        text=True,
+        capture_output=True,
+        check=True,
+        env=env,
+    )
+
+    output = json.loads(result.stdout)
+    assert "ann-marker" in output["additionalContext"]
+    assert "wrong host feedback" not in output["additionalContext"]
+
+
+def test_opencode_javascript_plugin_injects_exact_session_review_feedback(tmp_path: Path) -> None:
+    from lemoncrow.pro.capabilities.review.session_inbox import enqueue_session_message
+
+    root = tmp_path / ".lemoncrow"
+    enqueue_session_message(
+        root,
+        host="opencode",
+        session_id="s-review",
+        message="Apply review annotation ann-js and verify it.",
+    )
+    env = os.environ.copy()
+    env["LEMONCROW_ROOT"] = str(root)
+    env["LEMONCROW_PYTHON"] = str(ROOT / ".venv" / "bin" / "python3")
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    script = f"""
+import {{ LemonCrowNudge }} from {json.dumps((PLUGINS / "lemoncrow-nudge.js").as_uri())}
+const client = {{ tui: {{ showToast: async () => true }} }}
+const hooks = await LemonCrowNudge({{ client, directory: {json.dumps(str(workdir))} }})
+const first = {{ parts: [{{ type: 'text', text: 'Continue' }}] }}
+await hooks['chat.message']({{ sessionID: 's-review' }}, first)
+const second = {{ parts: [{{ type: 'text', text: 'Continue again' }}] }}
+await hooks['chat.message']({{ sessionID: 's-review' }}, second)
+console.log(JSON.stringify({{ first, second }}))
+"""
+    result = subprocess.run(
+        ["node", "--input-type=module", "-e", script],
+        text=True,
+        capture_output=True,
+        check=True,
+        env=env,
+    )
+
+    output = json.loads(result.stdout)
+    assert "ann-js" in output["first"]["parts"][0]["text"]
+    assert "lemoncrow_review_feedback" in output["first"]["parts"][0]["text"]
+    assert "ann-js" not in output["second"]["parts"][0]["text"]
 
 
 def test_opencode_repeated_failure_injects_rescue_on_next_prompt(tmp_path: Path) -> None:
@@ -155,6 +237,8 @@ def test_opencode_required_arg_default_threshold_needs_three_hits(tmp_path: Path
 def test_opencode_idle_event_shows_session_status(tmp_path: Path) -> None:
     env = os.environ.copy()
     env["LEMONCROW_ROOT"] = str(tmp_path / ".lemoncrow")
+    # Use this checkout, not a stale globally installed LemonCrow runtime.
+    env["LEMONCROW_PYTHON"] = sys.executable
     script = f"""
     import {{ LemonCrowNudge }} from {json.dumps((PLUGINS / "lemoncrow-nudge.js").as_uri())}
     const toasts = []

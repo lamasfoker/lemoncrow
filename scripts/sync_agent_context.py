@@ -575,18 +575,27 @@ def build_mode_outputs(
 
         opencode_projection = registry.projection(role_id, "opencode_agent")
         opencode_path = repo_root / "integrations" / "opencode" / "agents" / f"{opencode_projection.output_name}.md"
-        outputs[opencode_path] = render_agent(
+        opencode_text = render_agent(
             role,
             mode_doc,
             opencode_projection,
             profile=HostInstructionProfile(tool_prefix=_OPENCODE_TOOL_PREFIX),
         )
+        # The global code-only install copies this file verbatim, so the shipped
+        # per-role model pin (DEFAULT_HOST_ROLE_MODELS) must be in the file itself.
+        outputs[opencode_path] = rewrite_agent_model(
+            opencode_text,
+            normalize_model_for_host(
+                "opencode", resolve_explicit_host_model("opencode", role_id, workspace_root=repo_root)
+            ),
+        )
 
         # lemoncode is a rebranded opencode fork -- same agent markdown format,
         # same tool prefix, same `.opencode/agents` workspace layout. It reuses
-        # the opencode projection so the two surfaces can never drift apart.
+        # the opencode projection so the two surfaces can never drift apart; the
+        # opencode-provider model pin above is opencode's own and is not carried over.
         lemoncode_path = repo_root / "integrations" / "lemoncode" / "agents" / f"{opencode_projection.output_name}.md"
-        outputs[lemoncode_path] = outputs[opencode_path]
+        outputs[lemoncode_path] = opencode_text
 
         copilot_projection = registry.projection(role_id, "copilot_agent")
         copilot_path = repo_root / "integrations" / "copilot" / "agents" / f"{copilot_projection.output_name}.agent.md"
@@ -616,12 +625,9 @@ def build_outputs(*, claude_plugin_role_ids: Iterable[str] | None = None) -> dic
     registry = build_default_registry(ROOT)
     mode_outputs = build_mode_outputs(ROOT, claude_plugin_role_ids=claude_plugin_role_ids)
     agents_path = ROOT / "AGENTS.md"
-    copilot_path = ROOT / ".github/copilot-instructions.md"
     existing_agents = agents_path.read_text(encoding="utf-8") if agents_path.exists() else ""
-    existing_copilot = copilot_path.read_text(encoding="utf-8") if copilot_path.exists() else ""
     outputs = {
         agents_path: render_managed_context(existing_agents),
-        copilot_path: render_managed_context(existing_copilot),
         ROOT / "integrations/copilot/COPILOT_INSTRUCTIONS.lemoncrow.md": agent_guide() + "\n",
     }
     for role_id in registry.surfaced_role_ids("copilot_agent"):

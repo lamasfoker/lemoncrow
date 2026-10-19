@@ -31,6 +31,7 @@ from lemoncrow.pro.capabilities.review.packet import build_review_packet_with_bl
 from lemoncrow.pro.capabilities.review.session_models import ANNOTATION_KINDS
 from lemoncrow.pro.capabilities.review.sources.local import (
     annotate,
+    annotate_machine_finding,
     annotation_counts,
     coerce_annotation_kind,
     open_or_create_session,
@@ -134,7 +135,7 @@ class Review:
 
     def _snapshot(self) -> Any:
         self.build = self._build()
-        return snapshot_revision(
+        revision = snapshot_revision(
             self.store,
             self.session,
             self.repo_root,
@@ -142,6 +143,10 @@ class Review:
             store_root=self.store_root,
             build=self.build,
         )
+        # Annotation API tests mutate a saved Snapshot. Running drafts are
+        # intentionally read-only and have separate API coverage.
+        self.store.publish_snapshot(self.session.id, revision.id)
+        return revision
 
     def text(self, rel: str = "src/session.py") -> str:
         return (self.repo_root / rel).read_text(encoding="utf-8")
@@ -283,7 +288,7 @@ def test_a_line_past_the_end_of_the_file_is_refused(review: Review) -> None:
 
 
 def test_a_path_outside_the_review_is_refused(review: Review) -> None:
-    with pytest.raises(ValueError, match="not a file in revision"):
+    with pytest.raises(ValueError, match="not a file in Revision 0"):
         annotate(
             review.store,
             review.session,
@@ -328,6 +333,89 @@ def test_all_four_kinds_round_trip(review: Review) -> None:
         assert review.store.get_annotation(annotation.id) is not None
 
 
+def test_machine_finding_ingestion_is_idempotent_per_code_identity(review: Review) -> None:
+    first, first_created = annotate_machine_finding(
+        review.store,
+        review.session,
+        review.revision,
+        path="src/session.py",
+        start_line=_COMMENT_LINE,
+        end_line=_COMMENT_LINE,
+        body="possible stale cache",
+        title="Possible stale-cache behavior",
+        created_by="correctness",
+        created_by_actor="agent",
+        source="ai_review",
+        source_id="correctness",
+        confidence=0.72,
+        evidence=("check:cache-flow",),
+        new_text=review.text(),
+    )
+    second, second_created = annotate_machine_finding(
+        review.store,
+        review.session,
+        review.revision,
+        path="src/session.py",
+        start_line=_COMMENT_LINE,
+        end_line=_COMMENT_LINE,
+        body="  possible   stale cache  ",
+        title="Possible stale-cache behavior",
+        created_by="correctness",
+        created_by_actor="agent",
+        source="ai_review",
+        source_id="correctness",
+        confidence=0.72,
+        evidence=("check:cache-flow", "run:2"),
+        new_text=review.text(),
+    )
+
+    assert first_created is True
+    assert second_created is False
+    assert second.id == first.id
+    assert sum(annotation.source == "ai_review" for annotation in review.store.list_annotations(review.session.id)) == 1
+    assert any(item.startswith("finding:") for item in first.evidence)
+    assert first.confidence == 0.72
+
+
+def test_machine_finding_same_claim_on_rewritten_code_is_new(review: Review) -> None:
+    first, _ = annotate_machine_finding(
+        review.store,
+        review.session,
+        review.revision,
+        path="src/session.py",
+        start_line=_COMMENT_LINE,
+        end_line=_COMMENT_LINE,
+        body="possible stale cache",
+        created_by="correctness",
+        created_by_actor="agent",
+        source="ai_review",
+        source_id="correctness",
+        new_text=review.text(),
+    )
+    result = review.rewrite(
+        review.text().replace('return {"status": "invalid"}', 'return {"status": "invalid", "source": "cache"}')
+    )
+    review.revision = result.revision
+    review.build = review._build()
+    second, created = annotate_machine_finding(
+        review.store,
+        review.session,
+        review.revision,
+        path="src/session.py",
+        start_line=_COMMENT_LINE,
+        end_line=_COMMENT_LINE,
+        body="possible stale cache",
+        created_by="correctness",
+        created_by_actor="agent",
+        source="ai_review",
+        source_id="correctness",
+        new_text=review.text(),
+    )
+
+    assert created is True
+    assert second.id != first.id
+
+
 def test_non_human_annotations_never_inflate_outstanding_comment_counts(review: Review) -> None:
     human = review.comment(_COMMENT_LINE, body="human judgment")
     system = annotate(
@@ -357,7 +445,13 @@ def test_a_fifth_kind_is_refused_by_the_model_and_by_the_api(review: Review, cli
     response = _post(
         client,
         f"/api/reviews/{review.session.id}/annotations",
-        {"path": "src/session.py", "start_line": _COMMENT_LINE, "body": "no", "kind": "blocker"},
+        {
+            "path": "src/session.py",
+            "start_line": _COMMENT_LINE,
+            "body": "no",
+            "kind": "blocker",
+            "expected_revision_id": review.revision.id,
+        },
     )
     assert response.status_code == 422
     assert "blocker" in response.json()["detail"]
@@ -535,6 +629,7 @@ def test_the_export_reads_like_the_plan_and_names_its_orphans(review: Review) ->
     text = render_markdown(bundle)
 
     assert text.startswith("## Review feedback")
+    assert "Snapshot 0 · working_tree" in text
     assert "### src/session.py:L10 — request change" in text
     assert "this hides an invalid session" in text
     assert "### Comments that lost their anchor" in text
@@ -594,6 +689,7 @@ def test_the_api_builds_the_anchor_from_a_selected_line_range(review: Review, cl
             "range": {"start": _COMMENT_LINE, "end": _COMMENT_LINE, "side": "additions"},
             "body": "this hides an invalid session",
             "kind": "request_change",
+            "expected_revision_id": review.revision.id,
         },
     )
     assert response.status_code == 201
@@ -621,10 +717,15 @@ def test_the_api_refuses_a_path_that_is_not_in_the_review(review: Review, client
     response = _post(
         client,
         f"/api/reviews/{review.session.id}/annotations",
-        {"path": "src/untouched.py", "start_line": 1, "body": "x"},
+        {
+            "path": "src/untouched.py",
+            "start_line": 1,
+            "body": "x",
+            "expected_revision_id": review.revision.id,
+        },
     )
     assert response.status_code == 422
-    assert "not a file in revision" in response.json()["detail"]
+    assert "not a file in Revision 0" in response.json()["detail"]
 
 
 def test_the_listing_carries_the_reason_each_anchor_is_where_it_is(review: Review, client: TestClient) -> None:
@@ -645,7 +746,11 @@ def test_patch_edits_the_text_and_the_state_but_never_the_position(review: Revie
     assert edited.json()["annotation"]["body"] == "second draft"
     assert edited.json()["annotation"]["kind"] == "suggestion"
 
-    resolved = _patch(client, f"/api/annotations/{annotation.id}", {"state": "resolved"})
+    resolved = _patch(
+        client,
+        f"/api/annotations/{annotation.id}",
+        {"state": "resolved", "expected_revision_id": review.revision.id},
+    )
     assert resolved.json()["annotation"]["state"] == "resolved"
 
     # There is no route that moves an anchor, and the position survives editing.
@@ -658,7 +763,14 @@ def test_patch_edits_the_text_and_the_state_but_never_the_position(review: Revie
 def test_patch_refuses_an_unknown_comment_and_an_unknown_state(review: Review, client: TestClient) -> None:
     annotation = review.comment(_COMMENT_LINE)
     assert _patch(client, "/api/annotations/ann-nope", {"body": "x"}).status_code == 404
-    assert _patch(client, f"/api/annotations/{annotation.id}", {"state": "cancelled"}).status_code == 422
+    assert (
+        _patch(
+            client,
+            f"/api/annotations/{annotation.id}",
+            {"state": "cancelled", "expected_revision_id": review.revision.id},
+        ).status_code
+        == 422
+    )
 
 
 def test_the_export_route_renders_and_delivers_nothing(review: Review, client: TestClient) -> None:
@@ -681,26 +793,21 @@ def test_the_export_route_renders_and_delivers_nothing(review: Review, client: T
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.parametrize(
-    ("target", "expected"),
-    [
+def test_parse_line_target_accepts_the_spellings_a_reviewer_types() -> None:
+    for target, expected in [
         ("src/app.py:L10", ("src/app.py", 10, 10)),
         ("src/app.py:L10-L20", ("src/app.py", 10, 20)),
         ("src/app.py:L10-20", ("src/app.py", 10, 20)),
         ("a/b/c.ts:L1", ("a/b/c.ts", 1, 1)),
-    ],
-)
-def test_parse_line_target_accepts_the_spellings_a_reviewer_types(target: str, expected: tuple[str, int, int]) -> None:
-    assert parse_line_target(target) == expected
+    ]:
+        assert parse_line_target(target) == expected
 
 
-@pytest.mark.parametrize("target", ["src/app.py", "src/app.py:10", "src/app.py:L20-L10", "", "L10"])
-def test_parse_line_target_refuses_anything_it_would_have_to_guess_at(target: str) -> None:
-    """A bare path is refused rather than defaulted to line 1: a comment silently
-    attached to the top of a file is a comment about something nobody read."""
-
-    with pytest.raises(ValueError, match=r"line target|before it starts"):
-        parse_line_target(target)
+def test_parse_line_target_refuses_anything_it_would_have_to_guess_at() -> None:
+    for target in ["src/app.py", "src/app.py:10", "src/app.py:L20-L10", "", "L10"]:
+        "A bare path is refused rather than defaulted to line 1: a comment silently\n    attached to the top of a file is a comment about something nobody read."
+        with pytest.raises(ValueError, match=r"line target|before it starts"):
+            parse_line_target(target)
 
 
 def test_annotation_counts_name_every_state_present(review: Review) -> None:

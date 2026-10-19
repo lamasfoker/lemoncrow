@@ -48,8 +48,8 @@ export default function SavingsTimeChart({
   const naivePath = buildAreaPath(naivePoints, baseline);
 
   return (
-    <div className="border border-neutral-800 bg-neutral-950/70 p-3">
-      <div className="mb-2 flex items-center justify-between text-[11px] text-neutral-400 font-mono uppercase tracking-widest">
+    <div className="rounded-lg border border-border/70 bg-background/60 p-3">
+      <div className="mb-2 flex items-center justify-between text-label text-neutral-400 font-mono uppercase tracking-widest">
         <span>{windowDays}-day token trend</span>
         <span>Naive vs Actual</span>
       </div>
@@ -75,7 +75,7 @@ export default function SavingsTimeChart({
           x2={WIDTH - PAD_X}
           y1={baseline}
           y2={baseline}
-          stroke="#404040"
+          stroke="rgb(var(--n-700))"
           strokeWidth="1"
         />
         <line
@@ -83,7 +83,7 @@ export default function SavingsTimeChart({
           x2={PAD_X}
           y1={PAD_Y}
           y2={baseline}
-          stroke="#404040"
+          stroke="rgb(var(--n-700))"
           strokeWidth="1"
         />
 
@@ -100,14 +100,14 @@ export default function SavingsTimeChart({
               y={HEIGHT - 4}
               fontSize="10"
               textAnchor="middle"
-              fill="#737373"
+              fill="rgb(var(--n-500))"
             >
               {d.day.slice(5)}
             </text>
           );
         })}
       </svg>
-      <div className="mt-2 flex items-center gap-4 text-[11px] text-neutral-400">
+      <div className="mt-2 flex items-center gap-4 text-label text-neutral-400">
         <span className="inline-flex items-center gap-1">
           <span className="inline-block h-2 w-2 bg-orange-400" />
           Naive

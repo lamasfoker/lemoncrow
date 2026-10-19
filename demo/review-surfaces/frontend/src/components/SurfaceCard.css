@@ -1,0 +1,4 @@
+.surface-card { display: grid; gap: 8px; min-height: 120px; padding: 18px; border: 1px solid #24282e; border-radius: 10px; background: #111419; }
+.surface-card strong { color: #e8e8e8; font-size: 14px; }
+.surface-card span { color: #777e88; font-size: 13px; }
+.surface-card--reviewed { border-color: #d4b106; box-shadow: inset 3px 0 0 #d4b106; }

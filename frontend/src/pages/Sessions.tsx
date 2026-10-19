@@ -1,3 +1,6 @@
+import { Select, SelectItem } from "../components/ui/select";
+import { Button as UiButton } from "../components/ui/button";
+import { Input as UiInput } from "../components/ui/input";
 import {
   useEffect,
   useState,
@@ -14,9 +17,10 @@ import {
   Terminal,
   X,
 } from "lucide-react";
-import { api, type Trace, type SessionSummary } from "../api";
+import { api, type TraceSummary, type SessionSummary } from "../api";
 import { MetricCard, cx } from "../components/WorkbenchUI";
 import { fmtUsd, fmtDate, fmtDuration, fmtRelativeTime } from "../lib/format";
+import { setVisibleInterval } from "../lib/visibleInterval";
 import { extractHost, HOST_COLORS } from "./sessions/helpers";
 import { StatusDot } from "./sessions/StatusBadge";
 import { SessionExplorerDetail } from "./sessions/SessionDetail";
@@ -58,7 +62,7 @@ function firstModelLabel(models?: Record<string, number>): string | null {
 
 function resolveSessionModel(
   summary?: SessionSummary | null,
-  trace?: Trace | null
+  trace?: TraceSummary | null
 ): string | null {
   return (
     summary?.started_model ||
@@ -68,34 +72,11 @@ function resolveSessionModel(
   );
 }
 
-function hasUsageEvidence(summary?: SessionSummary | null, trace?: Trace | null): boolean {
-  if (summary) {
-    if (summary.total_turns > 0) return true;
-    if (summary.total_cost_usd > 0 || summary.total_lemoncrow_savings_usd > 0) return true;
-    if (Object.keys(summary.models_used || {}).length > 0) return true;
-    if (
-      (summary.input_tokens || 0) > 0 ||
-      (summary.output_tokens || 0) > 0 ||
-      (summary.cached_input_tokens || 0) > 0 ||
-      (summary.cache_write_tokens || 0) > 0
-    ) {
-      return true;
-    }
-  }
-  if (!trace) return false;
-  if ((trace.model || "").trim()) return true;
-  return (
-    (trace.input_tokens || 0) > 0 ||
-    (trace.output_tokens || 0) > 0 ||
-    (trace.cached_input_tokens || 0) > 0 ||
-    (trace.cache_creation_input_tokens || 0) > 0
-  );
-}
 
 // Latest activity timestamp for a session — prefers session-summary fields
 // (ended_at → started_at) and falls back to the head-trace created_at.
 function latestActivityMs(
-  trace: Trace,
+  trace: TraceSummary,
   summary?: SessionSummary | null
 ): number {
   const candidate =
@@ -120,7 +101,7 @@ export default function Sessions() {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
 
-  const [traces, setTraces] = useState<Trace[] | null>(null);
+  const [traces, setTraces] = useState<TraceSummary[] | null>(null);
   const [loadingTraces, setLoadingTraces] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [searchInput, setSearchInput] = useState(searchParams.get("q") ?? "");
@@ -151,17 +132,14 @@ export default function Sessions() {
   // Prefer traces that have a task description when multiple share the same session_id.
   const displayTraces = useMemo(() => {
     if (!traces) return null;
-    const seen = new Map<string, Trace>();
+    const seen = new Map<string, TraceSummary>();
     for (const t of traces) {
       const sid = t.session_id || t.id;
       const existing = seen.get(sid);
       if (!existing || (!existing.task && t.task)) seen.set(sid, t);
     }
-    return Array.from(seen.values()).filter((trace) => {
-      const sid = trace.session_id || trace.id;
-      return hasUsageEvidence(sessionsMap?.get(sid), trace);
-    });
-  }, [traces, sessionsMap]);
+    return Array.from(seen.values());
+  }, [traces]);
 
   const fetchTracesPage = useCallback(
     (offset: number) => {
@@ -190,7 +168,7 @@ export default function Sessions() {
         })
         .catch((e) => {
           if (requestSeq !== tracesRequestSeq.current) return;
-          setErr(String(e));
+          setErr(e instanceof Error ? e.message : String(e));
           setLoadingTraces(false);
         });
     },
@@ -253,7 +231,7 @@ export default function Sessions() {
       })
       .catch((e) => {
         if (requestSeq !== tracesRequestSeq.current) return;
-        setErr(String(e));
+          setErr(e instanceof Error ? e.message : String(e));
       });
   }, [query, page, hostFilter, workspaceFilter]);
 
@@ -262,124 +240,126 @@ export default function Sessions() {
     fetchSummaries();
   }, [refreshTraces, fetchSummaries]);
 
-  // Periodically refresh data every 30 seconds
-  useEffect(() => {
-    const interval = setInterval(refresh, 30000);
-    return () => clearInterval(interval);
-  }, [refresh]);
-
+  // Periodically refresh data every 30 seconds while the page is visible
+  useEffect(() => setVisibleInterval(refresh, 30000), [refresh]);
   return (
-    <div className="flex flex-col md:flex-row h-[calc(100vh-180px)] overflow-hidden border border-neutral-800/80 bg-surface-sunken">
+    <div className="flex h-[calc(100vh-41px)] flex-col overflow-hidden border border-border/80 bg-surface-sunken md:flex-row">
       {/* Sidebar — master list */}
       <aside
         className={cx(
-          "flex-shrink-0 flex flex-col border-b md:border-b-0 md:border-r border-neutral-800 bg-surface transition-all duration-200 ease-in-out overflow-hidden",
+          "flex-shrink-0 flex flex-col border-b md:border-b-0 md:border-r border-border bg-surface transition-all duration-200 ease-in-out overflow-hidden",
           sidebarCollapsed ? "w-full md:w-12" : "w-full md:w-80"
         )}
       >
         {sidebarCollapsed ? (
           /* ── Collapsed: narrow strip ── */
           <div className="flex flex-col items-center py-3 gap-4 flex-shrink-0">
-            <button
+            <UiButton
               type="button"
               onClick={() => setSidebarCollapsed(false)}
-              className="w-6 h-6 flex items-center justify-center text-neutral-400 hover:text-neutral-300 transition-colors rounded-full hover:bg-neutral-800"
-              title="Expand sidebar"
+              size="icon"
+              variant="ghost"
+              aria-label="Expand sidebar"
+              tooltip="Expand sidebar"
             >
               <ChevronRight size={14} />
-            </button>
-            <span className="text-[10px] font-bold uppercase tracking-[0.3em] text-neutral-400 [writing-mode:vertical-lr]">
+            </UiButton>
+            <span className="text-caption font-bold uppercase tracking-[0.3em] text-neutral-400 [writing-mode:vertical-lr]">
               History
             </span>
           </div>
         ) : (
           /* ── Expanded: full sidebar ── */
           <>
-            <div className="p-4 border-b border-neutral-800 space-y-4 bg-surface-raised">
+            <div className="p-4 border-b border-border space-y-4 bg-surface-raised">
               <div className="flex items-center justify-between gap-2">
                 <div className="flex items-center gap-2 min-w-0">
-                  <h2 className="text-[10px] font-bold uppercase tracking-widest text-neutral-400 whitespace-nowrap">
+                  <h2 className="text-caption font-bold uppercase tracking-widest text-neutral-400 whitespace-nowrap">
                     History
                   </h2>
-                  <span className="text-[10px] text-neutral-400 shrink-0">
+                  <span className="text-caption text-neutral-400 shrink-0">
                     All time
                   </span>
                   {loadingTraces && (
-                    <span className="text-[10px] text-brand-400 shrink-0">
+                    <span className="text-caption text-brand-400 shrink-0">
                       Scanning...
                     </span>
                   )}
                 </div>
                 <div className="flex items-center gap-2">
-                  <button
+                  <UiButton
                     type="button"
                     onClick={refresh}
-                    className="w-5 h-5 flex items-center justify-center text-neutral-400 hover:text-neutral-300 transition-colors shrink-0 rounded hover:bg-neutral-800"
-                    title="Refresh sessions"
+                    size="icon" variant="ghost" className="shrink-0"
+                    aria-label="Refresh sessions"
+                    tooltip="Refresh sessions"
                   >
                     <RefreshCw size={14} />
-                  </button>{" "}
-                  <button
+                  </UiButton>{" "}
+                  <UiButton
                     type="button"
                     onClick={() => setSidebarCollapsed(true)}
-                    className="w-5 h-5 flex items-center justify-center text-neutral-400 hover:text-neutral-300 transition-colors shrink-0 rounded hover:bg-neutral-800"
-                    title="Collapse sidebar"
+                    size="icon" variant="ghost" className="shrink-0"
+                    aria-label="Collapse sidebar"
+                    tooltip="Collapse sidebar"
                   >
                     <ChevronLeft size={14} />
-                  </button>
+                  </UiButton>
                 </div>
               </div>
               <div className="flex gap-2">
-                <input
+                <UiInput
                   type="search"
+                  uiSize="xs"
                   value={searchInput}
                   onChange={(e) => setSearchInput(e.target.value)}
                   placeholder="Search sessions, tasks, models..."
-                  className="w-full bg-surface-overlay border border-neutral-800 px-3 py-2.5 text-xs text-neutral-200 outline-none focus:border-brand-600 transition-all rounded-sm shadow-inner"
+                  className="w-full"
                 />
                 {searchInput && (
-                  <button
+                  <UiButton
                     type="button"
                     onClick={() => setSearchInput("")}
-                    className="px-2 border border-neutral-800 text-neutral-400 hover:text-neutral-300 transition-colors"
+                    size="icon"
+                    variant="ghost"
                   >
                     <X size={14} />
-                  </button>
+                  </UiButton>
                 )}
               </div>
               <div className="flex gap-2">
-                <select
+                <Select
                   aria-label="Filter by host"
                   value={hostFilter}
-                  onChange={(e) => setHostFilter(e.target.value)}
-                  className="flex-1 min-w-0 bg-surface-overlay border border-neutral-800 px-2 py-1.5 text-[10px] text-neutral-300 outline-none focus:border-brand-600"
+                  onValueChange={setHostFilter}
+                  className="flex-1 min-w-0 bg-surface-overlay border border-border px-2 py-1.5 text-caption text-neutral-300 outline-none focus:border-brand-600"
                 >
-                  <option value="all">All hosts</option>
+                  <SelectItem value="all">All hosts</SelectItem>
                   {availableHosts.map((h) => (
-                    <option key={h} value={h}>
+                    <SelectItem key={h} value={h}>
                       {h}
-                    </option>
+                    </SelectItem>
                   ))}
-                </select>
-                <select
+                </Select>
+                <Select
                   aria-label="Filter by workspace"
                   value={workspaceFilter}
-                  onChange={(e) => setWorkspaceFilter(e.target.value)}
-                  className="flex-1 min-w-0 bg-surface-overlay border border-neutral-800 px-2 py-1.5 text-[10px] text-neutral-300 outline-none focus:border-brand-600"
+                  onValueChange={setWorkspaceFilter}
+                  className="flex-1 min-w-0 bg-surface-overlay border border-border px-2 py-1.5 text-caption text-neutral-300 outline-none focus:border-brand-600"
                 >
-                  <option value="all">All workspaces</option>
+                  <SelectItem value="all">All workspaces</SelectItem>
                   {availableWorkspaces.map((w) => (
-                    <option key={w} value={w} title={w}>
+                    <SelectItem key={w} value={w} title={w}>
                       {w.split("/").pop() || w}
-                    </option>
+                    </SelectItem>
                   ))}
-                </select>
+                </Select>
               </div>
             </div>
 
             <div className="flex-1 overflow-y-auto custom-scrollbar">
               {err && (
-                <div className="p-4 text-xs text-red-300 font-mono">{err}</div>
+                <div role="alert" className="p-4 text-body leading-6 text-muted-foreground">{err}</div>
               )}
 
               {displayTraces
@@ -401,22 +381,23 @@ export default function Sessions() {
                   // haven't committed a final status to SQLite yet.
                   const displayStatus = t._live ? "running" : t.status;
                   const costAvailable =
-                    Boolean(summary) && summary?.cost_status !== "unavailable";
+                    Boolean(summary) && summary?.cost_status !== "unavailable" &&
+                    ((summary?.total_turns ?? 0) > 0 || (summary?.total_cost_usd ?? 0) > 0);
                   const costPrefix =
                     summary?.cost_status === "estimated" ? "~" : "";
 
                   return (
-                    <button
+                    <UiButton unstyled
                       key={t.id}
                       onClick={() =>
                         navigate(
-                          `/runs/${sid}${query ? `?q=${encodeURIComponent(query)}` : ""}`
+                          `/activity/${sid}${query ? `?q=${encodeURIComponent(query)}` : ""}`
                         )
                       }
                       className={cx(
-                        "w-full border-b border-neutral-800 p-3.5 text-left transition-all hover:bg-neutral-800/40 group/card",
+                        "w-full border-b border-border p-3.5 text-left transition-all hover:bg-neutral-800/40 group/card",
                         isActive
-                          ? "bg-neutral-900/45 border-r-2 border-r-neutral-500"
+                          ? "bg-muted/45 border-r-2 border-r-neutral-500"
                           : ""
                       )}
                     >
@@ -428,7 +409,7 @@ export default function Sessions() {
                           />
                           <span
                             className={cx(
-                              "shrink-0 text-[10px] font-mono uppercase tracking-[0.18em]",
+                              "shrink-0 text-caption font-mono uppercase tracking-[0.18em]",
                               hostTextClass
                             )}
                             title={host}
@@ -437,7 +418,7 @@ export default function Sessions() {
                           </span>
                           {sessionModel && (
                             <span
-                              className="min-w-0 truncate text-[10px] font-mono text-sky-200"
+                              className="min-w-0 truncate text-caption font-mono text-sky-200"
                               title={sessionModel}
                             >
                               {sessionModel}
@@ -446,13 +427,13 @@ export default function Sessions() {
                         </div>
                         <div className="flex items-center gap-2">
                           <span
-                            className="shrink-0 text-[10px] font-mono text-neutral-400"
+                            className="shrink-0 text-caption font-mono text-neutral-400"
                             title={fmtDate(t.created_at)}
                           >
                             {fmtRelativeTime(t.created_at)}
                           </span>
                           <span
-                            className="shrink-0 text-[10px] font-mono text-neutral-400"
+                            className="shrink-0 text-caption font-mono text-neutral-400"
                             title={
                               summary
                                 ? String(
@@ -476,25 +457,25 @@ export default function Sessions() {
                         className={cx(
                           "mb-2 text-xs font-mono line-clamp-2 leading-relaxed",
                           isActive
-                            ? "text-neutral-100 font-bold"
+                            ? "text-foreground font-bold"
                             : "text-neutral-400 group-hover/card:text-neutral-300"
                         )}
                       >
                         {highlightSearchText(t.task || "Untitled Task", query)}
                       </p>
 
-                      <div className="grid grid-cols-2 gap-1.5 rounded-sm border border-neutral-800/60 bg-surface-sunken/70 p-2">
+                      <div className="grid grid-cols-2 gap-1.5 rounded-md border border-border/60 bg-surface-sunken/70 p-2">
                         {(
                           [
                             [
-                              "Cost",
+                              summary?.cost_status === "estimated" ? "Priced" : "Cost",
                               summary && costAvailable
                                 ? `${costPrefix}${fmtUsd(summary.total_cost_usd)}`
                                 : "—",
                               "text-red-300",
                             ],
                             [
-                              "Saved",
+                              "Est. Saved",
                               summary
                                 ? fmtUsd(summary.total_lemoncrow_savings_usd)
                                 : "—",
@@ -504,14 +485,14 @@ export default function Sessions() {
                         ).map(([label, value, valCls]) => (
                           <div
                             key={label}
-                            className="flex items-center justify-between gap-2 rounded-sm border border-neutral-800/50 bg-neutral-950/40 px-2 py-1.5"
+                            className="flex items-center justify-between gap-2 rounded-md border border-border/50 bg-background/40 px-2 py-1.5"
                           >
-                            <div className="truncate text-[10px] font-mono tracking-[0.18em] uppercase text-neutral-400 leading-none">
+                            <div className="truncate text-caption font-mono tracking-[0.18em] uppercase text-neutral-400 leading-none">
                               {label}
                             </div>
                             <div
                               className={cx(
-                                "shrink-0 text-[10px] font-black font-mono leading-none",
+                                "shrink-0 text-caption font-black font-mono leading-none",
                                 valCls
                               )}
                             >
@@ -520,21 +501,23 @@ export default function Sessions() {
                           </div>
                         ))}
                       </div>
-                    </button>
+                    </UiButton>
                   );
                 })}
 
               {!loadingTraces && hasMore && traces && (
-                <button
+                <UiButton
                   onClick={loadMore}
-                  className="w-full p-4 text-[10px] text-neutral-400 hover:text-neutral-200 uppercase tracking-widest font-bold"
+                  variant="ghost"
+                  size="xs"
+                  className="w-full"
                 >
                   Load More
-                </button>
+                </UiButton>
               )}
 
               {!loadingTraces && traces?.length === 0 && (
-                <div className="p-8 text-center text-xs text-neutral-400 italic font-mono">
+                <div className="p-4 text-center text-label text-muted-foreground">
                   No sessions found
                 </div>
               )}
@@ -560,11 +543,10 @@ export default function Sessions() {
 // ---------------------------------------------------------------------------
 
 function EmptyState({ summaries }: { summaries: SessionSummary[] | null }) {
-  const usageSummaries =
-    summaries?.filter((summary) => hasUsageEvidence(summary, null)) ?? null;
+  const usageSummaries = summaries;
   const pricedSummaries =
-    usageSummaries?.filter((summary) => summary.cost_status !== "unavailable") ??
-    null;
+    summaries?.filter((summary) => summary.cost_status !== "unavailable" &&
+      (summary.total_turns > 0 || summary.total_cost_usd > 0)) ?? null;
   const totalCost =
     pricedSummaries?.reduce((sum, item) => sum + item.total_cost_usd, 0) ?? 0;
   const totalSaved =
@@ -577,12 +559,12 @@ function EmptyState({ summaries }: { summaries: SessionSummary[] | null }) {
   );
 
   return (
-    <div className="h-full overflow-y-auto custom-scrollbar p-6 space-y-6 animate-in fade-in duration-300">
+    <div className="h-full space-y-4 overflow-y-auto p-4 custom-scrollbar animate-in fade-in duration-300">
       <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
         <MetricCard
           label="Sessions"
           value={usageSummaries ? String(usageSummaries.length) : "—"}
-          tone="violet"
+          tone="neutral"
         />
         <MetricCard
           label="Total Cost"
@@ -593,30 +575,30 @@ function EmptyState({ summaries }: { summaries: SessionSummary[] | null }) {
                 : "—"
               : "—"
           }
-          tone="amber"
+          tone="warning"
         />
         <MetricCard
-          label="Savings"
+          label="Est. Savings"
           value={usageSummaries ? fmtUsd(totalSaved) : "—"}
-          tone="emerald"
+          tone="success"
         />
         <MetricCard
           label="Efficiency"
           value={
             usageSummaries && pricedSummaries && pricedSummaries.length > 0
-              ? `${Math.round((totalSaved / (totalCost || 1)) * 100)}%`
+              ? `${Math.round((totalSaved / (totalCost + totalSaved || 1)) * 100)}%`
               : "—"
           }
           tone="neutral"
         />
       </div>
 
-      <div className="border border-neutral-800 bg-surface-raised p-6 text-center rounded-sm">
-        <Terminal size={28} className="mx-auto mb-3 text-neutral-500" />
+      <div className="rounded-lg border border-border/70 bg-background/60 p-4 text-center">
+        <Terminal size={28} className="mx-auto mb-3 text-muted-foreground" />
         <h3 className="mb-1 text-xs font-semibold text-neutral-300">
           Select a session
         </h3>
-        <p className="mx-auto max-w-sm text-[11px] leading-relaxed text-neutral-500">
+        <p className="mx-auto max-w-sm text-label leading-relaxed text-muted-foreground">
           Inspect reasoning logs, tool executions, costs, and file changes from any past run.
         </p>
       </div>

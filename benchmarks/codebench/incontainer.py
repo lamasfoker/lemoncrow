@@ -488,6 +488,13 @@ def _docker_run_cmd(
         "-v",
         f"{CA_CERT}:/mnt/mitm.pem:ro",
     ]
+    if driver == "claude":
+        # Ambient Claude auth: mount the host credential read-only and let the
+        # entry script copy it into the isolated writable CLAUDE_CONFIG_DIR.
+        # OAuth env tokens still take precedence when supplied by the runner.
+        claude_creds = Path.home() / ".claude" / ".credentials.json"
+        if claude_creds.is_file() and not agent_env.get("CLAUDE_CODE_OAUTH_TOKEN"):
+            cmd += ["-v", f"{claude_creds}:/mnt/claude-credentials.json:ro"]
     if driver == "cursor":
         # cursor-agent auth (accessToken/refreshToken); the entry script copies it
         # into a writable HOME so a token refresh mid-run isn't blocked by the

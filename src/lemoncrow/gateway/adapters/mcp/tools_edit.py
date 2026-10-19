@@ -22,7 +22,7 @@ EDIT_TOOL_INPUT_SCHEMA: dict[str, Any] = {
     "properties": {
         "project_id": {
             "type": "string",
-            "description": "Optional registered project id; routes edits to that project's isolated workspace.",
+            "description": "Registered project id; routes edits to that project's workspace.",
         },
         "edits": {
             "type": "array",
@@ -534,7 +534,11 @@ def tool_smart_edit(
 
         from lemoncrow.pro.capabilities.tool_supervision.rich_edit import apply_rich_edits
 
-        result = apply_rich_edits(edits, atomic=atomic, repo_root=_edit_root, allowed_roots=_extra_roots)
+        # The same roots the confinement check above allows, not just the extras:
+        # apply_rich_edits performs its own path check against repo_root plus
+        # allowed_roots, so passing only _extra_roots drops the main checkout
+        # whenever a linked worktree is inferred.
+        result = apply_rich_edits(edits, atomic=atomic, repo_root=_edit_root, allowed_roots=_allowed_edit_roots)
 
         # Sync the long-lived engine's index-version cache so the next explore
         # call gets a cache miss and re-queries the FTS5 index (which the
@@ -733,6 +737,20 @@ def tool_smart_edit(
         # Incremental: refresh the shared index for the touched files now, so a
         # follow-up search/explore reflects this edit without the autosync lag.
         _reindex_edited_files(repo_root, [str(p) for p in paths.values()])
+        try:
+            from lemoncrow.core.foundation.paths import default_store_root
+            from lemoncrow.gateway.adapters.mcp.session_identity import resolved_host_session
+            from lemoncrow.pro.capabilities.review.live_runtime import request_live_review_prepare
+
+            session_id, host = resolved_host_session()
+            request_live_review_prepare(
+                default_store_root(),
+                repo_root,
+                host=host,
+                session_id=session_id,
+            )
+        except (ImportError, OSError, TypeError, ValueError):
+            pass
     # Disclose the worktree redirect. It is an inference, so a wrong one has to
     # be visible in the same breath as the write it misdirected.
     if _session_worktree is not None:

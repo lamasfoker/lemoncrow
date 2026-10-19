@@ -11,11 +11,11 @@ export interface ReviewEvidenceFact {
 }
 
 function stateLabel(state: ReviewEvidenceFactState): string {
-  if (state === "verified") return "PASS";
-  if (state === "failed") return "FAIL";
-  if (state === "not_run") return "NOT RUN";
-  if (state === "stale") return "STALE";
-  return "UNKNOWN";
+  if (state === "verified") return "Passed";
+  if (state === "failed") return "Failed";
+  if (state === "not_run") return "Did not run";
+  if (state === "stale") return "Older evidence";
+  return "Couldn’t determine";
 }
 
 function stateClass(state: ReviewEvidenceFactState): string {
@@ -27,14 +27,14 @@ function stateClass(state: ReviewEvidenceFactState): string {
 
 export default function ReviewEvidenceFacts({
   facts,
-  emptyText = "No named verification evidence is attached to this revision.",
+  emptyText = "No named verification evidence is attached to this Snapshot.",
 }: {
   facts: readonly ReviewEvidenceFact[];
   emptyText?: string;
 }) {
   if (facts.length === 0) {
     return (
-      <div className="rounded-md border border-neutral-800/70 bg-neutral-900/20 px-3 py-2.5 text-[10px] text-neutral-500">
+      <div className="rounded-md border border-border/70 bg-muted/20 px-3 py-2.5 text-caption text-muted-foreground">
         {emptyText}
       </div>
     );
@@ -51,11 +51,14 @@ export default function ReviewEvidenceFacts({
               : <CircleDot size={11} className={`mt-0.5 shrink-0 ${stateClass(item.state)}`} />}
           <div className="min-w-0 flex-1">
             <div className="flex min-w-0 items-center gap-2">
-              <span className="min-w-0 flex-1 truncate text-[10px] font-medium text-neutral-300">{item.label}</span>
-              <span className={`shrink-0 font-mono text-[9px] ${stateClass(item.state)}`}>{stateLabel(item.state)}</span>
+              <span className="min-w-0 flex-1 truncate text-caption font-medium text-neutral-300">{item.label}</span>
+              <span className={`shrink-0 text-micro ${stateClass(item.state)}`}>{stateLabel(item.state)}</span>
             </div>
-            <div className="mt-0.5 text-[10px] leading-4 text-neutral-600">{item.detail}</div>
-            <div className="mt-0.5 font-mono text-[9px] text-neutral-700">{item.source}</div>
+            <details className="mt-1 text-caption text-muted-foreground">
+              <summary className="cursor-pointer select-none text-caption text-muted-foreground">Evidence details</summary>
+              <div className="mt-1 leading-4">{item.detail}</div>
+              <div className="mt-0.5 font-mono text-micro">Source · {item.source}</div>
+            </details>
           </div>
         </div>
       ))}

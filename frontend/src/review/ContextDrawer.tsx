@@ -1,7 +1,23 @@
+import { Button as UiButton } from "../components/ui/button";
+import { Input as UiInput } from "../components/ui/input";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "../components/ui/tabs";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Pin, PinOff, X } from "lucide-react";
+import { Code2, Pin, PinOff, X } from "lucide-react";
+
+import type { CodeTarget } from "../lib/codeLinks";
+import { useResolvedProductCapabilities } from "../lib/RuntimeCapabilities";
 
 import { OrphanedComments } from "./AnnotationCard";
+import ScreenshotEvidenceCompare from "./ScreenshotEvidenceCompare";
+import ContextDevelopment, { fileDevelopmentCount } from "./ContextDevelopment";
+import ReviewCodePeek from "./ReviewCodePeek";
+import ReviewContextFiles from "./ReviewContextFiles";
+import ArtifactAnalysesPanel from "./ArtifactAnalysesPanel";
+import CheckRecipesPanel from "./CheckRecipesPanel";
+import InteractivePreviewPanel from "./InteractivePreview";
+import RunPlanPanel from "./RunPlanPanel";
+import RuntimeObservationPanel from "./RuntimeObservationPanel";
+import StaticFindingsPanel from "./StaticFindingsPanel";
 import {
   ArtifactCard,
   Discussion,
@@ -20,19 +36,27 @@ import type {
   FileDetail,
   ImpactSite,
   ReviewEvidence,
+  ReviewDevelopment,
+  ReviewJournal,
   ReviewMarkEvent,
   ReviewTarget,
 } from "./types";
 
-export type ContextDrawerTab = "impact" | "checks" | "evidence" | "author" | "discussion" | "history";
+export type ContextDrawerTab = "context" | "checks" | "discussion" | "activity";
 
 interface ContextDrawerProps {
   reviewId: string;
+  revisionNumber?: number;
+  historical?: boolean;
+  codeRoot?: string;
   target: ReviewTarget;
   detail: FileDetail | null;
   degraded: DegradedNote[];
   annotations: Annotation[];
   evidence: ReviewEvidence[];
+  journal?: ReviewJournal | null;
+  /** Change-level Development for this Snapshot; supersedes the legacy journal when it has stream evidence. */
+  development?: ReviewDevelopment | null;
   tab: ContextDrawerTab;
   pinned: boolean;
   uploading?: boolean;
@@ -43,15 +67,24 @@ interface ContextDrawerProps {
   onOpenImpact(site: ImpactSite): void;
   onUploadEvidence(files: File[]): void;
   onAddPreview(url: string, title: string): void;
+  onOpenDevelopment?(): void;
+  /** Opens a location in Code (the working tree); absent without a trusted local checkout. */
+  onOpenInCode?(target: CodeTarget): void;
+  /** Goes to a Code Peek location inside this Review, onto the backtrail. */
+  onJumpToCode?(target: CodeTarget): void;
+  /** Resolve/reopen a comment, including one that lost its anchor. */
+  onSetAnnotationState?(id: string, state: "open" | "resolved"): void;
+  /** `projection.triage.hidden_finding_ids`: findings the finding threshold folds (imported ones by ref). */
+  hiddenFindingIds?: readonly string[];
 }
 
-const PRIMARY_TABS: ContextDrawerTab[] = ["impact", "discussion", "checks"];
-const DETAIL_TABS: ContextDrawerTab[] = ["evidence", "author", "history"];
+const ALL_TABS: ContextDrawerTab[] = ["context", "checks", "discussion", "activity"];
 
 function tabLabel(tab: ContextDrawerTab): string {
-  if (tab === "discussion") return "Comments";
-  if (tab === "author") return "Author & provenance";
-  return tab[0].toUpperCase() + tab.slice(1);
+  if (tab === "context") return "Context";
+  if (tab === "checks") return "Checks";
+  if (tab === "discussion") return "Discussion";
+  return "Activity";
 }
 
 function checkWeight(status: string): number {
@@ -79,11 +112,16 @@ function scopeWeight(scope: "review" | "file" | undefined): number {
 
 export default function ContextDrawer({
   reviewId,
+  revisionNumber = 0,
+  historical = false,
+  codeRoot = "",
   target,
   detail,
   degraded,
   annotations,
   evidence,
+  journal = null,
+  development = null,
   tab,
   pinned,
   uploading = false,
@@ -94,7 +132,15 @@ export default function ContextDrawer({
   onOpenImpact,
   onUploadEvidence,
   onAddPreview,
+  onOpenDevelopment,
+  onOpenInCode,
+  onJumpToCode,
+  onSetAnnotationState,
+  hiddenFindingIds,
 }: ContextDrawerProps) {
+  // Code Peek is a Runtime consumer: no entry point in a Review-only install,
+  // nor while product discovery is still pending.
+  const runtimeCode = useResolvedProductCapabilities()?.features["runtime.code"] === true;
   const closeRef = useRef<HTMLButtonElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [dragging, setDragging] = useState(false);
@@ -127,6 +173,44 @@ export default function ContextDrawer({
   );
   const currentEvidence = relevantEvidence.filter((item) => item.status === "current");
   const staleEvidence = relevantEvidence.filter((item) => item.status === "stale");
+  const screenshotPairs = useMemo(() => {
+    const activeRevisionId = detail?.revision_id ?? "";
+    const activeRevisionNumber = evidence.find((item) => item.revision_id === activeRevisionId)?.revision_number ?? null;
+    const isScreenshot = (item: ReviewEvidence) =>
+      (item.kind === "screenshot" || item.kind === "image")
+      && item.mime_type.startsWith("image/")
+      && Boolean(item.content_url);
+    const key = (item: ReviewEvidence) => `${item.path}\u0000${item.title}`;
+    const previous = new Map<string, ReviewEvidence[]>();
+    for (const item of staleEvidence) {
+      if (!isScreenshot(item) || !item.title) continue;
+      const rows = previous.get(key(item)) ?? [];
+      rows.push(item);
+      previous.set(key(item), rows);
+    }
+    for (const rows of previous.values()) {
+      rows.sort((left, right) =>
+        (right.revision_number ?? -1) - (left.revision_number ?? -1)
+        || right.created_at.localeCompare(left.created_at));
+    }
+    return currentEvidence.flatMap((after) => {
+      if (!isScreenshot(after) || !after.title) return [];
+      // Evidence status already uses reviewed-code identity, not row identity.
+      // A carried artifact from an equivalent source generation is therefore
+      // valid current proof for this Snapshot even when captured on an older
+      // Snapshot row. The comparison labels the images only Before/After; it
+      // does not name the revision either one was captured on.
+      const before = (previous.get(key(after)) ?? []).find((candidate) => {
+        if (candidate.revision_id === after.revision_id) return false;
+        if (activeRevisionNumber != null && candidate.revision_number != null) {
+          return candidate.revision_number < activeRevisionNumber;
+        }
+        if (after.revision_number == null || candidate.revision_number == null) return true;
+        return candidate.revision_number < after.revision_number;
+      });
+      return before ? [{ before, after }] : [];
+    });
+  }, [currentEvidence, detail?.revision_id, staleEvidence]);
   const verification = [...(detail?.evidence ?? [])].sort(
     (left, right) =>
       checkWeight(left.status) - checkWeight(right.status) ||
@@ -141,6 +225,22 @@ export default function ContextDrawer({
   const meaningfulReasons = target.reasons.filter((reason) => !/^\+\d+\s+-\d+$/.test(reason.trim()));
   const symbols = detail?.symbols ?? [];
   const targetLabel = targetDisplayLabel(target);
+  const agentEntries = (journal?.entries ?? []).filter((item) => {
+    if (!item.path) return true;
+    const normalized = item.path.replace(/\\/g, "/").replace(/^\.\//, "");
+    return normalized === target.path || normalized.endsWith(`/${target.path}`);
+  });
+  const agentPlan = agentEntries.filter((item) => item.kind === "plan");
+  const agentDecisions = agentEntries.filter((item) => item.kind === "fact" || item.kind === "decision");
+  const agentOpen = agentEntries.filter((item) => item.kind === "question" || item.kind === "blocker");
+  const agentActivity = agentEntries.filter((item) => !["plan", "fact", "decision", "question", "blocker"].includes(item.kind));
+  // A frozen legacy journal stays authoritative for the Snapshots it was
+  // captured with; otherwise the Development stream owns this tab.
+  const fileDevelopment =
+    development && development.snapshot.source !== "legacy_journal" && (development.snapshot.available || !journal?.available)
+      ? development
+      : null;
+  const agentSignalCount = fileDevelopment ? fileDevelopmentCount(fileDevelopment, target.path) : agentEntries.length;
 
   useEffect(() => {
     closeRef.current?.focus();
@@ -160,7 +260,7 @@ export default function ContextDrawer({
   }, [target.path]);
 
   useEffect(() => {
-    if (tab !== "history" || !reviewId || !target.unit_key) return;
+    if (tab !== "activity" || !reviewId || !target.unit_key) return;
     let cancelled = false;
     void fetchTargetHistory(reviewId, target.unit_key)
       .then((result) => {
@@ -176,109 +276,73 @@ export default function ContextDrawer({
     return () => { cancelled = true; };
   }, [reviewId, tab, target.unit_key]);
 
+  const tabCount = (item: ContextDrawerTab): number => {
+    if (item === "context") return (detail?.impact ?? []).length + authorNotes.length;
+    if (item === "checks") return verification.filter((row) => row.status !== "PASS").length + currentEvidence.length;
+    if (item === "discussion") return fileAnnotations.length;
+    return agentSignalCount + history.length;
+  };
+
   return (
-    <aside className="flex h-full min-h-0 w-full flex-col bg-neutral-950" aria-label="Review context" role="complementary">
-      <div className="shrink-0 border-b border-neutral-800 px-3 pt-2">
-        <div className="flex items-start gap-2 pb-2">
+    <aside className="flex h-full min-h-0 w-full flex-col bg-background" aria-label="Review context" role="complementary">
+      <Tabs value={tab} onValueChange={(value) => onTab(value as ContextDrawerTab)} className="contents">
+      <div className="shrink-0 border-b border-border px-2.5 pt-1.5">
+        <div className="flex items-start gap-1.5 pb-1.5">
           <div className="min-w-0 flex-1">
-            <div className="truncate font-mono text-[11px] font-medium text-neutral-200" title={targetLabel}>{targetLabel}</div>
-            <div className="mt-0.5 truncate font-mono text-[10px] text-neutral-600" title={target.path}>{target.path}</div>
+            <div className="truncate font-mono text-label font-medium text-neutral-200" title={targetLabel}>{targetLabel}</div>
+            <div className="mt-0.5 truncate font-mono text-caption text-muted-foreground" title={target.path}>{target.path}</div>
           </div>
-          <button
+          {onOpenInCode && detail?.status !== "deleted" && (
+            <UiButton
+              type="button"
+              variant="ghost"
+              size="icon"
+              onClick={() => onOpenInCode({ path: target.path, line: target.start_line, endLine: target.end_line })}
+              aria-label="Open in Code"
+              tooltip="Open the working tree's current file in Code (current index)"
+              className="h-7 w-7"
+            >
+              <Code2 size={12} />
+            </UiButton>
+          )}
+          <UiButton
             type="button"
+            variant="ghost"
+            size="icon"
             onClick={onTogglePin}
             aria-pressed={pinned}
             aria-label={pinned ? "Unpin" : "Pin"}
-            title={pinned ? "Unpin context drawer" : "Pin context drawer"}
-            className={`review-icon-button h-7 w-7 ${pinned ? "text-sky-300" : ""}`}
+            tooltip={pinned ? "Unpin context drawer" : "Pin context drawer"}
+            className={`h-7 w-7 ${pinned ? "text-sky-300" : ""}`}
           >
             {pinned ? <PinOff size={12} /> : <Pin size={12} />}
-          </button>
-          <button ref={closeRef} type="button" onClick={onClose} aria-label="Close review context" className="review-icon-button h-7 w-7">
+          </UiButton>
+          <UiButton ref={closeRef} type="button" variant="ghost" size="icon" onClick={onClose} aria-label="Close review context" className="h-7 w-7">
             <X size={13} />
-          </button>
+          </UiButton>
         </div>
-        <div className="flex items-end gap-3 overflow-x-auto" role="tablist" aria-label="Review context sections">
-          {PRIMARY_TABS.map((item) => {
-            const count = item === "discussion"
-              ? fileAnnotations.length
-              : item === "checks"
-                ? verification.filter((row) => row.status !== "PASS").length
-                : (detail?.impact ?? []).length;
-            return (
-              <button
-                key={item}
-                id={`review-context-tab-${item}`}
-                type="button"
-                role="tab"
-                aria-selected={tab === item}
-                aria-controls="review-context-panel"
-                onClick={() => onTab(item)}
-                className={`shrink-0 border-b-2 pb-2 text-[10px] ${tab === item ? "border-sky-500 text-neutral-100" : "border-transparent text-neutral-500 hover:text-neutral-50"}`}
-              >
-                {tabLabel(item)}
-                {count > 0 && <span className="ml-1 font-mono text-[10px] text-neutral-600">{count}</span>}
-              </button>
-            );
-          })}
-          {DETAIL_TABS.includes(tab) && (
-            <button
-              id={`review-context-tab-${tab}`}
-              type="button"
-              role="tab"
-              aria-selected="true"
-              aria-controls="review-context-panel"
-              className="shrink-0 border-b-2 border-sky-500 pb-2 text-[10px] text-neutral-100"
-            >
-              {tabLabel(tab)}
-            </button>
-          )}
-          <details data-review-dropdown className="relative shrink-0 pb-1.5">
-            <summary
-              aria-label="More review context"
-              className="cursor-pointer list-none rounded px-1.5 py-0.5 text-[10px] text-neutral-600 hover:bg-neutral-900 hover:text-neutral-200 [&::-webkit-details-marker]:hidden"
-            >
-              Details
-            </summary>
-            <div className="review-menu absolute left-0 top-full z-50 mt-1 w-48">
-              {DETAIL_TABS.map((item) => {
-                const count = item === "evidence"
-                  ? currentEvidence.length
-                  : item === "history"
-                    ? history.length
-                    : authorNotes.length;
-                return (
-                  <button
-                    key={item}
-                    type="button"
-                    onClick={(event) => {
-                      onTab(item);
-                      event.currentTarget.closest("details")?.removeAttribute("open");
-                    }}
-                    className="review-menu-item"
-                  >
-                    <span>{tabLabel(item)}</span>
-                    {count > 0 && <span className="ml-auto font-mono text-[10px] text-neutral-600">{count}</span>}
-                  </button>
-                );
-              })}
-            </div>
-          </details>
+        <div className="flex min-w-0 items-end gap-1">
+          <TabsList variant="underline" aria-label="Review context homes" className="flex min-w-0 flex-1 overflow-x-auto">
+            {ALL_TABS.map((item) => {
+              const count = tabCount(item);
+              return (
+                <TabsTrigger key={item} value={item} variant="underline" className="gap-1 data-[state=active]:border-sky-500">
+                  {tabLabel(item)}
+                  {count > 0 && <span className="font-mono text-caption leading-none text-muted-foreground">{count}</span>}
+                </TabsTrigger>
+              );
+            })}
+          </TabsList>
         </div>
       </div>
 
-      <div
-        id="review-context-panel"
-        role="tabpanel"
-        aria-labelledby={`review-context-tab-${tab}`}
-        className="min-h-0 flex-1 overflow-y-auto px-3 py-3"
-      >
-        {tab === "impact" && (
+      <TabsContent value={tab} className="min-h-0 flex-1 overflow-y-auto px-2.5 py-2">
+        {tab === "context" && (
           <div className="space-y-4">
             {meaningfulReasons.length > 0 && (
               <section>
                 <div className="review-kicker mb-1.5">Why review this</div>
-                <div className="space-y-1 text-[10px] leading-4 text-neutral-300">
+                <div className="space-y-1 text-caption leading-4 text-neutral-300">
                   {meaningfulReasons.map((reason) => <div key={reason}>{reason}</div>)}
                 </div>
               </section>
@@ -287,28 +351,161 @@ export default function ContextDrawer({
               <div className="review-kicker mb-2">Affected code</div>
               <Impact sites={detail?.impact ?? []} onOpen={onOpenImpact} />
             </section>
+            {runtimeCode && codeRoot && target.symbol && (
+              <ReviewCodePeek
+                projectRoot={codeRoot}
+                path={target.path}
+                symbol={target.symbol}
+                line={target.start_line}
+                onJump={onJumpToCode}
+                onOpenInCode={onOpenInCode}
+              />
+            )}
+            <ReviewContextFiles
+              reviewId={reviewId}
+              revisionNumber={revisionNumber}
+              historical={historical}
+              onOpenInCode={onOpenInCode}
+            />
             {symbols.length > 0 && (
               <details className="border-t border-neutral-900 pt-3">
-                <summary className="cursor-pointer text-[10px] text-neutral-500 hover:text-neutral-50">Definitions in this file · {symbols.length}</summary>
-                <div className="mt-2 space-y-1.5 border-l border-neutral-800 pl-2">
+                <summary className="cursor-pointer text-caption text-muted-foreground hover:text-neutral-50">Definitions in this file · {symbols.length}</summary>
+                <div className="mt-2 space-y-1.5 border-l border-border pl-2">
                   {symbols.slice(0, 12).map((symbol) => (
-                    <div key={`${symbol.qualified_name}:${symbol.start_line}`} className="flex items-baseline gap-2 text-[10px]">
+                    <div key={`${symbol.qualified_name}:${symbol.start_line}`} className="flex items-baseline gap-2 text-caption">
                       <span className="min-w-0 flex-1 truncate font-mono text-neutral-300">{symbol.qualified_name || symbol.symbol_name}</span>
-                      <span className="text-neutral-600">{symbol.change}</span>
-                      <span className="font-mono text-neutral-600">{symbol.caller_count >= 0 ? `${symbol.caller_count} callers` : "? callers"}</span>
+                      <span className="text-muted-foreground">{symbol.change}</span>
+                      <span className="font-mono text-muted-foreground">{symbol.caller_count >= 0 ? `${symbol.caller_count} callers` : "? callers"}</span>
+                      {onOpenInCode && symbol.start_line > 0 && detail?.status !== "deleted" && (
+                        <UiButton
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          onClick={() => onOpenInCode({ path: target.path, line: symbol.start_line, endLine: symbol.end_line })}
+                          aria-label={`Open ${symbol.qualified_name || symbol.symbol_name} in Code`}
+                          tooltip="Open in Code (current index)"
+                          className="h-5 w-5 shrink-0 self-center"
+                        >
+                          <Code2 size={11} />
+                        </UiButton>
+                      )}
                     </div>
                   ))}
-                  {symbols.length > 12 && <div className="text-[10px] text-neutral-600">+{symbols.length - 12} more</div>}
+                  {symbols.length > 12 && <div className="text-caption text-muted-foreground">+{symbols.length - 12} more</div>}
                 </div>
               </details>
             )}
             {degraded.length > 0 && (
               <details className="border-t border-neutral-900 pt-3">
-                <summary className="cursor-pointer text-[10px] text-amber-300/80">Analysis limitations · {degraded.length}</summary>
-                <div className="mt-2 space-y-2 border-l border-neutral-800 pl-2">
-                  {degraded.map((item) => <div key={item.name} className="text-[10px] leading-relaxed text-neutral-500"><span className="font-mono text-neutral-400">{item.name}</span><div>{item.note}</div></div>)}
+                <summary className="cursor-pointer text-caption text-amber-300/80">Analysis limitations · {degraded.length}</summary>
+                <div className="mt-2 space-y-2 border-l border-border pl-2">
+                  {degraded.map((item) => <div key={item.name} className="text-caption leading-relaxed text-muted-foreground"><span className="font-mono text-neutral-400">{item.name}</span><div>{item.note}</div></div>)}
                 </div>
               </details>
+            )}
+          </div>
+        )}
+
+        {tab === "activity" && fileDevelopment && (
+          <ContextDevelopment
+            reviewId={reviewId}
+            development={fileDevelopment}
+            path={target.path}
+            onOpenDevelopment={onOpenDevelopment}
+          />
+        )}
+
+        {tab === "activity" && !fileDevelopment && (
+          <div className="space-y-4">
+            {!journal?.available ? (
+              <div className="text-caption leading-relaxed text-muted-foreground">
+                {journal?.reason || "No exact author-session journal is attached to this Review yet."}
+              </div>
+            ) : (
+              <>
+                <section>
+                  <div className="flex items-center gap-2">
+                    <div className="review-kicker">Live author session</div>
+                    <span className="font-mono text-micro text-muted-foreground">{journal.host || "agent"}</span>
+                  </div>
+                  {journal.session_id && (
+                    <div className="mt-1 truncate font-mono text-micro text-muted-foreground" title={journal.session_id}>
+                      {journal.session_id}
+                    </div>
+                  )}
+                  {agentEntries.length === 0 && (
+                    <div className="mt-2 text-caption text-muted-foreground">{journal.reason || "No review-relevant author activity is recorded yet."}</div>
+                  )}
+                </section>
+
+                {agentPlan.length > 0 && (
+                  <section className="border-t border-neutral-900 pt-3">
+                    <div className="review-kicker mb-2">Plan</div>
+                    <div className="space-y-2">
+                      {agentPlan.map((item) => (
+                        <div key={item.id} className="border-l border-sky-900/60 pl-2 text-caption leading-relaxed text-neutral-300">
+                          <div>{item.summary}</div>
+                          {item.detail && <div className="mt-1 whitespace-pre-wrap text-muted-foreground">{item.detail}</div>}
+                        </div>
+                      ))}
+                    </div>
+                  </section>
+                )}
+
+                {agentDecisions.length > 0 && (
+                  <section className="border-t border-neutral-900 pt-3">
+                    <div className="review-kicker mb-2">Decisions & facts</div>
+                    <div className="space-y-1.5 text-caption leading-relaxed">
+                      {agentDecisions.map((item) => (
+                        <div key={item.id} className={`border-l pl-2 ${item.kind === "fact" ? "border-emerald-900/60 text-neutral-300" : "border-violet-900/60 text-neutral-400"}`}>
+                          {item.summary}
+                          {item.detail && <div className="mt-1 text-muted-foreground">{item.detail}</div>}
+                        </div>
+                      ))}
+                    </div>
+                  </section>
+                )}
+
+                {agentOpen.length > 0 && (
+                  <section className="border-t border-neutral-900 pt-3">
+                    <div className="review-kicker mb-2">Still open</div>
+                    <div className="space-y-1.5 text-caption leading-relaxed">
+                      {agentOpen.map((item) => (
+                        <div key={item.id} className={item.kind === "blocker" ? "text-rose-300/90" : "text-amber-300/80"}>
+                          {item.summary}
+                        </div>
+                      ))}
+                    </div>
+                  </section>
+                )}
+
+                <section className="border-t border-neutral-900 pt-3">
+                  <div className="review-kicker mb-2">Relevant activity</div>
+                  {agentActivity.length === 0 ? (
+                    <div className="text-caption text-muted-foreground">No recorded agent activity is scoped to this file yet.</div>
+                  ) : (
+                    <div className="space-y-2">
+                      {[...agentActivity].reverse().slice(0, 24).map((item) => (
+                        <div key={item.id} className="border-l border-border pl-2 text-caption">
+                          <div className="flex min-w-0 items-baseline gap-2">
+                            <span className="shrink-0 font-mono text-muted-foreground">{item.kind}</span>
+                            <span className="min-w-0 flex-1 truncate text-neutral-300" title={item.summary}>{item.summary}</span>
+                            {item.status && (
+                              <span className={item.status === "pass" ? "text-emerald-300" : item.status === "fail" ? "text-rose-300" : "text-muted-foreground"}>{item.status}</span>
+                            )}
+                          </div>
+                          {item.detail && <div className="mt-1 max-h-28 overflow-auto whitespace-pre-wrap break-words font-mono text-micro leading-4 text-muted-foreground">{item.detail}</div>}
+                          {item.at && <div className="mt-0.5 text-micro text-muted-foreground">{new Date(item.at).toLocaleTimeString()}</div>}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </section>
+
+                <div className="border-t border-neutral-900 pt-2 text-micro leading-relaxed text-muted-foreground">
+                  Review shows observable plans, decisions, tool/test evidence, messages, and edit activity. Hidden chain-of-thought is not captured.
+                </div>
+              </>
             )}
           </div>
         )}
@@ -316,40 +513,57 @@ export default function ContextDrawer({
         {tab === "checks" && (
           <div className="space-y-3">
             {verification.length > 0 && (
-              <div className="flex flex-wrap gap-2 text-[10px]">
+              <div className="flex flex-wrap gap-2 text-caption">
                 {failedChecks > 0 && <span className="text-rose-300">{failedChecks} failed</span>}
                 {unresolvedChecks > 0 && <span className="text-amber-300">{unresolvedChecks} unresolved</span>}
                 {passedChecks > 0 && <span className="text-emerald-300/70">{passedChecks} passed</span>}
               </div>
             )}
             <Verification rows={verification} />
-            <div className="text-[10px] leading-relaxed text-neutral-600">
-              Review-wide passes are context, not proof that this target is correct.
+            <StaticFindingsPanel
+              reviewId={reviewId}
+              revisionId={detail?.revision_id ?? ""}
+              path={target.path}
+              readOnly={readOnly || historical}
+              hiddenFindingIds={hiddenFindingIds}
+            />
+            <RunPlanPanel reviewId={reviewId} revisionId={detail?.revision_id ?? ""} readOnly={readOnly || historical} />
+            <CheckRecipesPanel reviewId={reviewId} revisionId={detail?.revision_id ?? ""} readOnly={readOnly || historical} />
+            <RuntimeObservationPanel reviewId={reviewId} revisionId={detail?.revision_id ?? ""} readOnly={readOnly || historical} />
+            <ArtifactAnalysesPanel reviewId={reviewId} revisionId={detail?.revision_id ?? ""} readOnly={readOnly || historical} />
+            {!historical && (
+              <InteractivePreviewPanel reviewId={reviewId} revisionId={detail?.revision_id ?? ""} readOnly={readOnly} openedFrom="checks_rail" />
+            )}
+            <div className="text-caption leading-relaxed text-muted-foreground">
+              Review-wide passes are context, not proof that this review area is correct.
             </div>
           </div>
         )}
 
-        {tab === "evidence" && (
+        {tab === "checks" && (
           <div className="space-y-3">
-            <PanelCard title="Current revision" action={<span className="font-mono text-[10px] text-neutral-600">{currentEvidence.length}</span>}>
+            {screenshotPairs.map(({ before, after }) => (
+              <ScreenshotEvidenceCompare key={`${before.id}:${after.id}`} before={before} after={after} />
+            ))}
+            <PanelCard title="Current Snapshot" action={<span className="font-mono text-caption text-muted-foreground">{currentEvidence.length}</span>}>
               {currentEvidence.length === 0 ? (
-                <div className="text-[10px] text-neutral-600">No current screenshots, video, traces, or previews attached.</div>
+                <div className="text-caption text-muted-foreground">No current screenshots, video, traces, or previews attached.</div>
               ) : (
                 <div className="space-y-2">{currentEvidence.map((artifact) => <ArtifactCard key={artifact.id} artifact={artifact} />)}</div>
               )}
             </PanelCard>
             {staleEvidence.length > 0 && (
-              <details className="border-t border-neutral-800 pt-2">
-                <summary className="cursor-pointer text-[10px] uppercase tracking-wider text-neutral-600">Previous revisions · {staleEvidence.length}</summary>
+              <details className="border-t border-border pt-2">
+                <summary className="cursor-pointer text-caption uppercase tracking-wider text-muted-foreground">Previous Snapshots · {staleEvidence.length}</summary>
                 <div className="mt-2 space-y-2">{staleEvidence.map((artifact) => <ArtifactCard key={artifact.id} artifact={artifact} />)}</div>
               </details>
             )}
             {readOnly ? (
-              <div className="border border-neutral-800 px-2.5 py-2 text-[10px] text-neutral-500">Evidence is read-only until this review is restored.</div>
+              <div className="border border-border px-2.5 py-2 text-caption text-muted-foreground">Evidence is read-only until this review is restored.</div>
             ) : (
-              <details className="border border-neutral-800 bg-neutral-900/20">
-                <summary className="cursor-pointer px-2.5 py-2 text-[10px] uppercase tracking-wider text-neutral-500">Add evidence</summary>
-                <div className="space-y-2 border-t border-neutral-800 p-2.5">
+              <details className="border border-border bg-muted/20">
+                <summary className="cursor-pointer px-2.5 py-2 text-caption uppercase tracking-wider text-muted-foreground">Add evidence</summary>
+                <div className="space-y-2 border-t border-border p-2.5">
                   <label
                     onDragEnter={(event) => { event.preventDefault(); setDragging(true); }}
                     onDragOver={(event) => { event.preventDefault(); setDragging(true); }}
@@ -362,7 +576,7 @@ export default function ContextDrawer({
                     }}
                     className={`block cursor-pointer border border-dashed p-3 text-center focus-within:border-brand-400/35 ${dragging ? "border-sky-600 bg-sky-950/20" : "border-neutral-700"}`}
                   >
-                    <input
+                    <UiInput unstyled
                       ref={fileInputRef}
                       type="file"
                       multiple
@@ -375,7 +589,7 @@ export default function ContextDrawer({
                         event.currentTarget.value = "";
                       }}
                     />
-                    <div className="text-[10px] text-neutral-300">{uploading ? "Adding evidence…" : "Drop screenshot, video, trace.zip, or document"}</div>
+                    <div className="text-caption text-neutral-300">{uploading ? "Adding evidence…" : "Drop screenshot, video, trace.zip, or document"}</div>
                   </label>
                   {/*
                     Dropping a file and clicking the drop zone are both pointer
@@ -383,26 +597,28 @@ export default function ContextDrawer({
                     and therefore not in the tab order, so without this button a
                     keyboard reviewer has no way to attach evidence at all.
                   */}
-                  <button
+                  <UiButton
                     type="button"
+                    variant="outline"
+                    size="xs"
                     onClick={() => fileInputRef.current?.click()}
-                    className="border border-neutral-700 px-2 py-1 text-[10px] text-neutral-400 hover:text-neutral-50"
                   >
                     Choose files
-                  </button>
+                  </UiButton>
                   <div className="flex gap-1.5">
-                    <input value={previewUrl} onChange={(event) => setPreviewUrl(event.target.value)} placeholder="http://localhost:3000/..." className="min-w-0 flex-1 border border-neutral-800 bg-neutral-950 px-2 py-1 text-[10px] text-neutral-300 outline-none focus:border-neutral-600" />
-                    <button
+                    <UiInput uiSize="xs" value={previewUrl} onChange={(event) => setPreviewUrl(event.target.value)} placeholder="http://localhost:3000/..." className="min-w-0 flex-1" />
+                    <UiButton
                       type="button"
+                      variant="outline"
+                      size="xs"
                       disabled={!previewUrl.trim()}
                       onClick={() => {
                         onAddPreview(previewUrl.trim(), "Live preview");
                         setPreviewUrl("");
                       }}
-                      className="border border-neutral-700 px-2 text-[10px] text-neutral-400 disabled:opacity-40"
                     >
                       Add
-                    </button>
+                    </UiButton>
                   </div>
                 </div>
               </details>
@@ -410,16 +626,16 @@ export default function ContextDrawer({
           </div>
         )}
 
-        {tab === "author" && (
+        {tab === "context" && (
           <div className="space-y-4">
             <section>
               <div className="review-kicker mb-2">Author rationale</div>
               {authorNotes.length === 0 ? (
-                <div className="text-[10px] text-neutral-600">No exact author rationale is attached to this file.</div>
+                <div className="text-caption text-muted-foreground">No exact author rationale is attached to this file.</div>
               ) : (
                 <div className="space-y-2">
                   {authorNotes.map((note) => (
-                    <div key={note.id} className="border-l border-amber-900/70 pl-2 text-[10px] leading-relaxed text-neutral-300">
+                    <div key={note.id} className="border-l border-amber-900/70 pl-2 text-caption leading-relaxed text-neutral-300">
                       {note.title && <div className="font-medium text-neutral-200">{note.title}</div>}
                       <div className="whitespace-pre-wrap">{note.body}</div>
                     </div>
@@ -441,9 +657,9 @@ export default function ContextDrawer({
               are a sibling block outside it; counting them here made the header
               read "Discussion 2" over a single comment.
             */}
-            <PanelCard title="Comments" action={<span className="font-mono text-[10px] text-neutral-600">{anchoredComments.length}</span>}>
+            <PanelCard title="Comments" action={<span className="font-mono text-caption text-muted-foreground">{anchoredComments.length}</span>}>
               {anchoredComments.length === 0 && orphanedComments.length > 0 ? (
-                <div className="text-[10px] text-neutral-600">Every comment on this file lost its anchor; they are listed below.</div>
+                <div className="text-caption text-muted-foreground">Every comment on this file lost its anchor; they are listed below.</div>
               ) : (
                 <Discussion annotations={anchoredComments} path={target.path} />
               )}
@@ -454,33 +670,33 @@ export default function ContextDrawer({
               surface that names the rung that failed and the reason it failed, so
               the last known line reads as history rather than as a location.
             */}
-            <OrphanedComments comments={orphanedComments} />
-            {humanNotes.length === 0 && <div className="text-[10px] leading-relaxed text-neutral-600">Line comments remain inline in the diff. Human judgment remains distinct from AUTHOR, LEMONCROW, and AI REVIEW claims.</div>}
+            <OrphanedComments comments={orphanedComments} onSetState={readOnly ? undefined : onSetAnnotationState} />
+            {humanNotes.length === 0 && <div className="text-caption leading-relaxed text-muted-foreground">Line comments remain inline in the diff. Human judgment remains distinct from AUTHOR, LEMONCROW, and AI REVIEW claims.</div>}
           </div>
         )}
 
-        {tab === "history" && (
+        {tab === "activity" && (
           <div className="space-y-3">
-            <PanelCard title="Judgment history" action={<span className="font-mono text-[10px] text-neutral-600">{history.length}</span>}>
+            <PanelCard title="Judgment history" action={<span className="font-mono text-caption text-muted-foreground">{history.length}</span>}>
               {historyError ? (
-                <div className="text-[10px] text-rose-300">{historyError}</div>
+                <div className="text-caption text-rose-300">{historyError}</div>
               ) : history.length === 0 ? (
-                <div className="text-[10px] text-neutral-600">No recorded judgment transitions for this target yet.</div>
+                <div className="text-caption text-muted-foreground">No recorded judgment transitions for this review area yet.</div>
               ) : (
                 <div className="space-y-2">
                   {[...history].reverse().map((event) => (
-                    <div key={event.id} className="border-l border-neutral-800 pl-2 text-[10px]">
+                    <div key={event.id} className="border-l border-border pl-2 text-caption">
                       <div className="flex flex-wrap items-center gap-2">
                         <span className={event.actor_type === "human" ? "text-emerald-300" : event.actor_type === "agent" ? "text-violet-300" : "text-neutral-400"}>
                           {event.reviewer_id || (event.actor_type === "agent" ? "agent" : "LemonCrow")}
                         </span>
                         <span className="font-mono text-neutral-300">{event.from_state || "none"} → {event.to_state || "removed"}</span>
-                        <span className="text-neutral-600">{event.event_kind}</span>
+                        <span className="text-muted-foreground">{event.event_kind}</span>
                       </div>
-                      <div className="mt-0.5 text-[10px] text-neutral-600">{event.created_at ? new Date(event.created_at).toLocaleString() : ""}</div>
-                      {event.reason && <div className="mt-1 leading-relaxed text-neutral-500">{event.reason}</div>}
+                      <div className="mt-0.5 text-caption text-muted-foreground">{event.created_at ? new Date(event.created_at).toLocaleString() : ""}</div>
+                      {event.reason && <div className="mt-1 leading-relaxed text-muted-foreground">{event.reason}</div>}
                       {event.previous_unit_key && event.previous_unit_key !== event.unit_key && (
-                        <div className="mt-1 font-mono text-[10px] text-neutral-600">moved from {event.previous_unit_key}</div>
+                        <div className="mt-1 font-mono text-caption text-muted-foreground">moved from {event.previous_unit_key}</div>
                       )}
                     </div>
                   ))}
@@ -489,7 +705,8 @@ export default function ContextDrawer({
             </PanelCard>
           </div>
         )}
-      </div>
+      </TabsContent>
+      </Tabs>
     </aside>
   );
 }

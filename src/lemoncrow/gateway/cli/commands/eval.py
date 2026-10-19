@@ -10,12 +10,12 @@ import click
 def _gpu_supports_embedder(min_free_mb: int = 512) -> tuple[bool, str]:
     """Return (ok, reason). True when a CUDA GPU with enough free VRAM is present.
 
-    Uses ``nvidia-smi`` so it works regardless of which Python env is active.
-    Falls back to ``torch.cuda`` when nvidia-smi is unavailable.
+    Uses ``nvidia-smi`` so it works regardless of which Python env is active and
+    never imports a model framework into the public CLI (the semantic channel's
+    embedder is supplied by the private runtime).
     """
     import subprocess
 
-    # Primary: nvidia-smi — works in any Python env
     try:
         out = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
@@ -29,25 +29,9 @@ def _gpu_supports_embedder(min_free_mb: int = 512) -> tuple[bool, str]:
             return False, f"only {free_mb} MB free VRAM (need {min_free_mb} MB)"
         return True, f"{free_mb} MB free VRAM"
     except FileNotFoundError:
-        pass  # nvidia-smi not installed; fall through to torch
+        return False, "nvidia-smi not found (no CUDA GPU detected)"
     except Exception as exc:
         return False, f"nvidia-smi error: {exc}"
-
-    # Fallback: torch (only available when torch is installed in this env)
-    try:
-        import torch
-
-        if not torch.cuda.is_available():
-            return False, "no CUDA GPU detected"
-        free_bytes, _ = torch.cuda.mem_get_info()
-        free_mb = free_bytes // (1024 * 1024)
-        if free_mb < min_free_mb:
-            return False, f"only {free_mb} MB free VRAM (need {min_free_mb} MB)"
-        return True, f"{free_mb} MB free VRAM"
-    except ImportError:
-        return False, "nvidia-smi not found and torch not installed"
-    except Exception as exc:
-        return False, f"GPU check failed: {exc}"
 
 
 @click.group(name="eval")
@@ -215,9 +199,11 @@ def _channel_cmd_env(
     pairs: tuple[Path, ...],
     workers: int = 1,
 ) -> tuple[list[str], dict[str, str], list[Path]]:
-    """Every channel -- LemonCrow included -- runs through the same provider
-    harness over the shipped stdio surface. LemonCrow channel variants are env
-    toggles the server honours (the provider forwards its environment)."""
+    """Run every channel through the same provider and scoring harness.
+
+    The default thin client uses persistent HTTP. Legacy LemonCrow variants use
+    stdio and explicit backend toggles forwarded to that server.
+    """
     import os
     import sys
 
@@ -551,10 +537,10 @@ def _render_comparison(channel_results: dict[str, dict[str, Any]], csv_path: Pat
     "channels",
     multiple=True,
     type=click.Choice([_ALL_CHANNEL, *_RETRIEVAL_CHANNELS]),
-    default=("lexical",),
+    default=("lemoncrow-shared",),
     show_default=True,
-    help="Channel(s) to benchmark. Repeatable for side-by-side comparison: "
-    "--channel lexical --channel lexical+zoekt. "
+    help="Channel(s) to benchmark. Default measures the real thin client over HTTP against the configured server. "
+    "Repeatable for side-by-side comparison: --channel lemoncrow-shared --channel lexical. "
     "Use 'all' to run every channel. "
     "Current client and configured server: lemoncrow-shared. "
     "Legacy MCP (env-toggled): zoekt, "
@@ -627,7 +613,7 @@ def eval_retrieval(
 
     Pass --channel multiple times for a side-by-side comparison table::
 
-        lc eval retrieval --channel lexical --channel lexical+zoekt --full
+        lc dev eval retrieval --channel lemoncrow-shared --channel lexical --full
     """
     import json
     import subprocess
@@ -1007,7 +993,7 @@ def eval_fitness(
             )
             active_channels.remove("lexical+zoekt+semantic")
 
-    eval_cmd = ["lemoncrow", "eval", "retrieval"]
+    eval_cmd = ["lemoncrow", "dev", "eval", "retrieval"]
     for pair_path in split_pairs:
         eval_cmd += ["--pairs", str(pair_path)]
     for ch in active_channels:
@@ -1017,6 +1003,81 @@ def eval_fitness(
 
     click.echo(f"[eval fitness] {' '.join(eval_cmd)}", err=True)
     raise SystemExit(subprocess.run(eval_cmd, cwd=str(Path(".").resolve()), env=env, check=False).returncode)
+
+
+@eval_.command("replay")
+@click.option("--days", default=30, show_default=True, type=int, help="How many recent days of traces to replay.")
+@click.option("--baseline", "baseline_name", default="heuristic", show_default=True, help="Baseline ranker.")
+@click.option("--candidate-ranker", "candidate_name", required=True, help="Ranker under evaluation.")
+@click.option("--label-window", default=8, show_default=True, type=int, help="Later calls that label relevance.")
+@click.option("--min-labeled", default=30, show_default=True, type=int, help="Refuse a verdict below this.")
+@click.option("--json", "as_json", is_flag=True)
+@click.pass_context
+def eval_replay(
+    ctx: click.Context,
+    days: int,
+    baseline_name: str,
+    candidate_name: str,
+    label_window: int,
+    min_labeled: int,
+    as_json: bool,
+) -> None:
+    """Replay recorded code_search traces through two rankers and score both.
+
+    Relevance = paths the agent touched in the next --label-window calls of the
+    same session. Exit status 1 when the candidate regresses MRR or there is
+    not enough labeled evidence for a verdict.
+    """
+    import json as _json
+
+    from lemoncrow.core.capabilities.context_engine import get_ranker
+    from lemoncrow.core.capabilities.trace_replay import (
+        assemble_calls,
+        build_cases,
+        replay_rankers,
+        verify_production_parity,
+    )
+    from lemoncrow.gateway.cli.commands.trace import iter_all_records
+
+    try:
+        baseline = get_ranker(baseline_name)
+        candidate = get_ranker(candidate_name)
+    except KeyError as exc:
+        raise click.ClickException(str(exc)) from exc
+    calls = assemble_calls(iter_all_records(ctx.obj["root"], days=max(1, days)))
+    cases = build_cases(calls, label_window=max(1, label_window))
+    report = replay_rankers(cases, baseline, candidate)
+    parity, parity_total = verify_production_parity(cases, baseline)
+    enough = report.cases_labeled >= min_labeled
+    regressed = report.candidate.mrr < report.baseline.mrr
+    verdict = "insufficient_evidence" if not enough else ("regression" if regressed else "no_regression")
+    payload = {
+        **report.to_payload(),
+        "calls": len(calls),
+        "baseline_parity": {"reproduced": parity, "cases": parity_total},
+        "verdict": verdict,
+    }
+    if as_json:
+        click.echo(_json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        b, c = report.baseline, report.candidate
+        click.echo(f"calls {len(calls)}  retrieval cases {report.cases_total}  labeled {report.cases_labeled}")
+        click.echo(f"baseline parity {parity}/{parity_total}")
+        click.echo(f"{'':18}{b.name:>14}{c.name:>14}")
+        for label, bv, cv in (
+            ("MRR@k", b.mrr, c.mrr),
+            ("recall@k", b.recall, c.recall),
+            ("hit@1", b.hit_at_1, c.hit_at_1),
+            ("mean sufficiency", b.sufficiency, c.sufficiency),
+        ):
+            click.echo(f"{label:18}{bv:>14.4f}{cv:>14.4f}")
+        click.echo(
+            f"improvements {report.improvements}  regressions {report.regressions}  unchanged {report.unchanged}"
+        )
+        click.echo(f"top-1 changed on {report.top1_changed}/{report.cases_total} cases")
+        click.echo(f"verdict: {verdict}")
+    if verdict != "no_regression":
+        ctx.exit(1)
 
 
 __all__ = [

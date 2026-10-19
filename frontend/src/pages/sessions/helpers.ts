@@ -18,7 +18,7 @@ export const HOST_COLORS: Record<string, string> = {
   lemoncode: "bg-yellow-900/40 text-yellow-300 border-yellow-700/50",
 };
 
-export function extractHost(trace: Trace | string): string {
+export function extractHost(trace: Pick<Trace, "agent" | "host" | "id"> | string): string {
   const agent = typeof trace === "string" ? trace : trace.agent;
   const host = typeof trace === "string" ? null : trace.host;
   const id = typeof trace === "string" ? "" : trace.id;

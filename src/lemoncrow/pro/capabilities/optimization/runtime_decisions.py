@@ -145,6 +145,9 @@ class OptimizationTraceRecorder:
     def record_runtime_decision(self, event: RuntimeDecisionEvent) -> None:
         """Adapt a shared runtime decision to the existing redacted trace row."""
 
+        from lemoncrow.core.foundation.runtime_trace import record_decision
+
+        record_decision(event)
         if not self.enabled or len(self._payload["decisions"]) >= _MAX_DECISIONS:
             return
         proposed_safe = _safe_value(event.proposed)

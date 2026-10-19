@@ -330,6 +330,48 @@ def test_swe_overlay_installs_and_exports_headroom_apply(tmp_path: Path, monkeyp
     assert "LEMONCROW_HEADROOM_TAIL_STATS=/mnt/headroom-stats.jsonl" in cmd
 
 
+def test_claude_container_mounts_ambient_credentials_without_token(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("fix it", encoding="utf-8")
+    cert = tmp_path / "mitm.pem"
+    cert.write_text("cert", encoding="utf-8")
+    fake_home = tmp_path / "home"
+    creds = fake_home / ".claude" / ".credentials.json"
+    creds.parent.mkdir(parents=True)
+    creds.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(INCONTAINER, "CA_CERT", cert)
+    monkeypatch.setattr(INCONTAINER.Path, "home", classmethod(lambda cls: fake_home))
+    instance = types.SimpleNamespace(
+        instance_id="demo", image="demo:image", problem_statement="fix it", repo_dir="/testbed"
+    )
+
+    ambient = INCONTAINER._docker_run_cmd(
+        instance,
+        "lemoncrow",
+        driver="claude",
+        overlay="overlay:test",
+        model="claude-opus-4-8",
+        max_turns=10,
+        proxy_port=12345,
+        prompt_path=prompt,
+        agent_env={},
+    )
+    assert f"{creds}:/mnt/claude-credentials.json:ro" in ambient
+
+    token_auth = INCONTAINER._docker_run_cmd(
+        instance,
+        "lemoncrow",
+        driver="claude",
+        overlay="overlay:test",
+        model="claude-opus-4-8",
+        max_turns=10,
+        proxy_port=12345,
+        prompt_path=prompt,
+        agent_env={"CLAUDE_CODE_OAUTH_TOKEN": "redacted"},
+    )
+    assert f"{creds}:/mnt/claude-credentials.json:ro" not in token_auth
+
+
 def test_rate_limiter_does_not_block_proxy_event_loop(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setenv("CODEBENCH_RATE_LIMIT_RPM", "1200")
     limiter = RATE_LIMIT.ModelRequestRateLimiter()

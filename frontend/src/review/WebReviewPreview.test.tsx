@@ -1,27 +1,66 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import WebReviewPreview from "./WebReviewPreview";
 
-const api = vi.hoisted(() => ({ fetchLiveWebPreview: vi.fn() }));
+const api = vi.hoisted(() => {
+  const fetchSurfaceImpact = vi.fn();
+  return {
+    fetchLiveWebPreview: vi.fn(),
+    fetchWebPreview: vi.fn(),
+    fetchReviewVerification: vi.fn(),
+    fetchSurfaceImpact,
+    fetchSurfaceImpactWithRetry: fetchSurfaceImpact,
+  };
+});
 
 vi.mock("./reviewApi", () => ({
   currentReviewId: () => "review-1",
   fetchLiveWebPreview: api.fetchLiveWebPreview,
+  fetchWebPreview: api.fetchWebPreview,
+  fetchReviewVerification: api.fetchReviewVerification,
+  fetchSurfaceImpact: api.fetchSurfaceImpact,
+  fetchSurfaceImpactWithRetry: api.fetchSurfaceImpactWithRetry,
 }));
+
+let objectUrlCounter = 0;
 
 beforeEach(() => {
   vi.clearAllMocks();
+  objectUrlCounter = 0;
+  Object.defineProperty(URL, "createObjectURL", {
+    configurable: true,
+    value: vi.fn(() => `blob:preview-${++objectUrlCounter}`),
+  });
+  Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: vi.fn() });
   window.sessionStorage.clear();
   window.localStorage.clear();
   vi.stubGlobal("ResizeObserver", class {
     observe() {}
     disconnect() {}
   });
+  api.fetchReviewVerification.mockResolvedValue({ checks: [], summary: {}, artifacts: [] });
   api.fetchLiveWebPreview.mockImplementation(
     async (_id: string, _path: string, side: "old" | "new", route: string) => ({
       url: `http://127.0.0.1:4567/token/${side}${route}`,
+    }),
+  );
+  api.fetchWebPreview.mockImplementation(
+    async (_id: string, _path: string, side: "old" | "new") => new Blob([side], { type: "image/png" }),
+  );
+  api.fetchSurfaceImpact.mockImplementation(
+    async (_id: string, provider: string, surfaceId: string) => ({
+      revision_id: "rrv-1",
+      provider,
+      surface_id: surfaceId,
+      source: "web",
+      comparator: "image",
+      changed: true,
+      magnitude: surfaceId === "/" ? 0.2 : 0.1,
+      label: surfaceId === "/" ? "Δ 20.0% pixels" : "Δ 10.0% pixels",
+      reasons: ["visible pixels changed"],
+      metrics: {},
     }),
   );
 });
@@ -48,8 +87,8 @@ function props(overrides: Partial<React.ComponentProps<typeof WebReviewPreview>>
     chromeTheme: "light",
     active: true,
     routeOptions: [
-      { route: "/", surfaceKey: "web:/" },
-      { route: "/scan", surfaceKey: "web:/scan" },
+      { route: "/", surfaceKey: "web:/", documentPath: "src/Hero.tsx" },
+      { route: "/scan", surfaceKey: "web:/scan", documentPath: "src/Hero.tsx" },
     ],
     onActivate: vi.fn(),
     onOpenPath: vi.fn(),
@@ -73,21 +112,27 @@ describe("WebReviewPreview", () => {
     const routePicker = screen.getByRole("button", { name: "Rendered route" });
     expect(routePicker.textContent).toContain("/");
     await userEvent.click(routePicker);
-    expect(screen.getAllByRole("option").map((option) => option.textContent?.trim())).toEqual(["/", "/scan"]);
-    expect(screen.getByRole("button", { name: "Preview mode" }).getAttribute("aria-pressed")).toBe("true");
+    expect(screen.getAllByRole("option").map((option) => option.textContent?.trim())).toEqual([
+      "/Δ 20.0% pixels",
+      "/scanΔ 10.0% pixels",
+    ]);
+    // Close the route picker before reading the rest of the toolbar.
+    await userEvent.keyboard("{Escape}");
+    expect(screen.getByRole("radio", { name: "Preview" }).getAttribute("aria-checked")).toBe("true");
     const openSurface = screen.getByRole("button", { name: "Open web surface / in dedicated tab" });
     expect(openSurface.textContent).toContain("Web · app");
     await userEvent.click(openSurface);
     expect(first.onOpenDedicated).toHaveBeenCalledTimes(1);
-    expect(screen.getByRole("button", { name: "Compare mode" })).toBeTruthy();
-    expect(screen.queryByRole("button", { name: "Source mode" })).toBeNull();
+    expect(screen.getByRole("radio", { name: "Compare" })).toBeTruthy();
+    expect(screen.queryByRole("radio", { name: "Source" })).toBeNull();
     const viewOptions = screen.getByRole("button", { name: "Web preview options" });
-    const desktop = screen.getByRole("button", { name: "Desktop viewport" });
-    expect(desktop.closest("details")?.hasAttribute("open")).toBe(false);
+    expect(screen.queryByRole("button", { name: "Desktop viewport" })).toBeNull();
     await userEvent.click(viewOptions);
-    expect(desktop.closest("details")?.hasAttribute("open")).toBe(true);
+    const desktop = await screen.findByRole("button", { name: "Desktop viewport" });
     expect(desktop.getAttribute("aria-pressed")).toBe("true");
     expect(screen.getByRole("button", { name: /Preview theme: Auto/ })).toBeTruthy();
+    expect(screen.getByText("Shortcuts")).toBeTruthy();
+    expect(screen.getByText(/1\/2\/3 modes/)).toBeTruthy();
     expect(screen.getByText("Affected files · 2")).toBeTruthy();
 
     await userEvent.click(screen.getByRole("button", { name: "Mobile viewport" }));
@@ -104,12 +149,112 @@ describe("WebReviewPreview", () => {
     expect(screen.getByRole("button", { name: "Mobile viewport" }).getAttribute("aria-pressed")).toBe("true");
   });
 
+  it("renders an inspectable frozen before/after screenshot diff for the exact Snapshot", async () => {
+    render(<WebReviewPreview {...props()} />);
+    await userEvent.click(screen.getByRole("radio", { name: "Pixels" }));
+
+    await waitFor(() => expect(api.fetchWebPreview).toHaveBeenCalledTimes(2));
+    expect(api.fetchWebPreview).toHaveBeenCalledWith("review-1", "src/Hero.tsx", "old", "/", 1440, 5000, "rrv-1");
+    expect(api.fetchWebPreview).toHaveBeenCalledWith("review-1", "src/Hero.tsx", "new", "/", 1440, 5000, "rrv-1");
+    expect(await screen.findByTestId("web-frozen-screenshot-compare")).toBeTruthy();
+    expect(screen.getByAltText("Before · old source screenshot")).toBeTruthy();
+    expect(screen.getByAltText("After · new source screenshot")).toBeTruthy();
+    expect(screen.getByText(/Source remains authoritative/i)).toBeTruthy();
+
+    const divider = screen.getByRole("slider", { name: "Screenshot comparison divider" });
+    expect(divider.getAttribute("aria-valuenow")).toBe("50");
+    fireEvent.keyDown(divider, { key: "End" });
+    expect(divider.getAttribute("aria-valuenow")).toBe("100");
+    expect((screen.getByAltText("After · new source screenshot") as HTMLImageElement).style.clipPath).toBe("inset(0 0% 0 0)");
+  });
+
+  it("ranks only affected route options by deterministic frozen screenshot delta", async () => {
+    api.fetchSurfaceImpact.mockImplementation(
+      async (_id: string, provider: string, surfaceId: string) => ({
+        revision_id: "rrv-1",
+        provider,
+        surface_id: surfaceId,
+        source: "web",
+        comparator: "image",
+        changed: true,
+        magnitude: surfaceId === "/scan" ? 0.42 : 0.03,
+        label: surfaceId === "/scan" ? "Δ 42.0% pixels" : "Δ 3.0% pixels",
+        reasons: ["visible pixels changed"],
+        metrics: {},
+      }),
+    );
+    render(<WebReviewPreview {...props()} />);
+
+    await waitFor(() => expect(api.fetchSurfaceImpact).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.queryByText("Ranking pixels…")).toBeNull());
+    await userEvent.click(screen.getByRole("button", { name: "Rendered route" }));
+    const options = screen.getAllByRole("option");
+    expect(options.map((option) => option.textContent?.trim())).toEqual([
+      "/scanΔ 42.0% pixels",
+      "/Δ 3.0% pixels",
+    ]);
+    expect(api.fetchSurfaceImpact).toHaveBeenCalledWith(
+      "review-1", "web", "/scan", "rrv-1", 3,
+    );
+  });
+
+  it("shows the exact-Snapshot browser result for this route without another pane", async () => {
+    api.fetchReviewVerification.mockResolvedValue({
+      checks: [
+        {
+          name: "Home regression · 1280x800", status: "FAIL", state: "current", required: true, detail: "/ · 1 assertion(s) failed",
+          browser: { scenario: "home", route: "/", configured: true, applicability: "", run: null, baseline: null },
+        },
+        {
+          name: "Scan smoke", status: "PASS", state: "current", required: false, detail: "",
+          browser: { scenario: "scan", route: "/scan", configured: true, applicability: "", run: null, baseline: null },
+        },
+        {
+          name: "Home regression · 1280x800", status: "PASS", state: "stale", required: false, detail: "",
+          browser: { scenario: "home", route: "/", configured: true, applicability: "", run: null, baseline: null },
+        },
+      ],
+      summary: {},
+      artifacts: [],
+    });
+    render(<WebReviewPreview {...props()} />);
+    const chip = await screen.findByText("Browser FAIL");
+    expect(chip.getAttribute("title")).toContain("required");
+    expect(api.fetchReviewVerification).toHaveBeenCalledWith("review-1", "rrv-1");
+    expect(screen.queryByText("Browser PASS")).toBeNull();
+  });
+
+  it("keeps two same-titled browser scenarios on one route apart by typed identity", async () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    api.fetchReviewVerification.mockResolvedValue({
+      checks: [
+        {
+          name: "Home regression", status: "FAIL", state: "current", required: true, detail: "",
+          check_key: "browser|reported|home|",
+          browser: { scenario: "home", route: "/", configured: true, applicability: "", run: null, baseline: null },
+        },
+        {
+          name: "Home regression", status: "PASS", state: "current", required: true, detail: "",
+          check_key: "browser|reported|home-legacy|",
+          browser: { scenario: "home-legacy", route: "/", configured: true, applicability: "", run: null, baseline: null },
+        },
+      ],
+      summary: {},
+      artifacts: [],
+    });
+    render(<WebReviewPreview {...props()} />);
+    expect(await screen.findByText("Browser FAIL")).toBeTruthy();
+    expect(screen.getByText("Browser PASS")).toBeTruthy();
+    expect(errors.mock.calls.some((call) => String(call[0]).includes("same key"))).toBe(false);
+    errors.mockRestore();
+  });
+
   it("filters routes without clearing the search after selection", async () => {
     const onNavigateSurface = vi.fn();
     render(<WebReviewPreview {...props({ onNavigateSurface })} />);
 
     await userEvent.click(screen.getByRole("button", { name: "Rendered route" }));
-    const search = screen.getByRole("searchbox", { name: "Rendered route search" });
+    const search = screen.getByRole("combobox", { name: "Rendered route search" });
     await userEvent.type(search, "scan");
     expect(screen.getAllByRole("option")).toHaveLength(1);
     expect(screen.getByRole("option").textContent).toContain("/scan");
@@ -117,14 +262,14 @@ describe("WebReviewPreview", () => {
     expect(onNavigateSurface).toHaveBeenCalledWith("web:/scan");
 
     await userEvent.click(screen.getByRole("button", { name: "Rendered route" }));
-    expect((screen.getByRole("searchbox", { name: "Rendered route search" }) as HTMLInputElement).value).toBe("scan");
+    expect((screen.getByRole("combobox", { name: "Rendered route search" }) as HTMLInputElement).value).toBe("scan");
     expect(screen.getAllByRole("option")).toHaveLength(1);
     expect(window.localStorage.getItem("lemoncrow-review-surface-filter:review-1:web")).toBe("scan");
   });
 
   it("fits Compare into one pane, shows scale, and can link or unlink scrolling", async () => {
     render(<WebReviewPreview {...props()} />);
-    await userEvent.click(screen.getByRole("button", { name: "Compare mode" }));
+    await userEvent.click(screen.getByRole("radio", { name: "Compare" }));
 
     await waitFor(() => expect(screen.getByTestId("web-live-frame-old")).toBeTruthy());
     const shell = screen.getByTestId("web-live-compare-shell");
@@ -158,7 +303,7 @@ describe("WebReviewPreview", () => {
     await waitFor(() => expect(screen.getByTestId("web-live-frame-new")).toBeTruthy());
 
     await userEvent.keyboard("2");
-    expect(screen.getByRole("button", { name: "Compare mode" }).getAttribute("aria-pressed")).toBe("true");
+    expect(screen.getByRole("radio", { name: "Compare" }).getAttribute("aria-checked")).toBe("true");
     await userEvent.keyboard("m");
     await userEvent.click(screen.getByRole("button", { name: "Web preview options" }));
     expect(screen.getByRole("button", { name: "Mobile viewport" }).getAttribute("aria-pressed")).toBe("true");

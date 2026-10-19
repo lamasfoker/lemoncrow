@@ -216,7 +216,12 @@ PROVIDER_ALIASES: dict[str, str] = {
     "azure": "azure-claude",
     "openrouter": "openrouter-claude",
 }
-CLI_DRIVERS = ("claude", "lemoncrow-run", "codex", "cursor")
+CLI_DRIVERS = (
+    "claude",
+    "codex",
+    "cursor",
+    *(("lemoncrow-run",) if os.environ.get("LEMONCROW_INTERNAL_PRIVATE_RUNTIME", "").strip() == "1" else ()),
+)
 
 # Cursor model ids differ from the Claude/codebench shorthands ("sonnet").
 # cursor-agent only accepts its own ids (claude-opus-4-7-thinking-high, gpt-5.x,
@@ -2148,9 +2153,10 @@ def run_arm(
                 # arm's native stack, not ambient host MCP.
                 cmd.extend(["--mcp-config", json.dumps(EMPTY_MCP), "--strict-mcp-config"])
         elif cli_driver == "lemoncrow-run":
-            # Direct owned-session arm: LemonCrow owns prompt assembly, model routing,
-            # caching, and the executable tool loop on the caller's API credentials.
-            # The retained workspace is validated like every other coding arm.
+            # Private engineering benchmark arm: LemonCrow owns prompt assembly,
+            # model routing, caching, and the executable tool loop. Public Runtime
+            # Lite does not expose `lc run start`; enable it only for this harness.
+            env["LEMONCROW_INTERNAL_PRIVATE_RUNTIME"] = "1"
             cmd = ["lemoncrow", "run", "start", task.prompt(), "--yolo"]
             if model:
                 cmd += ["--model", model]

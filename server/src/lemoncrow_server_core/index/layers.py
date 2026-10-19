@@ -5,6 +5,12 @@ view's membership rows and a tenant's Layer-1 content. Both the in-process
 store and the SQLite store use the classes here and differ only in where the
 graph is persisted, which is why one differential oracle covers both.
 
+The semantic layer is not here. Its port is
+:class:`~.contracts.SemanticIndex`; the implementation (unit derivation, the
+generation/overlay ANN, query-time semantic scoring) is private advanced code
+intelligence, resolved through :mod:`.semantic`. The membership, readiness and
+build-lock helpers below are the shared layer discipline it builds on.
+
 Three properties are enforced here rather than in the algorithm:
 
 **Bounded work.** A build that would have to resolve more than
@@ -36,23 +42,28 @@ profile a manifest row declares for it are allowed to differ.
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Final, Protocol
 
+from ..errors import ErrorCode, ServerError
 from .boundary import addressable_in
 from .contracts import (
     AnalysisStore,
     ContentProvenance,
     ContentStore,
     Edge,
+    EdgeKind,
     IndexLayerState,
     IndexLayerStatus,
     LinkBuildMode,
     LinkBuildReport,
     ManifestEntry,
+    ViewState,
     ViewStore,
+    repository_generation_scope_id,
 )
 from .links import (
     DEFAULT_FULL_REBUILD_RATIO,
@@ -66,26 +77,47 @@ from .links import (
 __all__ = [
     "DEFAULT_INLINE_REBUILD_BUDGET",
     "InMemoryLinkGraphStore",
+    "IndexBuildCancelled",
     "LayerSources",
     "LinkGraphStore",
     "LinkLayer",
-    "SemanticLayer",
     "StatusTable",
 ]
 
+_LOG = logging.getLogger(__name__)
+
 #: Files an inline build may resolve before it defers to scheduled work.
 DEFAULT_INLINE_REBUILD_BUDGET: Final[int] = 5_000
+_BUILD_LOCK_STRIPES: Final[int] = 64
 
 _COLD_LINK: Final[str] = "link_index_not_built"
 _COLD_SEMANTIC: Final[str] = "semantic_index_not_built"
 
 
+def _acquire_build_lock(lock: threading.Lock, *, wait: bool, cancel: Callable[[], bool] | None) -> bool:
+    if not wait:
+        return lock.acquire(blocking=False)
+    while True:
+        if cancel is not None and cancel():
+            raise IndexBuildCancelled("deferred index build cancelled")
+        if lock.acquire(timeout=0.1):
+            return True
+
+
+class IndexBuildCancelled(RuntimeError):
+    """Cooperative stop for background derived-index work."""
+
+
 class LinkGraphStore(Protocol):
     """Where a view's resolved graph lives between builds."""
 
-    def load(self, org_id: str, view_id: str) -> LinkGraph | None: ...
+    def load(self, org_id: str, view_id: str, base: str = "", base_graph: LinkGraph | None = None) -> LinkGraph | None:
+        """The stored graph; *base_graph* is the graph stored under *base*, when held."""
 
-    def save(self, org_id: str, view_id: str, graph: LinkGraph) -> None: ...
+    def save(
+        self, org_id: str, view_id: str, graph: LinkGraph, base: str = "", base_graph: LinkGraph | None = None
+    ) -> None:
+        """Store *graph*; *base* names the generation graph it extends, if any."""
 
     def edges_for_paths(self, org_id: str, view_id: str, paths: Sequence[str]) -> tuple[Edge, ...]: ...
 
@@ -104,11 +136,15 @@ class InMemoryLinkGraphStore:
         self._graphs: dict[tuple[str, str], LinkGraph] = {}
         self._lock = threading.Lock()
 
-    def load(self, org_id: str, view_id: str) -> LinkGraph | None:
+    def load(self, org_id: str, view_id: str, base: str = "", base_graph: LinkGraph | None = None) -> LinkGraph | None:
+        del base, base_graph  # graphs are held whole in memory
         with self._lock:
             return self._graphs.get((org_id, view_id))
 
-    def save(self, org_id: str, view_id: str, graph: LinkGraph) -> None:
+    def save(
+        self, org_id: str, view_id: str, graph: LinkGraph, base: str = "", base_graph: LinkGraph | None = None
+    ) -> None:
+        del base, base_graph  # the graph object is shared in memory; nothing to deduplicate
         with self._lock:
             self._graphs[(org_id, view_id)] = graph
 
@@ -238,9 +274,11 @@ class _Members:
     oversize: int
 
 
-def _members(sources: LayerSources, org_id: str, view_id: str) -> _Members:
-    state = sources.views.get(org_id, view_id)
-    membership = sources.views.membership(org_id, view_id)
+def _members_from(
+    sources: LayerSources,
+    state: ViewState,
+    membership: Mapping[str, ManifestEntry],
+) -> _Members:
     expected: dict[str, ManifestEntry] = {}
     oversize = 0
     for path, entry in membership.items():
@@ -260,10 +298,42 @@ def _members(sources: LayerSources, org_id: str, view_id: str) -> _Members:
     )
 
 
+def _members(sources: LayerSources, org_id: str, view_id: str) -> _Members:
+    state = sources.views.get(org_id, view_id)
+    return _members_from(sources, state, sources.views.membership(org_id, view_id))
+
+
+def _generation_members(sources: LayerSources, org_id: str, view_id: str) -> _Members:
+    state = sources.views.get(org_id, view_id)
+    return _members_from(sources, state, sources.views.generation_membership(org_id, view_id))
+
+
+def _generation_graph_key(state: ViewState) -> str:
+    if not state.generation_id:
+        return state.view_id
+    return repository_generation_scope_id(state.generation_id, state.content_subject)
+
+
+def _live_view_revision(sources: LayerSources, org_id: str, view_id: str) -> int | None:
+    """The View's current revision, or ``None`` when it is not (or no longer) open.
+
+    A status query is a flag, not a failure: an evicted or never-opened View
+    keeps whatever the layer's own table says (eviction resets it to cold)
+    instead of turning a degradation check into ``view_unknown``.
+    """
+
+    try:
+        return sources.views.get(org_id, view_id).view_revision
+    except ServerError as exc:
+        if exc.code is ErrorCode.VIEW_UNKNOWN:
+            return None
+        raise
+
+
 class LinkLayer:
     """Layer 3 for every view, backed by a pluggable graph store."""
 
-    __slots__ = ("_budget", "_graphs", "_ratio", "_sources", "_status")
+    __slots__ = ("_budget", "_build_locks", "_graphs", "_ratio", "_sources", "_status")
 
     def __init__(
         self,
@@ -278,17 +348,25 @@ class LinkLayer:
         self._budget = inline_rebuild_budget
         self._ratio = full_rebuild_ratio
         self._status = StatusTable(_COLD_LINK)
+        self._build_locks = tuple(threading.Lock() for _ in range(_BUILD_LOCK_STRIPES))
 
     # -- IndexLayer ------------------------------------------------------ #
 
     def status(self, org_id: str, view_id: str) -> IndexLayerStatus:
-        return self._status.status(org_id, view_id)
+        current = self._status.status(org_id, view_id)
+        revision = _live_view_revision(self._sources, org_id, view_id) if current.ready else None
+        if revision is not None and current.at_view_revision != revision:
+            self._status.note_revision(org_id, view_id, revision)
+            current = self._status.status(org_id, view_id)
+        return current
 
     def note_revision(self, org_id: str, view_id: str, view_revision: int) -> None:
         self._status.note_revision(org_id, view_id, view_revision)
 
     def forget(self, org_id: str, view_id: str) -> None:
         self._status.forget(org_id, view_id)
+        # View-specific overlay graphs die with the View. Immutable generation
+        # graphs deliberately survive and are shared by other Views/worktrees.
         self._graphs.drop(org_id, view_id)
 
     def forget_view(self, view_id: str) -> None:
@@ -301,17 +379,102 @@ class LinkLayer:
     def last_build(self, org_id: str, view_id: str) -> LinkBuildReport | None:
         return self._status.last_build(org_id, view_id)
 
+    def _read_graph_key(self, org_id: str, view_id: str) -> str:
+        overlay, tombstones = self._sources.views.overlay(org_id, view_id)
+        if overlay or tombstones:
+            return view_id
+        return _generation_graph_key(self._sources.views.get(org_id, view_id))
+
     def edges(self, org_id: str, view_id: str) -> tuple[Edge, ...]:
-        graph = self._graphs.load(org_id, view_id)
+        graph = self._graphs.load(org_id, self._read_graph_key(org_id, view_id))
         return () if graph is None else tuple(sorted(graph.edges))
 
     def edges_for_paths(self, org_id: str, view_id: str, paths: Sequence[str]) -> tuple[Edge, ...]:
-        return self._graphs.edges_for_paths(org_id, view_id, paths)
+        return self._graphs.edges_for_paths(org_id, self._read_graph_key(org_id, view_id), paths)
+
+    def export_generation(self, org_id: str, view_id: str) -> Mapping[str, object] | None:
+        state = self._sources.views.get(org_id, view_id)
+        if not state.generation_id:
+            return None
+        graph = self._graphs.load(org_id, _generation_graph_key(state))
+        if graph is None:
+            return None
+        return {
+            "graph": graph.to_json(),
+            "edges": [edge.to_wire() for edge in sorted(graph.edges)],
+        }
+
+    def restore_generation(self, org_id: str, view_id: str, payload: Mapping[str, object]) -> bool:
+        state = self._sources.views.get(org_id, view_id)
+        if not state.generation_id:
+            return False
+        raw_graph = payload.get("graph")
+        raw_edges = payload.get("edges")
+        if not isinstance(raw_graph, Mapping) or not isinstance(raw_edges, list):
+            return False
+        try:
+            if not all(isinstance(item, Mapping) for item in raw_edges):
+                return False
+            edges = frozenset(
+                Edge(
+                    kind=EdgeKind(str(item["kind"])),
+                    src_path=str(item["src_path"]),
+                    dst_path=str(item["dst_path"]),
+                    symbol=str(item.get("symbol", "")),
+                    src_line=int(item.get("src_line", 0)),
+                )
+                for item in raw_edges
+            )
+            graph = LinkGraph.from_json(raw_graph, edges)
+        except (KeyError, TypeError, ValueError):
+            return False
+        members = _generation_members(self._sources, org_id, view_id)
+        snapshot = dict(members.snapshot)
+        if dict(graph.snapshot) != snapshot:
+            return False
+        paths = set(snapshot)
+        if any(edge.src_path not in paths or edge.dst_path not in paths for edge in graph.edges):
+            return False
+        for table in (graph.path_modules, graph.path_defines, graph.path_refs, graph.path_candidates):
+            if set(table) != paths:
+                return False
+        restored = replace(graph, at_view_revision=0)
+        self._graphs.save(org_id, _generation_graph_key(state), restored)
+        if not members.missing_digests:
+            self._status.record_build(
+                org_id,
+                view_id,
+                LinkBuildReport(
+                    mode=LinkBuildMode.UNCHANGED,
+                    at_view_revision=state.view_revision,
+                    view_paths=len(members.snapshot),
+                    changed_paths=0,
+                    dirty_paths=0,
+                    resolved_paths=0,
+                    edges_before=len(restored.edges),
+                    edges_after=len(restored.edges),
+                    reason="generation_bundle_restore",
+                ),
+            )
+            self._status.mark_ready(
+                org_id,
+                view_id,
+                view_revision=state.view_revision,
+                covered_paths=len(members.snapshot),
+            )
+        return True
 
     # -- the build ------------------------------------------------------- #
 
-    def _loader(self, org_id: str, members: Mapping[str, ManifestEntry]) -> Callable[[str], FileFacts | None]:
+    def _loader(
+        self,
+        org_id: str,
+        members: Mapping[str, ManifestEntry],
+        cancel: Callable[[], bool] | None = None,
+    ) -> Callable[[str], FileFacts | None]:
         def _load(path: str) -> FileFacts | None:
+            if cancel is not None and cancel():
+                raise IndexBuildCancelled("deferred index build cancelled")
             entry = members.get(path)
             if entry is None:
                 return None
@@ -323,8 +486,13 @@ class LinkLayer:
 
         return _load
 
-    def _all_facts(self, org_id: str, members: Mapping[str, ManifestEntry]) -> dict[str, FileFacts]:
-        load = self._loader(org_id, members)
+    def _all_facts(
+        self,
+        org_id: str,
+        members: Mapping[str, ManifestEntry],
+        cancel: Callable[[], bool] | None = None,
+    ) -> dict[str, FileFacts]:
+        load = self._loader(org_id, members, cancel)
         facts: dict[str, FileFacts] = {}
         for path in members:
             item = load(path)
@@ -332,50 +500,212 @@ class LinkLayer:
                 facts[path] = item
         return facts
 
-    def refresh(self, org_id: str, view_id: str, *, budget: int | None = None) -> IndexLayerStatus:
-        """Bring Layer 3 to the view's committed revision, within budget."""
-        state = self._sources.views.get(org_id, view_id)
-        revision = state.view_revision
-        current = self._status.status(org_id, view_id)
-        if current.ready and current.at_view_revision == revision:
-            return current
-
-        members = _members(self._sources, org_id, view_id)
-        ceiling = self._budget if budget is None else budget
-        previous = self._graphs.load(org_id, view_id)
-
-        graph: LinkGraph | None = None
-        report: LinkBuildReport
+    def _advance_graph(
+        self,
+        org_id: str,
+        previous: LinkGraph | None,
+        members: _Members,
+        *,
+        at_view_revision: int,
+        ceiling: int,
+        cancel: Callable[[], bool] | None,
+        cold_reason: str,
+    ) -> tuple[LinkGraph | None, LinkBuildReport]:
         if previous is None:
             if len(members.snapshot) > ceiling:
-                return self._defer(org_id, view_id, members, revision, ceiling)
-            graph = build_graph(self._all_facts(org_id, members.available), at_view_revision=revision)
-            report = LinkBuildReport(
+                return None, LinkBuildReport(
+                    mode=LinkBuildMode.DEFERRED,
+                    at_view_revision=at_view_revision,
+                    view_paths=len(members.snapshot),
+                    changed_paths=len(members.snapshot),
+                    dirty_paths=0,
+                    resolved_paths=0,
+                    edges_before=0,
+                    edges_after=0,
+                    reason=f"inline_rebuild_budget:{ceiling}",
+                )
+            graph = build_graph(self._all_facts(org_id, members.available, cancel), at_view_revision=at_view_revision)
+            return graph, LinkBuildReport(
                 mode=LinkBuildMode.FULL,
-                at_view_revision=revision,
+                at_view_revision=at_view_revision,
                 view_paths=len(members.snapshot),
                 changed_paths=len(members.snapshot),
                 dirty_paths=len(members.snapshot),
                 resolved_paths=len(members.snapshot),
                 edges_before=0,
                 edges_after=len(graph.edges),
-                reason="cold_start",
+                reason=cold_reason,
             )
-        else:
-            graph, report = update_graph(
+
+        updated, report = update_graph(
+            previous,
+            snapshot=members.snapshot,
+            load_facts=self._loader(org_id, members.available, cancel),
+            at_view_revision=at_view_revision,
+            full_rebuild_ratio=self._ratio,
+        )
+        if updated is not None:
+            return updated, report
+        if len(members.snapshot) > ceiling:
+            return None, LinkBuildReport(
+                mode=LinkBuildMode.DEFERRED,
+                at_view_revision=at_view_revision,
+                view_paths=len(members.snapshot),
+                changed_paths=report.changed_paths,
+                dirty_paths=0,
+                resolved_paths=0,
+                edges_before=len(previous.edges),
+                edges_after=len(previous.edges),
+                reason=f"inline_rebuild_budget:{ceiling}",
+            )
+        graph = build_graph(self._all_facts(org_id, members.available, cancel), at_view_revision=at_view_revision)
+        return graph, replace(report, edges_after=len(graph.edges))
+
+    def refresh(
+        self,
+        org_id: str,
+        view_id: str,
+        *,
+        budget: int | None = None,
+        wait: bool = False,
+        cancel: Callable[[], bool] | None = None,
+        defer_cold: bool = False,
+    ) -> IndexLayerStatus:
+        """Bring Layer 3 to the committed revision without blocking foreground callers.
+
+        The immutable base graph is keyed by RepositoryGeneration *and* the
+        View's possession scope. Clean Views therefore converge on one build;
+        dirty Views incrementally derive their private overlay graph from that
+        shared base. Deferred workers pass ``wait=True``. Foreground queries use
+        the default and remain explicitly degraded while the shared build runs.
+        """
+        state = self._sources.views.get(org_id, view_id)
+        revision = state.view_revision
+        current = self._status.status(org_id, view_id)
+        if current.ready and current.at_view_revision == revision:
+            return current
+        build_key = _generation_graph_key(state)
+        lock = self._build_locks[hash((org_id, build_key)) % len(self._build_locks)]
+        if not _acquire_build_lock(lock, wait=wait, cancel=cancel):
+            return self._status.set(
+                org_id,
+                view_id,
+                IndexLayerStatus(
+                    state=IndexLayerState.BUILDING,
+                    reason="link_rebuild_in_progress",
+                    covered_paths=current.covered_paths,
+                    at_view_revision=current.at_view_revision,
+                ),
+            )
+        self._status.set(
+            org_id,
+            view_id,
+            IndexLayerStatus(
+                state=IndexLayerState.BUILDING,
+                reason="link_rebuild_in_progress",
+                covered_paths=current.covered_paths,
+                at_view_revision=current.at_view_revision,
+            ),
+        )
+        try:
+            return self._refresh_locked(org_id, view_id, revision, budget=budget, cancel=cancel)
+        finally:
+            lock.release()
+
+    def _refresh_locked(
+        self,
+        org_id: str,
+        view_id: str,
+        revision: int,
+        *,
+        budget: int | None,
+        cancel: Callable[[], bool] | None,
+    ) -> IndexLayerStatus:
+        state = self._sources.views.get(org_id, view_id)
+        ceiling = self._budget if budget is None else budget
+        overlay, tombstones = self._sources.views.overlay(org_id, view_id)
+        generation_key = _generation_graph_key(state)
+        generation_members = _generation_members(self._sources, org_id, view_id)
+        generation_previous = self._graphs.load(org_id, generation_key)
+        generation_graph, generation_report = self._advance_graph(
+            org_id,
+            generation_previous,
+            generation_members,
+            at_view_revision=0,
+            ceiling=ceiling,
+            cancel=cancel,
+            cold_reason="generation_cold_start",
+        )
+        if generation_graph is None:
+            return self._defer(org_id, view_id, generation_members, revision, ceiling)
+
+        # A generation is immutable; publishing its scoped base graph remains
+        # valid even if this particular View advances while the build runs.
+        # Unchanged, it is already stored: saving it again rewrote every edge.
+        if generation_previous is None or generation_report.mode is not LinkBuildMode.UNCHANGED:
+            self._graphs.save(org_id, generation_key, generation_graph)
+
+        if overlay or tombstones:
+            members = _members(self._sources, org_id, view_id)
+            previous = (
+                self._graphs.load(org_id, view_id, base=generation_key, base_graph=generation_graph) or generation_graph
+            )
+            graph, report = self._advance_graph(
+                org_id,
                 previous,
-                snapshot=members.snapshot,
-                load_facts=self._loader(org_id, members.available),
+                members,
                 at_view_revision=revision,
-                full_rebuild_ratio=self._ratio,
+                ceiling=ceiling,
+                cancel=cancel,
+                cold_reason="overlay_cold_start",
             )
             if graph is None:
-                if len(members.snapshot) > ceiling:
-                    return self._defer(org_id, view_id, members, revision, ceiling)
-                graph = build_graph(self._all_facts(org_id, members.available), at_view_revision=revision)
-                report = replace(report, edges_after=len(graph.edges))
+                return self._defer(org_id, view_id, members, revision, ceiling)
+            target_key = view_id
+        else:
+            members = generation_members
+            graph = generation_graph
+            target_key = generation_key
+            report = replace(
+                generation_report,
+                at_view_revision=revision,
+                reason=(
+                    "generation_reuse"
+                    if generation_previous is not None and generation_report.mode is LinkBuildMode.UNCHANGED
+                    else generation_report.reason
+                ),
+            )
 
-        self._graphs.save(org_id, view_id, graph)
+        # Only the View-specific publication is revision-sensitive. The base
+        # generation graph above is reusable regardless of overlay churn.
+        latest = self._sources.views.get(org_id, view_id).view_revision
+        if latest != revision:
+            current = self._status.status(org_id, view_id)
+            return self._status.set(
+                org_id,
+                view_id,
+                IndexLayerStatus(
+                    state=IndexLayerState.BUILDING,
+                    reason="view_revision_advanced",
+                    covered_paths=current.covered_paths,
+                    at_view_revision=current.at_view_revision,
+                ),
+            )
+        if target_key == view_id:
+            self._graphs.save(org_id, view_id, graph, base=generation_key, base_graph=generation_graph)
+            if self._sources.views.get(org_id, view_id).view_revision != revision:
+                self._graphs.drop(org_id, view_id)
+                current = self._status.status(org_id, view_id)
+                return self._status.set(
+                    org_id,
+                    view_id,
+                    IndexLayerStatus(
+                        state=IndexLayerState.BUILDING,
+                        reason="view_revision_advanced",
+                        covered_paths=current.covered_paths,
+                        at_view_revision=current.at_view_revision,
+                    ),
+                )
         self._status.record_build(org_id, view_id, report)
         if members.missing_digests:
             return self._status.set(
@@ -424,74 +754,3 @@ class LinkLayer:
                 at_view_revision=0,
             ),
         )
-
-
-class SemanticLayer:
-    """Embedding search readiness for one view.
-
-    There is no per-view artifact to build: the vectors are Layer-1 rows and the
-    view contributes only membership. "Building" therefore means deriving the
-    analysis for members that have content but no derived rows yet, and
-    readiness means every member that *should* have content does.
-    """
-
-    __slots__ = ("_budget", "_sources", "_status")
-
-    def __init__(
-        self,
-        sources: LayerSources,
-        *,
-        inline_rebuild_budget: int = DEFAULT_INLINE_REBUILD_BUDGET,
-    ) -> None:
-        self._sources = sources
-        self._budget = inline_rebuild_budget
-        self._status = StatusTable(_COLD_SEMANTIC)
-
-    def status(self, org_id: str, view_id: str) -> IndexLayerStatus:
-        return self._status.status(org_id, view_id)
-
-    def note_revision(self, org_id: str, view_id: str, view_revision: int) -> None:
-        self._status.note_revision(org_id, view_id, view_revision)
-
-    def forget(self, org_id: str, view_id: str) -> None:
-        self._status.forget(org_id, view_id)
-
-    def forget_view(self, view_id: str) -> None:
-        self._status.forget_view(view_id)
-
-    def mark_ready(self, org_id: str, view_id: str, *, view_revision: int, covered_paths: int) -> None:
-        self._status.mark_ready(org_id, view_id, view_revision=view_revision, covered_paths=covered_paths)
-
-    def refresh(self, org_id: str, view_id: str, *, budget: int | None = None) -> IndexLayerStatus:
-        state = self._sources.views.get(org_id, view_id)
-        members = _members(self._sources, org_id, view_id)
-        ceiling = self._budget if budget is None else budget
-        if len(members.snapshot) > ceiling:
-            return self._status.set(
-                org_id,
-                view_id,
-                IndexLayerStatus(
-                    state=IndexLayerState.BUILDING,
-                    reason="semantic_rebuild_deferred",
-                    covered_paths=0,
-                    at_view_revision=0,
-                ),
-            )
-        for entry in members.available.values():
-            data = self._sources.content.get(org_id, entry.content_digest)
-            if data is None:
-                continue
-            self._sources.analysis.ensure(org_id, entry.content_digest, entry.parser_profile, data)
-        if members.missing_digests:
-            return self._status.set(
-                org_id,
-                view_id,
-                IndexLayerStatus(
-                    state=IndexLayerState.BUILDING,
-                    reason="semantic_content_incomplete",
-                    covered_paths=len(members.snapshot),
-                    at_view_revision=state.view_revision,
-                ),
-            )
-        self._status.mark_ready(org_id, view_id, view_revision=state.view_revision, covered_paths=len(members.snapshot))
-        return self._status.status(org_id, view_id)

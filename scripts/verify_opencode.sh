@@ -2,67 +2,81 @@
 # verify_opencode.sh — Verify LemonCrow install + provider wiring for opencode.
 #
 # 1. Runs install_opencode.sh (post-install checks; handles --workspace + skip).
-# 2. Smoke-tests the `lc` MCP provider entry in opencode.json (tools/list).
+# 2. Smoke-tests the `lc` MCP entry the installer wrote to opencode.json (tools/list).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/lib/python_bootstrap.sh"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # 1) Install-time verification (also handles --workspace passthrough).
 bash "${SCRIPT_DIR}/install_opencode.sh" "$@"
 
-# 2) LemonCrow-as-provider smoke test in opencode.json (skip if opencode absent).
-command -v opencode >/dev/null 2>&1 || {
+# 2) LemonCrow MCP smoke test against the installed opencode.json (skip if opencode absent).
+command -v "${OPENCODE_BIN:-opencode}" >/dev/null 2>&1 || command -v opencode2 >/dev/null 2>&1 || {
     echo "=== SKIPPED (opencode CLI absent) ==="
     exit 0
 }
 
-cd "${REPO_ROOT}"
+# Resolve the same opencode.json install_opencode.sh writes.
+OC_FILE="${OPENCODE_CONFIG_HOME:-${XDG_CONFIG_HOME:-${HOME}/.config}/opencode}/opencode.json"
+while [ $# -gt 0 ]; do
+    if [ "$1" = "--workspace" ] && [ $# -gt 1 ]; then
+        OC_FILE="$(cd "$2" && pwd)/opencode.json"
+        shift
+    fi
+    shift
+done
 
 echo "=== LemonCrow opencode provider verification ==="
 
-echo "--- checking opencode.json exists ---"
-test -f opencode/opencode.json || { echo "FAIL: opencode/opencode.json not found"; exit 1; }
+echo "--- checking ${OC_FILE} ---"
+test -f "$OC_FILE" || { echo "FAIL: $OC_FILE not found"; exit 1; }
 
-echo "--- validating opencode.json (JSON syntax) ---"
-python3 -c "import json, sys; json.load(open('opencode/opencode.json'))" \
-    && echo "opencode.json: valid JSON"
+echo "--- checking lc MCP entry and listing its tools ---"
+python3 - "$OC_FILE" <<'EOF'
+import json, os, subprocess, sys
 
-echo "--- checking MCP server entry ---"
-python3 - <<'EOF'
-import json, sys
-data = json.load(open("opencode/opencode.json"))
-mcps = data.get("mcp", {})
-if "lemoncrow" not in mcps:
-    print("FAIL: 'lemoncrow' MCP server not found in opencode.json")
+data = json.load(open(sys.argv[1]))
+mcp = data.get("mcp", {})
+entry = mcp.get("servers", {}).get("lc") or mcp.get("lc")
+if not isinstance(entry, dict):
+    print("FAIL: 'lc' MCP server not found in opencode.json")
     sys.exit(1)
-entry = mcps["lemoncrow"]
-cmd = entry.get("command", "")
-if "lc" not in str(cmd) and "mcp" not in str(entry.get("args", [])):
-    print(f"FAIL: unexpected command: {cmd}")
+command = entry.get("command")
+if not isinstance(command, list) or not {"mcp", "lite-mcp"} & set(command):
+    print(f"FAIL: unexpected lc MCP command: {command}")
     sys.exit(1)
-print(f"LemonCrow MCP entry: {entry}")
-EOF
+print(f"lc MCP entry: {command}")
 
-echo "--- checking opencode can list tools (via lc mcp stdio) ---"
-echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"verify","version":"1"},"capabilities":{}}}
-{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
-    | lc mcp 2>/dev/null \
-    | python3 - <<'EOF'
-import sys, json
-lines = sys.stdin.read().strip().split("\n")
-for line in lines:
+requests = [
+    {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+     "params": {"protocolVersion": "2024-11-05", "clientInfo": {"name": "verify", "version": "1"}, "capabilities": {}}},
+    {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+]
+env = {**os.environ, **{k: str(v) for k, v in (entry.get("environment") or {}).items() if "<" not in str(v)}}
+try:
+    result = subprocess.run(
+        command, input="".join(json.dumps(r) + "\n" for r in requests),
+        capture_output=True, text=True, timeout=60, env=env,
+    )
+except (OSError, subprocess.TimeoutExpired) as exc:
+    print(f"FAIL: lc MCP did not answer tools/list: {exc}")
+    sys.exit(1)
+for line in result.stdout.splitlines():
     try:
-        msg = json.loads(line)
-        if "result" in msg and "tools" in msg.get("result", {}):
-            tools = [t["name"] for t in msg["result"]["tools"]]
-            print(f"tools found: {tools}")
-            assert "check_plan" in tools, "check_plan tool missing"
-            print("PASS: required tools present")
-            sys.exit(0)
-    except Exception:
-        pass
+        message = json.loads(line)
+    except ValueError:
+        continue
+    tools = message.get("result", {}).get("tools") if isinstance(message.get("result"), dict) else None
+    if tools is not None:
+        names = sorted(tool["name"] for tool in tools)
+        print(f"tools found: {names}")
+        missing = {"code_search", "read"} - set(names)
+        if missing:
+            print(f"FAIL: required tools missing: {sorted(missing)}")
+            sys.exit(1)
+        print("PASS: required tools present")
+        sys.exit(0)
 print("FAIL: tools/list response not found")
 sys.exit(1)
 EOF

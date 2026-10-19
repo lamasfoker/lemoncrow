@@ -46,7 +46,7 @@ else
     COPILOT_CLI_HOOKS_JSON="${HOME}/.copilot/hooks/hooks.json"
 fi
 
-info()  { echo "[lemoncrow:uninstall:copilot] $*"; }
+info()  { echo "[lc:uninstall:copilot] $*"; }
 run()   { $DRY_RUN && echo "  [dry-run] $*" || eval "$@"; }
 
 if [ -f "$MCP_JSON" ] && grep -q "lemoncrow" "$MCP_JSON" 2>/dev/null; then

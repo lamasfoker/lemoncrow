@@ -47,7 +47,8 @@ def test_large_savings_stays_active_and_sets_host_agent(monkeypatch: pytest.Monk
     root.mkdir()
     config.mkdir()
     result = pr.apply_session_start_files(root, plugin, config_dir=config)
-    assert result["dormant"] is False
+    assert result["runtime"] == {"mode": "local", "all_features": True}
+    assert "active" in result["actions"]
     assert _host_agent(config) == "lemoncrow:code"
 
 

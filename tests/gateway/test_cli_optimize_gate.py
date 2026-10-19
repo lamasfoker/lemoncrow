@@ -31,6 +31,7 @@ def test_optimize_gate_outputs_json_verdict(tmp_path: Path) -> None:
         [
             "--root",
             str(tmp_path / ".lemoncrow"),
+            "usage",
             "optimize",
             "gate",
             "--runs",

@@ -92,9 +92,11 @@ def _build_engine(repo_root: Path) -> Any | None:
     os.environ.setdefault("LEMONCROW_EXPLORE_SEMANTIC", "0")
     os.environ.setdefault("LEMONCROW_ZOEKT_MODE", "off")
     try:
-        from lemoncrow.pro.capabilities.code_context.engine import CodeContextEngine
+        from lemoncrow.core.capabilities.code_intelligence_provider import (
+            create_code_intelligence_provider,
+        )
 
-        return CodeContextEngine(repo_root, autosync_enabled=False)
+        return create_code_intelligence_provider(repo_root, autosync_enabled=False)
     except Exception:
         return None
 

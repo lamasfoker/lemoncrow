@@ -27,7 +27,10 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-PROTOCOL_VERSION = "2026-09-14"
+from lemoncrow_client.protocol import CAPTURE_OPTIONS, REVIEW_FEATURES
+
+PROTOCOL_VERSION = "2026-10-05"
+PREVIOUS_PROTOCOL_VERSION = "2026-09-14"
 SERVER_CAPABILITIES = {
     "tools.v1",
     "views.v1",
@@ -48,12 +51,29 @@ def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def default_review_manifest() -> dict[str, Any]:
+    """A hosted-shaped Review capability manifest that serves everything."""
+    return {
+        "manifest": 1,
+        **dict.fromkeys(REVIEW_FEATURES, True),
+        "schemas": {"packet": [2], "evidence": [1], "policy": [1], "record": [1]},
+        "evidence_kinds": ["document", "screenshot"],
+        "capture_modes": ["derived", "packet"],
+        "capture_options": sorted(CAPTURE_OPTIONS),
+    }
+
+
 @dataclass
 class StubState:
     """Everything the stub remembers, and the knobs a test turns."""
 
     # -- knobs --------------------------------------------------------- #
+    #: The newest protocol this stub speaks. It also accepts the one before it
+    #: when ``protocol_version`` is the current one, like the real window.
     protocol_version: str = PROTOCOL_VERSION
+    #: The Review capability manifest it publishes; ``None`` models a server
+    #: from before manifests (no manifest field, no ``/v1/reviews/manifest``).
+    review_manifest: dict[str, Any] | None = field(default_factory=default_review_manifest)
     token: str = TOKEN
     content_size_cap: int = CONTENT_SIZE_CAP
     allow_local_fs: bool = False
@@ -70,6 +90,8 @@ class StubState:
     dead: bool = False
     #: Refuse the next tool call as ``view_revision_stale``, naming a revision.
     stale_once: bool = False
+    #: ``X-LemonCrow-Request-Id`` of every executed tool call, in order.
+    tool_request_ids: list[str] = field(default_factory=list)
 
     # -- observed state ------------------------------------------------ #
     blobs: dict[str, bytes] = field(default_factory=dict)
@@ -93,6 +115,22 @@ class StubState:
     review_captures: list[Mapping[str, Any]] = field(default_factory=list)
     #: Every review request in arrival order, drafts and appends included.
     review_requests: list[tuple[str, Mapping[str, Any]]] = field(default_factory=list)
+    #: Every Reader API (``/api/...``) request, as ``(method, path)``.
+    reader_requests: list[tuple[str, str]] = field(default_factory=list)
+
+    def accepted_versions(self) -> tuple[str, ...]:
+        if self.protocol_version == PROTOCOL_VERSION:
+            return (PROTOCOL_VERSION, PREVIOUS_PROTOCOL_VERSION)
+        return (self.protocol_version,)
+
+    def identity(self) -> dict[str, Any]:
+        review = dict(self.review_manifest) if self.review_manifest is not None else {}
+        return {
+            "protocol_version": self.protocol_version,
+            "supported_protocol_versions": sorted(self.accepted_versions()),
+            "deployment": {"mode": "customer_hosted"},
+            "product_capabilities": {"review": review},
+        }
 
     def content_for(self, path: str) -> bytes | None:
         row = self.manifest.get(path)
@@ -152,7 +190,32 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path == "/healthz":
             self._send(200, {"status": "ok"})
             return
+        if self.path == "/v1/reviews/manifest" and self.state.review_manifest is not None:
+            if not self._authenticated():
+                self._send(401, _error("unauthenticated", "bad credential", action="reauthenticate"))
+                return
+            identity = self.state.identity()
+            self._send(
+                200,
+                {
+                    "protocol_version": identity["protocol_version"],
+                    "supported_protocol_versions": identity["supported_protocol_versions"],
+                    "deployment": identity["deployment"],
+                    "product_capabilities": identity["product_capabilities"],
+                },
+            )
+            return
+        if self.path.startswith("/api/"):
+            self._reader("GET")
+            return
         self._send(404, _error("tool_unknown", "no such route"))
+
+    def _reader(self, method: str) -> None:
+        if not self._authenticated():
+            self._send(401, {"detail": "bad credential"})
+            return
+        self.state.reader_requests.append((method, self.path))
+        self._send(200, {"ok": True, "path": self.path})
 
     def do_DELETE(self) -> None:
         if self.state.dead:
@@ -179,6 +242,9 @@ class _Handler(BaseHTTPRequestHandler):
         path = self.path
         if path == "/v1/handshake":
             self._handshake(body)
+            return
+        if path.startswith("/api/"):
+            self._reader("POST")
             return
         if not self._authenticated():
             self._send(401, _error("unauthenticated", "bad credential", action="reauthenticate"))
@@ -240,7 +306,7 @@ class _Handler(BaseHTTPRequestHandler):
     def _handshake(self, body: Mapping[str, Any]) -> None:
         state = self.state
         offered = {str(name) for name in body.get("capabilities", [])}
-        if body.get("protocol_version") != state.protocol_version:
+        if body.get("protocol_version") not in state.accepted_versions():
             self._send(
                 426,
                 _error(
@@ -248,6 +314,7 @@ class _Handler(BaseHTTPRequestHandler):
                     "client protocol is not supported by this server",
                     action="upgrade_client",
                     server_protocol=state.protocol_version,
+                    supported=sorted(state.accepted_versions()),
                 ),
             )
             return
@@ -268,15 +335,16 @@ class _Handler(BaseHTTPRequestHandler):
         self._send(
             200,
             {
-                "protocol_version": state.protocol_version,
+                "protocol_version": body["protocol_version"],
                 "capabilities": sorted(granted),
                 "local_fs": state.allow_local_fs and "local_fs" in granted,
+                "server": state.identity(),
             },
         )
 
     def _open_session(self, body: Mapping[str, Any]) -> None:
         state = self.state
-        if body.get("protocol_version") != state.protocol_version:
+        if body.get("protocol_version") not in state.accepted_versions():
             self._send(
                 426,
                 _error("protocol_version_mismatch", "unsupported", action="upgrade_client"),
@@ -291,7 +359,7 @@ class _Handler(BaseHTTPRequestHandler):
             200,
             {
                 "session_id": state.session_id,
-                "protocol_version": state.protocol_version,
+                "protocol_version": body["protocol_version"],
                 "capabilities": sorted(granted),
                 "local_fs": "local_fs" in granted,
                 # The nonce a same-host offer has to be carrying. Chosen by the
@@ -548,6 +616,7 @@ class _Handler(BaseHTTPRequestHandler):
             )
             return
         state.tool_calls.append((name, dict(arguments), bound))
+        state.tool_request_ids.append(self.headers.get("X-LemonCrow-Request-Id", ""))
         text = self._render(name, arguments)
         payload: dict[str, Any] = {
             "tool": name,
@@ -630,6 +699,9 @@ class StubServer:
         return f"http://{host}:{port}"
 
     def close(self) -> None:
+        # shutdown() closes the listener, but HTTP/1.1 handler threads can still
+        # serve accepted keep-alive sockets. They must refuse work after stop.
+        self.state.dead = True
         self._server.shutdown()
         self._server.server_close()
         self._thread.join(timeout=5.0)

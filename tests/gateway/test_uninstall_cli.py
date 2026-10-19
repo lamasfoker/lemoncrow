@@ -42,6 +42,37 @@ def _run_uninstall_script(
     )
 
 
+def test_uninstall_help_is_side_effect_free(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    marker = home / ".lemoncrow" / "bin" / "lc"
+    workspace_marker = workspace / "AGENTS.md"
+    marker.parent.mkdir(parents=True)
+    marker.write_text("keep", encoding="utf-8")
+    workspace.mkdir()
+    workspace_marker.write_text("keep workspace", encoding="utf-8")
+
+    env = {
+        "HOME": str(home),
+        "PATH": "/usr/bin:/bin",
+        "SHELL": "/bin/bash",
+    }
+    result = subprocess.run(
+        ["bash", str(repo_root / "scripts" / "uninstall.sh"), "--help"],
+        cwd=str(workspace),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Usage: bash scripts/uninstall.sh" in result.stdout
+    assert marker.read_text(encoding="utf-8") == "keep"
+    assert workspace_marker.read_text(encoding="utf-8") == "keep workspace"
+
+
 def test_uninstall_purge_preserves_install_dir_under_projects(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[2]
     home = tmp_path / "home"
@@ -67,6 +98,40 @@ def test_uninstall_purge_removes_default_managed_install_dir(tmp_path: Path) -> 
     assert "Removed" in result.stdout
 
 
+def test_packaged_uninstall_can_purge_its_own_install_tree(tmp_path: Path) -> None:
+    """The installed script must keep running after ~/.lemoncrow is removed."""
+    repo_root = Path(__file__).resolve().parents[2]
+    home = tmp_path / "home"
+    install_dir = home / ".lemoncrow" / "install"
+    scripts = install_dir / "scripts"
+    scripts.mkdir(parents=True)
+    uninstall = scripts / "uninstall.sh"
+    uninstall.write_text((repo_root / "scripts" / "uninstall.sh").read_text(encoding="utf-8"), encoding="utf-8")
+    uninstall.chmod(0o755)
+    (home / ".lemoncrow" / "install_dir").write_text(str(install_dir), encoding="utf-8")
+
+    env = {
+        "HOME": str(home),
+        "PATH": "/usr/bin:/bin",
+        "SHELL": "/bin/bash",
+        "XDG_CONFIG_HOME": str(home / ".config"),
+        "LEMONCROW_BIN_DIR": str(home / ".lemoncrow" / "bin"),
+        "LEMONCROW_TOOL_DIR": str(home / ".lemoncrow" / "uv-tools"),
+    }
+    result = subprocess.run(
+        ["bash", str(uninstall), "--purge", "--no-hosts"],
+        cwd=str(tmp_path),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Uninstall complete" in result.stdout
+    assert not (home / ".lemoncrow").exists()
+
+
 def test_uninstall_command_calls_script(tmp_path: Path) -> None:
     runner = CliRunner()
     # Mock _project_root to point to a temp dir where we'll place a dummy script
@@ -74,19 +139,19 @@ def test_uninstall_command_calls_script(tmp_path: Path) -> None:
         mock_root.return_value = tmp_path
         script_dir = tmp_path / "scripts"
         script_dir.mkdir()
-        uninstall_script = script_dir / "uninstall.sh"
+        uninstall_script = script_dir / "uninstall_product.sh"
         uninstall_script.touch()
 
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0)
 
-            result = runner.invoke(cli, ["uninstall", "--dry-run", "--no-hosts"])
+            result = runner.invoke(cli, ["uninstall", "all", "--dry-run", "--no-hosts"])
 
             assert result.exit_code == 0
             mock_run.assert_called_once()
             args, _ = mock_run.call_args
             cmd = args[0]
-            assert "uninstall.sh" in str(cmd[1])
+            assert "uninstall_product.sh" in str(cmd[1])
             assert "--dry-run" in cmd
             assert "--no-hosts" in cmd
 
@@ -97,14 +162,14 @@ def test_uninstall_command_with_workspace(tmp_path: Path) -> None:
         mock_root.return_value = tmp_path
         script_dir = tmp_path / "scripts"
         script_dir.mkdir()
-        uninstall_script = script_dir / "uninstall.sh"
+        uninstall_script = script_dir / "uninstall_product.sh"
         uninstall_script.touch()
 
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0)
 
             workspace_path = tmp_path / "my-workspace"
-            result = runner.invoke(cli, ["uninstall", "--workspace", str(workspace_path)])
+            result = runner.invoke(cli, ["uninstall", "all", "--workspace", str(workspace_path)])
 
             assert result.exit_code == 0
             mock_run.assert_called_once()
@@ -120,13 +185,13 @@ def test_uninstall_command_with_purge(tmp_path: Path) -> None:
         mock_root.return_value = tmp_path
         script_dir = tmp_path / "scripts"
         script_dir.mkdir()
-        uninstall_script = script_dir / "uninstall.sh"
+        uninstall_script = script_dir / "uninstall_product.sh"
         uninstall_script.touch()
 
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0)
 
-            result = runner.invoke(cli, ["uninstall", "--purge", "--dry-run"])
+            result = runner.invoke(cli, ["uninstall", "all", "--purge", "--dry-run"])
 
             assert result.exit_code == 0
             mock_run.assert_called_once()
@@ -141,9 +206,9 @@ def test_uninstall_command_script_not_found(tmp_path: Path) -> None:
     with patch("lemoncrow.gateway.cli.commands.admin._project_root") as mock_root:
         mock_root.return_value = tmp_path
         # scripts/uninstall.sh does not exist
-        result = runner.invoke(cli, ["uninstall"])
+        result = runner.invoke(cli, ["uninstall", "all"])
         assert result.exit_code != 0
-        assert "uninstall script not found" in result.output
+        assert "product uninstall script not found" in result.output
 
 
 def test_uninstall_command_failure(tmp_path: Path) -> None:
@@ -152,14 +217,37 @@ def test_uninstall_command_failure(tmp_path: Path) -> None:
         mock_root.return_value = tmp_path
         script_dir = tmp_path / "scripts"
         script_dir.mkdir()
-        uninstall_script = script_dir / "uninstall.sh"
+        uninstall_script = script_dir / "uninstall_product.sh"
         uninstall_script.touch()
 
         with patch("subprocess.run") as mock_run:
             mock_run.side_effect = subprocess.CalledProcessError(1, ["bash"])
-            result = runner.invoke(cli, ["uninstall"])
+            result = runner.invoke(cli, ["uninstall", "all"])
             assert result.exit_code != 0
             assert "uninstall failed with code 1" in result.output
+
+
+def test_uninstall_requires_product_without_tty() -> None:
+    result = CliRunner().invoke(cli, ["uninstall"])
+    assert result.exit_code == 2
+    assert "review|runtime|all" in result.output
+
+
+def test_uninstall_review_routes_to_product_wrapper(tmp_path: Path) -> None:
+    runner = CliRunner()
+    with patch("lemoncrow.gateway.cli.commands.admin._project_root") as mock_root:
+        mock_root.return_value = tmp_path
+        script_dir = tmp_path / "scripts"
+        script_dir.mkdir()
+        wrapper = script_dir / "uninstall_product.sh"
+        wrapper.touch()
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            result = runner.invoke(cli, ["uninstall", "review", "--dry-run"])
+            assert result.exit_code == 0, result.output
+            cmd = mock_run.call_args.args[0]
+            assert cmd[:3] == ["bash", str(wrapper), "review"]
+            assert "--dry-run" in cmd
 
 
 def _run_host_uninstall(
@@ -239,6 +327,7 @@ def test_uninstall_opencode_cleans_provider_permissions_plugins_and_agents(tmp_p
     (agents_dir / "custom.md").write_text("agent\n", encoding="utf-8")
     (plugins_dir / "lemoncrow-nudge.js").write_text("plugin\n", encoding="utf-8")
     (plugins_dir / "lemoncrow_nudge.py").write_text("plugin\n", encoding="utf-8")
+    (plugins_dir / ".lemoncrow-host").write_text("opencode\n", encoding="utf-8")
 
     result = _run_host_uninstall(repo_root, "uninstall_opencode.sh", home, workspace)
 
@@ -252,6 +341,7 @@ def test_uninstall_opencode_cleans_provider_permissions_plugins_and_agents(tmp_p
     assert (agents_dir / "custom.md").exists()
     assert not (plugins_dir / "lemoncrow-nudge.js").exists()
     assert not (plugins_dir / "lemoncrow_nudge.py").exists()
+    assert not (plugins_dir / ".lemoncrow-host").exists()
     assert not staging_dir.exists()
 
 
@@ -284,6 +374,7 @@ def test_uninstall_lemoncode_cleans_provider_permissions_plugins_and_agents(tmp_
     (agents_dir / "custom.md").write_text("agent\n", encoding="utf-8")
     (plugins_dir / "lemoncrow-nudge.js").write_text("plugin\n", encoding="utf-8")
     (plugins_dir / "lemoncrow_nudge.py").write_text("plugin\n", encoding="utf-8")
+    (plugins_dir / ".lemoncrow-host").write_text("lemoncode\n", encoding="utf-8")
 
     result = _run_host_uninstall(repo_root, "uninstall_lemoncode.sh", home, workspace)
 
@@ -297,6 +388,7 @@ def test_uninstall_lemoncode_cleans_provider_permissions_plugins_and_agents(tmp_
     assert (agents_dir / "custom.md").exists()
     assert not (plugins_dir / "lemoncrow-nudge.js").exists()
     assert not (plugins_dir / "lemoncrow_nudge.py").exists()
+    assert not (plugins_dir / ".lemoncrow-host").exists()
     assert not staging_dir.exists()
 
 

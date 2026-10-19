@@ -59,7 +59,7 @@ def test_mcp_stdio_smoke() -> None:
     env = os.environ.copy()
 
     result = subprocess.run(
-        ["uv", "run", "lemoncrow", "mcp"],
+        ["uv", "run", "lemoncrow", "runtime", "mcp"],
         input=input_str,
         text=True,
         capture_output=True,

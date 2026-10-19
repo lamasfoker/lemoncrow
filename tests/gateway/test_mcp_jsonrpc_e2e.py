@@ -315,7 +315,7 @@ def test_stdio_server_processes_requests_concurrently(monkeypatch: pytest.Monkey
     def fake_handle(request: dict[str, Any]) -> dict[str, Any]:
         if request["id"] == 1:
             slow_started.set()
-            assert release_slow.wait(timeout=2)
+            assert release_slow.wait(timeout=10)
         return {"jsonrpc": "2.0", "id": request["id"], "result": {"ok": True}}
 
     class RecordingStdout(io.StringIO):
@@ -343,10 +343,14 @@ def test_stdio_server_processes_requests_concurrently(monkeypatch: pytest.Monkey
 
     server_thread = threading.Thread(target=mcp_server.serve)
     server_thread.start()
-    assert slow_started.wait(timeout=1)
-    assert stdout.fast_written.wait(timeout=1)
+    # Under the full xdist fast suite this process can briefly be CPU-starved;
+    # these waits only coordinate the test threads. Concurrency is proven by
+    # the fast response arriving while request 1 is still blocked, and by the
+    # final [2, 1] response order below.
+    assert slow_started.wait(timeout=5)
+    assert stdout.fast_written.wait(timeout=5)
     release_slow.set()
-    server_thread.join(timeout=2)
+    server_thread.join(timeout=5)
 
     assert not server_thread.is_alive()
     responses = [json.loads(line) for line in stdout.getvalue().splitlines()]
@@ -568,6 +572,7 @@ def test_edit_atomic_rollback_e2e(mcp_env: Path) -> None:
     assert good.read_text(encoding="utf-8") == "original\n"
 
 
+@pytest.mark.private_engine
 def test_symbol_edit_descriptor_e2e(mcp_env: Path) -> None:
     target = mcp_env / "service.py"
     target.write_text(

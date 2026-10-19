@@ -31,7 +31,6 @@ class SearchHandlerHooks:
     grep_badge_provider: Callable[[str, list[str]], str | None]
     apply_search_verdict: Callable[..., dict[str, Any]]
     count_grep_hits: Callable[[dict[str, Any]], int]
-    check_repeat_query: Callable[[str], bool]
     workspace_code_router: Callable[[str], Any]
     resolve_query_as_existing_file: Callable[..., str | None]
     lean_code_search_view: Callable[..., dict[str, Any]]
@@ -248,6 +247,8 @@ def tool_smart_search(
         "projectPath": "paths",
         "path": "paths",
         "include_paths": "paths",
+        "include": "paths",
+        "include_snippets": "include_source",
         "pattern": "query",
         "regex": "query",
     },
@@ -263,7 +264,7 @@ def tool_smart_search(
     # ONE agent-visible count knob. Every vanilla-habit spelling for "how many
     # results" (maxFiles, max_results, max_files, max_candidates) now lands on
     # `limit`, the real parameter.
-    hidden_params=("include_source",),
+    hidden_params=("include_source", "mode", "force"),
 )
 def tool_code_search(
     query: Annotated[
@@ -276,19 +277,20 @@ def tool_code_search(
     ] = None,
     project_id: Annotated[
         str | None,
-        Field(description="Optional registered project id; routes this call to that project's isolated index."),
+        Field(description="Registered project id; routes to that project's index."),
     ] = None,
     include_source: Annotated[
         bool,
         Field(description="Hidden: keep the top-2 matches' source inline (bounded)."),
     ] = False,
+    mode: str | None = None,
     limit: Annotated[
         int | None,
         Field(ge=1, le=32, description="Cap candidate_files entries (default 8, or 5 when one file dominates)."),
     ] = None,
     force: Annotated[
         bool,
-        Field(description=("Return full source even if this result was already shown in this session.")),
+        Field(description="Full source even if already shown this session."),
     ] = False,
 ) -> dict[str, Any]:
     """Relevant symbols' source grouped by file + call-graph relations, in one capped call.
@@ -298,19 +300,20 @@ def tool_code_search(
     as already read -- do not re-open those files with `read`.
     """
     hooks = _hooks()
-    _ = project_id  # transport metadata is consumed before the handler
+    _ = project_id, mode  # transport/host-search metadata; mode does not alter code_search semantics
     workspace_root = hooks.workspace_root()
     # Search the current scope/source even for similar queries. The transport's
     # content deduplication can reference an identical result after execution;
     # word overlap alone cannot prove that the answer was already delivered.
     _ = force  # consumed by transport-level content deduplication
-    # Normalise: paths param accepts list, comma-sep string, or single path
-    # (the legacy `path` kwarg is folded into `paths` by param_aliases).
+    # Normalise: paths accepts list, comma-separated string, or one path.
+    # Host search tools also emit include="dir/**"; the alias above folds it
+    # into paths, and this trims that recursive-glob suffix to a directory scope.
     raw = paths
     if isinstance(raw, list):
-        seed_list = [p.strip() for p in raw if p and p.strip()]
+        seed_list = [p.strip()[:-3] if p.strip().endswith("/**") else p.strip() for p in raw if p and p.strip()]
     elif isinstance(raw, str):
-        seed_list = [p.strip() for p in raw.split(",") if p.strip()]
+        seed_list = [p.strip()[:-3] if p.strip().endswith("/**") else p.strip() for p in raw.split(",") if p.strip()]
     else:
         seed_list = []
     seed_files = seed_list or None

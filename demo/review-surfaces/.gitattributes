@@ -1,0 +1,3 @@
+# Review demo media is intentionally compared as rendered binary artifacts.
+media/** binary
+.fixtures/media/** binary

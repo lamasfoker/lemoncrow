@@ -1,10 +1,10 @@
 """Deployment-neutral request limits, cancellation, and global concurrency.
 
 These are engine mechanics shared by the public loopback server and the hosted
-composition. Tenant fairness does not live here: the enterprise package extends
-:class:`Limits` with a per-organization ceiling and supplies its own concurrency
-gate. The shared handlers only depend on the small ``hold(scope_id)`` shape, so
-local mode never needs to know what an organization is.
+composition. Multi-user policy is not part of the public engine: a hosting
+composition may extend :class:`Limits` and supply its own concurrency gate. The
+shared handlers only depend on the small ``hold(scope_id)`` shape, so local mode
+never needs to know what an organization is.
 """
 
 from __future__ import annotations
@@ -50,6 +50,12 @@ class Limits:
     max_open_views: int = 16_384
     max_materialized_views: int = 64
     materialized_bytes_quota: int = 2 * 1024 * _MIB
+    max_repository_index_bytes: int = 64 * 1024 * _MIB
+    max_index_wal_bytes: int = 128 * _MIB
+    #: Hard admission bound for one deferred structural/semantic catch-up job.
+    #: One worker process also bounds concurrent CPU/I/O; this caps the amount
+    #: of repository state a single background build may resolve in memory.
+    max_deferred_index_files: int = 1_250_000
 
     def __post_init__(self) -> None:
         for name in (
@@ -71,9 +77,14 @@ class Limits:
             "max_open_views",
             "max_materialized_views",
             "materialized_bytes_quota",
+            "max_repository_index_bytes",
+            "max_index_wal_bytes",
+            "max_deferred_index_files",
         ):
             if int(getattr(self, name)) < 1:
                 raise ValueError(f"{name} must be >= 1")
+        if self.max_repository_index_bytes <= self.max_index_wal_bytes:
+            raise ValueError("repository index budget must exceed its WAL budget")
         if self.tool_deadline_s <= 0:
             raise ValueError("tool_deadline_s must be > 0")
 
@@ -135,22 +146,49 @@ class CancellationToken:
 
 
 class CancellationRegistry:
-    """Session-scoped request cancellation shared by both compositions."""
+    """Session-scoped request cancellation shared by both compositions.
 
+    The async facade is deliberately part of the contract even for the local
+    implementation. Hosted coordination can then register/cancel through Redis
+    without teaching the HTTP handlers whether cancellation is process-local or
+    distributed.
+    """
+
+    io_bound = False
     __slots__ = ("_tokens",)
 
     def __init__(self) -> None:
         self._tokens: dict[tuple[str, str], CancellationToken] = {}
 
+    def start_track(self, session_id: str, request_id: str) -> CancellationToken:
+        token = CancellationToken()
+        self._tokens[(session_id, request_id)] = token
+        return token
+
+    def finish_track(self, session_id: str, request_id: str) -> None:
+        self._tokens.pop((session_id, request_id), None)
+
     @contextlib.contextmanager
     def track(self, session_id: str, request_id: str) -> Iterator[CancellationToken]:
-        token = CancellationToken()
-        key = (session_id, request_id)
-        self._tokens[key] = token
+        token = self.start_track(session_id, request_id)
         try:
             yield token
         finally:
-            self._tokens.pop(key, None)
+            self.finish_track(session_id, request_id)
+
+    @contextlib.asynccontextmanager
+    async def track_async(self, session_id: str, request_id: str) -> AsyncIterator[CancellationToken]:
+        with self.track(session_id, request_id) as token:
+            yield token
+
+    async def cancel_async(self, session_id: str, request_id: str) -> bool:
+        return self.cancel(session_id, request_id)
+
+    async def cancel_session_async(self, session_id: str) -> int:
+        return self.cancel_session(session_id)
+
+    async def close_async(self) -> None:
+        return None
 
     def cancel(self, session_id: str, request_id: str) -> bool:
         token = self._tokens.get((session_id, request_id))

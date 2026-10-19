@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import threading
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -25,13 +26,15 @@ import pygit2
 import pytest
 
 from lemoncrow.pro.capabilities.review.gitdiff import resolve_rev_range
-from lemoncrow.pro.capabilities.review.models import ReviewPacket
-from lemoncrow.pro.capabilities.review.packet import build_review_packet, build_review_packet_with_blobs
+from lemoncrow.pro.capabilities.review.models import ProvenanceAttribution, ProvenanceRecord, ReviewPacket
+from lemoncrow.pro.capabilities.review.packet import PacketBuild, build_review_packet, build_review_packet_with_blobs
 from lemoncrow.pro.capabilities.review.session_models import ReviewSession
 from lemoncrow.pro.capabilities.review.sources.local import (
+    annotate,
     coerce_mark_state,
     effective_mark_state,
     encode_packet,
+    enrich_revision_projection,
     mark_downgrade_note,
     mark_unit,
     open_or_create_session,
@@ -41,8 +44,10 @@ from lemoncrow.pro.capabilities.review.sources.local import (
     refresh,
     resolve_mark_units,
     resolve_unit,
+    set_review_status,
     snapshot_revision,
     source_ref,
+    sync_commit_checkpoints,
 )
 from lemoncrow.pro.capabilities.review.store import ReviewStore
 from lemoncrow.pro.capabilities.review.units import file_fingerprint
@@ -124,6 +129,74 @@ def _named_range_repo(tmp_path: Path) -> tuple[Path, Any]:
     _write(root, "src/session.py", _CHANGED)
     _commit(repo, "feature one", 60)
     return root, repo
+
+
+@pytest.mark.parametrize("failed_preparation", [None, "packet", "blobs"])
+def test_packet_preparation_overlaps_source_freeze_before_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_preparation: str | None,
+) -> None:
+    from lemoncrow.pro.capabilities.review.sources import local
+
+    root, _repo = _dirty_repo(tmp_path)
+    rng = resolve_rev_range(root)
+    store = _store(tmp_path)
+    session = open_or_create_session(store, root, rng)
+    build = build_review_packet_with_blobs(
+        root,
+        rng,
+        store_root=store.root,
+        with_impact=False,
+        with_provenance=False,
+    )
+    barrier = threading.Barrier(2)
+    owner = threading.get_ident()
+    original_encode = local.encode_packet
+    original_blobs = store.write_blob_artifact
+    original_packet = store.write_packet_artifact
+    original_add = store.add_revision
+    committed: list[str] = []
+
+    def encode(packet: ReviewPacket) -> bytes:
+        assert threading.get_ident() != owner
+        barrier.wait(timeout=5)
+        if failed_preparation == "packet":
+            raise ValueError("packet preparation failed")
+        return original_encode(packet)
+
+    def freeze(review_id: str, revision_id: str, blobs: Any) -> Any:
+        assert threading.get_ident() == owner
+        barrier.wait(timeout=5)
+        if failed_preparation == "blobs":
+            raise ValueError("blobs preparation failed")
+        return original_blobs(review_id, revision_id, blobs)
+
+    def write_packet(review_id: str, revision_id: str, payload: bytes) -> Any:
+        assert threading.get_ident() == owner
+        assert payload == original_encode(build.packet)
+        return original_packet(review_id, revision_id, payload)
+
+    def commit(revision: Any, units: Any, **kwargs: Any) -> Any:
+        assert threading.get_ident() == owner
+        assert read_packet_json(store, revision) == json.loads(gzip.decompress(original_encode(build.packet)))
+        assert store.read_blob_artifact(session.id, revision.id) == build.blobs.new
+        assert units
+        committed.append(revision.id)
+        return original_add(revision, units, **kwargs)
+
+    monkeypatch.setattr(local, "encode_packet", encode)
+    monkeypatch.setattr(store, "write_blob_artifact", freeze)
+    monkeypatch.setattr(store, "write_packet_artifact", write_packet)
+    monkeypatch.setattr(store, "add_revision", commit)
+    if failed_preparation:
+        with pytest.raises(ValueError, match=f"{failed_preparation} preparation failed"):
+            record_revision(store, session, root, rng, store_root=store.root, build=build)
+        assert not committed
+        assert store.latest_revision(session.id) is None
+    else:
+        result = record_revision(store, session, root, rng, store_root=store.root, build=build)
+        assert committed == [result.revision.id]
 
 
 # --------------------------------------------------------------------------- #
@@ -241,6 +314,71 @@ def test_reusing_exact_revision_repairs_empty_packet_files_and_missing_blobs(tmp
     assert overlay["src/session.py"] == _CHANGED.encode("utf-8")
 
 
+def test_a_snapshot_recorded_under_the_commit_id_source_identity_is_unchanged_after_the_upgrade(
+    tmp_path: Path,
+) -> None:
+    """A Snapshot recorded before the tree-id source identity stores the commit-id form.
+
+    The same source in that form counts as unchanged, from a capture that
+    names it (a server-backed one) and from an in-process one alike. A real
+    content change still takes a Snapshot.
+    """
+
+    from lemoncrow.pro.capabilities.review.gitdiff import source_state
+
+    root, _repo = _dirty_repo(tmp_path)
+    rng = resolve_rev_range(root)
+    store = _store(tmp_path)
+    session = open_or_create_session(store, root, rng)
+    state = source_state(root, rng)
+    build = build_review_packet_with_blobs(
+        root,
+        rng,
+        store_root=tmp_path / "store",
+        with_impact=False,
+        with_provenance=False,
+        with_patch_text=True,
+        unbounded_patch_text=True,
+    )
+    assert build.source_fingerprint == state.fingerprint != state.legacy_fingerprint
+
+    def record(*, build: PacketBuild, **kwargs: Any) -> Any:
+        return record_revision(store, session, root, rng, store_root=tmp_path / "store", build=build, **kwargs)
+
+    before = record(build=replace(build, source_fingerprint=state.legacy_fingerprint)).revision
+    assert before.source_fingerprint == state.legacy_fingerprint
+
+    named = record(
+        build=build,
+        source_fingerprint_override=state.fingerprint,
+        legacy_source_fingerprint=state.legacy_fingerprint,
+    )
+    assert (named.created, named.revision.id) == (False, before.id)
+    in_process = record(build=build)
+    assert (in_process.created, in_process.revision.id) == (False, before.id)
+
+    _write(root, "src/session.py", _CHANGED.replace('"invalid"', '"gone"'))
+    changed_rng = resolve_rev_range(root)
+    changed = record_revision(
+        store,
+        session,
+        root,
+        changed_rng,
+        store_root=tmp_path / "store",
+        build=build_review_packet_with_blobs(
+            root,
+            changed_rng,
+            store_root=tmp_path / "store",
+            with_impact=False,
+            with_provenance=False,
+            with_patch_text=True,
+            unbounded_patch_text=True,
+        ),
+    )
+    assert changed.created is True
+    assert changed.revision.revision_number == before.revision_number + 1
+
+
 def test_a_working_tree_and_a_commit_range_are_different_sessions(tmp_path: Path) -> None:
     root, repo = _dirty_repo(tmp_path)
     store = _store(tmp_path)
@@ -257,6 +395,10 @@ def test_named_branch_range_follows_branch_head_in_one_session(tmp_path: Path) -
     first = open_or_create_session(store, root, first_range)
 
     assert source_ref(first_range, repo_root=root) == "named:refs/heads/main...refs/heads/feature"
+    scm = store.list_relationships(first.id, kind="scm")
+    assert len(scm) == 1
+    assert scm[0].provider == "git"
+    assert scm[0].external_id == "named:refs/heads/main...refs/heads/feature"
 
     _write(root, "src/session.py", _CHANGED.replace('"invalid"', '"newer"'))
     _commit(repo, "feature two", 120)
@@ -265,8 +407,48 @@ def test_named_branch_range_follows_branch_head_in_one_session(tmp_path: Path) -
 
     assert second.id == first.id
     assert second.source_ref == first.source_ref
+    scm = store.list_relationships(first.id, kind="scm")
+    assert len(scm) == 1
+    assert scm[0].provider == "git"
+    assert scm[0].external_id == "named:refs/heads/main...refs/heads/feature"
     assert first_range.head_sha != second_range.head_sha
     assert range_for_session(root, second).head_sha == second_range.head_sha
+
+
+def test_named_change_records_new_snapshot_for_rebase_without_reopening_equivalent_targets(tmp_path: Path) -> None:
+    root, repo = _named_range_repo(tmp_path)
+    store = _store(tmp_path)
+    first_range = resolve_rev_range(root, "main...feature")
+    session = open_or_create_session(store, root, first_range)
+    first = refresh(store, session, root, store_root=tmp_path / "store", rng=first_range)
+    for unit in store.list_units(first.revision.id):
+        mark_unit(store, session, first.revision, unit, state="reviewed")
+
+    # Advance the lower Change on an unrelated path, then regenerate/rebase the
+    # higher Change onto it with exactly the same higher-layer semantic delta.
+    repo.checkout("refs/heads/main")
+    _write(root, "docs/base.txt", "lower layer moved\n")
+    new_base = _commit(repo, "lower layer moves", 120)
+    repo.branches["feature"].set_target(repo[new_base].id)
+    repo.checkout("refs/heads/feature")
+    _write(root, "src/session.py", _CHANGED)
+    _commit(repo, "feature rebased", 180)
+
+    second_range = resolve_rev_range(root, "main...feature")
+    reopened = open_or_create_session(store, root, second_range)
+    second = refresh(store, reopened, root, store_root=tmp_path / "store", rng=second_range)
+
+    assert reopened.id == session.id
+    assert second.created is True
+    assert second.revision.id != first.revision.id
+    assert second.revision.revision_number == first.revision.revision_number + 1
+    assert second.revision.tree_fingerprint == first.revision.tree_fingerprint
+    assert second.revision.source_fingerprint != first.revision.source_fingerprint
+    assert second.revision.base_sha != first.revision.base_sha
+    assert second.revision.head_sha != first.revision.head_sha
+    assert second.reconciliation.reopened == ()
+    assert second.reconciliation.dropped == ()
+    assert {mark.state for mark in store.list_marks(session.id)} == {"reviewed"}
 
 
 def test_relative_commit_range_remains_snapshot_isolated(tmp_path: Path) -> None:
@@ -488,6 +670,42 @@ def test_hunk_units_are_content_fingerprinted_because_patch_text_is_captured(tmp
     hunks = [unit for unit in store.list_units(revision.id) if unit.kind == "hunk"]
     assert hunks
     assert all(unit.fingerprint_method == "hunk_patch_sha256" for unit in hunks)
+
+
+def test_persisted_packet_refuses_mixed_generation_source_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, _repo = _dirty_repo(tmp_path)
+    rng = resolve_rev_range(root)
+    store = _store(tmp_path)
+    session = open_or_create_session(store, root, rng)
+
+    from lemoncrow.pro.capabilities.review import packet as packet_module
+
+    original_load = packet_module.load_blobs
+
+    def racing_load(*args: Any, **kwargs: Any):
+        blobs = original_load(*args, **kwargs)
+        _write(root, "src/session.py", _CHANGED.replace('"invalid"', '"raced"'))
+        return blobs
+
+    monkeypatch.setattr(packet_module, "load_blobs", racing_load)
+    with pytest.raises(ValueError, match="source changed while Review source bytes were being captured"):
+        snapshot_revision(store, session, root, rng, store_root=tmp_path / "store")
+
+    assert store.latest_revision(session.id) is None
+
+
+def test_packet_build_carries_the_exact_stable_source_fingerprint(tmp_path: Path) -> None:
+    from lemoncrow.pro.capabilities.review.gitdiff import source_state
+
+    root, _repo = _dirty_repo(tmp_path)
+    rng = resolve_rev_range(root)
+    build = build_review_packet_with_blobs(
+        root, rng, store_root=tmp_path / "store", with_impact=False, with_patch_text=True
+    )
+    assert build.source_fingerprint
+    assert build.source_fingerprint == source_state(root, rng).fingerprint
 
 
 def test_the_packet_artifact_round_trips_with_its_degraded_tuple_verbatim(tmp_path: Path) -> None:
@@ -1100,3 +1318,1074 @@ def test_a_rename_that_carried_a_verdict_is_not_reported_as_a_discard() -> None:
     assert before[1].unit_key not in migrated
     # No rename reported, nothing migrated: every dropped mark is a real loss.
     assert _rename_migrations(before, after, ()) == frozenset()
+
+
+def test_same_revision_enrichment_never_downgrades_or_flips_exact_provenance(tmp_path: Path) -> None:
+    root, _repo = _dirty_repo(tmp_path)
+    rng = resolve_rev_range(root)
+    store = _store(tmp_path)
+    session = open_or_create_session(store, root, rng)
+    base = build_review_packet_with_blobs(
+        root, rng, store_root=tmp_path / "store", with_impact=False, with_patch_text=True
+    )
+    changed_path = base.packet.files[0].path
+    exact = PacketBuild(
+        packet=replace(
+            base.packet,
+            provenance=ProvenanceRecord(
+                status="matched",
+                host="codex",
+                session_id="author-exact",
+                certainty="exact",
+                match_confidence=1.0,
+            ),
+            attributions=(
+                ProvenanceAttribution(
+                    scope="file",
+                    scope_key=changed_path,
+                    host="codex",
+                    session_id="author-exact",
+                ),
+            ),
+        ),
+        blobs=base.blobs,
+    )
+    revision = snapshot_revision(store, session, root, rng, store_root=tmp_path / "store", build=exact)
+
+    weaker = PacketBuild(
+        packet=replace(
+            base.packet,
+            provenance=ProvenanceRecord(
+                status="matched",
+                host="claude",
+                session_id="heuristic-session",
+                certainty="possible",
+                match_confidence=0.35,
+            ),
+        ),
+        blobs=base.blobs,
+    )
+    enriched = enrich_revision_projection(store, session, revision, weaker)
+    assert enriched.provenance_certainty == "exact"
+    assert enriched.provenance_host == "codex"
+    assert enriched.provenance_session_id == "author-exact"
+    packet = read_packet_json(store, enriched)
+    assert packet is not None
+    assert packet["provenance"]["certainty"] == "exact"
+    assert packet["provenance"]["session_id"] == "author-exact"
+
+    conflicting_exact = PacketBuild(
+        packet=replace(
+            base.packet,
+            provenance=ProvenanceRecord(
+                status="matched",
+                host="claude",
+                session_id="different-exact-author",
+                certainty="exact",
+                match_confidence=1.0,
+            ),
+            attributions=(
+                ProvenanceAttribution(
+                    scope="file",
+                    scope_key=changed_path,
+                    host="claude",
+                    session_id="different-exact-author",
+                ),
+            ),
+        ),
+        blobs=base.blobs,
+    )
+    enriched_again = enrich_revision_projection(store, session, enriched, conflicting_exact)
+    assert enriched_again.provenance_host == "codex"
+    assert enriched_again.provenance_session_id == "author-exact"
+    packet_again = read_packet_json(store, enriched_again)
+    assert packet_again is not None
+    assert {(item["scope_key"], item["host"], item["session_id"]) for item in packet_again["attributions"]} == {
+        (changed_path, "codex", "author-exact"),
+        (changed_path, "claude", "different-exact-author"),
+    }
+    assert {
+        (item.scope_key, item.host, item.session_id)
+        for item in store.list_revision_attributions(enriched_again.id)
+        if item.scope == "file"
+    } == {
+        (changed_path, "codex", "author-exact"),
+        (changed_path, "claude", "different-exact-author"),
+    }
+
+
+def test_concurrent_same_revision_enrichment_serializes_monotonic_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, _repo = _dirty_repo(tmp_path)
+    rng = resolve_rev_range(root)
+    store_root = tmp_path / "store"
+    seed_store = ReviewStore(store_root)
+    session = open_or_create_session(seed_store, root, rng)
+    base = build_review_packet_with_blobs(root, rng, store_root=store_root, with_impact=False, with_patch_text=True)
+    revision = snapshot_revision(seed_store, session, root, rng, store_root=store_root, build=base)
+
+    weaker = PacketBuild(
+        packet=replace(
+            base.packet,
+            provenance=ProvenanceRecord(
+                status="matched",
+                host="claude",
+                session_id="heuristic-session",
+                certainty="possible",
+                match_confidence=0.35,
+            ),
+        ),
+        blobs=base.blobs,
+    )
+    exact = PacketBuild(
+        packet=replace(
+            base.packet,
+            provenance=ProvenanceRecord(
+                status="matched",
+                host="codex",
+                session_id="author-exact",
+                certainty="exact",
+                match_confidence=1.0,
+            ),
+        ),
+        blobs=base.blobs,
+    )
+
+    weak_store = ReviewStore(store_root)
+    exact_store = ReviewStore(store_root)
+    weak_at_packet_write = threading.Event()
+    release_weak = threading.Event()
+    exact_done = threading.Event()
+    failures: list[BaseException] = []
+    original_write = weak_store.write_packet_artifact
+
+    def blocked_write(review_id: str, revision_id: str, payload: bytes) -> tuple[str, str, int]:
+        weak_at_packet_write.set()
+        if not release_weak.wait(timeout=5):  # pragma: no cover - failure reported below
+            raise RuntimeError("timed out waiting to release weak enrichment")
+        return original_write(review_id, revision_id, payload)
+
+    monkeypatch.setattr(weak_store, "write_packet_artifact", blocked_write)
+
+    def run_weak() -> None:
+        try:
+            enrich_revision_projection(weak_store, session, revision, weaker)
+        except BaseException as exc:  # pragma: no cover - asserted empty below
+            failures.append(exc)
+
+    def run_exact() -> None:
+        try:
+            enrich_revision_projection(exact_store, session, revision, exact)
+        except BaseException as exc:  # pragma: no cover - asserted empty below
+            failures.append(exc)
+        finally:
+            exact_done.set()
+
+    weak_thread = threading.Thread(target=run_weak)
+    exact_thread = threading.Thread(target=run_exact)
+    weak_thread.start()
+    assert weak_at_packet_write.wait(timeout=5)
+    exact_thread.start()
+    # The weak enrichment is holding the final projection transition while its
+    # artifact write is paused. A concurrent exact enrichment must therefore
+    # wait rather than decide from the same stale pre-write packet.
+    assert not exact_done.wait(timeout=0.25)
+    release_weak.set()
+    weak_thread.join(timeout=5)
+    exact_thread.join(timeout=5)
+
+    assert failures == []
+    assert not weak_thread.is_alive()
+    assert not exact_thread.is_alive()
+    stored = seed_store.get_revision(revision.id)
+    assert stored is not None
+    assert stored.provenance_certainty == "exact"
+    assert stored.provenance_host == "codex"
+    assert stored.provenance_session_id == "author-exact"
+    packet = read_packet_json(seed_store, stored)
+    assert packet is not None
+    assert packet["provenance"]["certainty"] == "exact"
+    assert packet["provenance"]["session_id"] == "author-exact"
+
+
+def test_failed_head_transition_rolls_back_mark_reconciliation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root, _repo = _dirty_repo(tmp_path)
+    store_root = tmp_path / "store"
+    store = ReviewStore(store_root)
+    rng = resolve_rev_range(root)
+    session = open_or_create_session(store, root, rng)
+    first = snapshot_revision(store, session, root, rng, store_root=store_root)
+    unit = resolve_unit(store.list_units(first.id), "src/session.py")
+    assert unit is not None
+    mark_unit(store, session, first, unit, state="reviewed", reviewer_id="local")
+    before = store.list_marks(session.id, reviewer_id="local")
+    assert len(before) == 1 and before[0].state == "reviewed"
+
+    _write(root, "src/session.py", _CHANGED.replace('"invalid"', '"rollback-check"'))
+    next_rng = resolve_rev_range(root)
+    build = build_review_packet_with_blobs(
+        root, next_rng, store_root=store_root, with_impact=False, with_patch_text=True
+    )
+    original_set_current = store.set_current_revision
+
+    def fail_after_reconciliation(review_id: str, revision_id: str) -> bool:
+        # The call happens inside atomic_review_transition after mark migration
+        # has already run. Raising here must roll every nested store write back.
+        raise ValueError("forced current-head failure")
+
+    monkeypatch.setattr(store, "set_current_revision", fail_after_reconciliation)
+    with pytest.raises(ValueError, match="forced current-head failure"):
+        record_revision(
+            store,
+            session,
+            root,
+            next_rng,
+            store_root=store_root,
+            build=build,
+            project_annotations=False,
+        )
+
+    monkeypatch.setattr(store, "set_current_revision", original_set_current)
+    reopened = ReviewStore(store_root)
+    current = reopened.latest_revision(session.id)
+    assert current is not None and current.id == first.id
+    after = reopened.list_marks(session.id, reviewer_id="local")
+    assert [(m.unit_key, m.state, m.reviewed_revision_id) for m in after] == [
+        (before[0].unit_key, before[0].state, before[0].reviewed_revision_id)
+    ]
+
+
+def test_older_concurrent_capture_cannot_roll_current_revision_backward(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+
+    root, _repo = _dirty_repo(tmp_path)
+    store_root = tmp_path / "store"
+    store = ReviewStore(store_root)
+    rng1 = resolve_rev_range(root)
+    session = open_or_create_session(store, root, rng1)
+    first = snapshot_revision(store, session, root, rng1, store_root=store_root)
+
+    _write(root, "src/session.py", _CHANGED.replace('"invalid"', '"generation-a"'))
+    rng_a = resolve_rev_range(root)
+    build_a = build_review_packet_with_blobs(
+        root, rng_a, store_root=store_root, with_impact=False, with_patch_text=True
+    )
+
+    store_a = ReviewStore(store_root)
+    original_add = store_a.add_revision
+    row_recorded = threading.Event()
+    release_old = threading.Event()
+
+    def blocked_add(*args: Any, **kwargs: Any):
+        result = original_add(*args, **kwargs)
+        row_recorded.set()
+        assert release_old.wait(timeout=10)
+        return result
+
+    monkeypatch.setattr(store_a, "add_revision", blocked_add)
+    old_result: list[Any] = []
+    old_error: list[BaseException] = []
+
+    def capture_old() -> None:
+        try:
+            old_result.append(
+                record_revision(
+                    store_a,
+                    session,
+                    root,
+                    rng_a,
+                    store_root=store_root,
+                    build=build_a,
+                    project_annotations=False,
+                )
+            )
+        except BaseException as exc:  # asserted below
+            old_error.append(exc)
+
+    thread = threading.Thread(target=capture_old)
+    thread.start()
+    assert row_recorded.wait(timeout=10)
+
+    _write(root, "src/session.py", _CHANGED.replace('"invalid"', '"generation-b"'))
+    rng_b = resolve_rev_range(root)
+    build_b = build_review_packet_with_blobs(
+        root, rng_b, store_root=store_root, with_impact=False, with_patch_text=True
+    )
+    store_b = ReviewStore(store_root)
+    newer = record_revision(
+        store_b,
+        session,
+        root,
+        rng_b,
+        store_root=store_root,
+        build=build_b,
+        project_annotations=False,
+    )
+    assert newer.revision.id != first.id
+
+    release_old.set()
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+    assert old_result == []
+    assert len(old_error) == 1
+    assert "Review advanced while this source generation was being reconciled" in str(old_error[0])
+
+    final_store = ReviewStore(store_root)
+    current = final_store.latest_revision(session.id)
+    assert current is not None
+    assert current.id == newer.revision.id
+    assert current.source_fingerprint == build_b.source_fingerprint
+
+
+def test_human_store_writes_fail_if_review_head_advanced_before_commit(tmp_path: Path) -> None:
+    from lemoncrow.pro.capabilities.review.session_models import ReviewEvidence
+
+    root, _repo = _dirty_repo(tmp_path)
+    store_root = tmp_path / "store"
+    store = ReviewStore(store_root)
+    rng = resolve_rev_range(root)
+    session = open_or_create_session(store, root, rng)
+    first = snapshot_revision(store, session, root, rng, store_root=store_root)
+    first_unit = next(unit for unit in store.list_units(first.id) if unit.kind == "file")
+
+    _write(root, "src/session.py", _CHANGED.replace('"invalid"', '"new head"'))
+    second = snapshot_revision(store, session, root, resolve_rev_range(root), store_root=store_root)
+    assert second.id != first.id
+
+    with pytest.raises(ValueError, match="Review advanced"):
+        mark_unit(
+            store,
+            session,
+            first,
+            first_unit,
+            expected_current_revision_id=first.id,
+        )
+    with pytest.raises(ValueError, match="Review advanced"):
+        annotate(
+            store,
+            session,
+            first,
+            path=first_unit.path,
+            start_line=1,
+            end_line=1,
+            body="stale comment",
+            new_text=(store.read_blob_artifact(session.id, first.id) or {}).get(first_unit.path),
+            expected_current_revision_id=first.id,
+        )
+    with pytest.raises(ValueError, match="Review advanced"):
+        store.record_outcome(
+            session.id,
+            first.id,
+            session.reviewer_id,
+            outcome="lgtm",
+            expected_current_revision_id=first.id,
+        )
+    with pytest.raises(ValueError, match="Review advanced"):
+        store.add_evidence(
+            ReviewEvidence(
+                id="",
+                review_id=session.id,
+                revision_id=first.id,
+                kind="document",
+                title="stale",
+                source="human",
+            ),
+            expected_current_revision_id=first.id,
+        )
+
+    assert store.list_marks(session.id, reviewer_id=session.reviewer_id) == ()
+    assert store.list_annotations(session.id) == ()
+    assert store.list_outcomes(session.id, reviewer_id=session.reviewer_id) == ()
+    assert store.list_evidence(session.id) == ()
+
+
+def test_new_revision_reopens_a_finished_review(tmp_path: Path) -> None:
+    root, _repo = _dirty_repo(tmp_path)
+    rng = resolve_rev_range(root)
+    store = _store(tmp_path)
+    session = open_or_create_session(store, root, rng)
+    first = snapshot_revision(store, session, root, rng, store_root=tmp_path / "store")
+    store.update_session_status_if_current_revision(session.id, first.id, "finished")
+    assert store.get_session(session.id).status == "finished"
+
+    _write(root, "src/session.py", _CHANGED.replace('"invalid"', '"new revision"'))
+    second = snapshot_revision(store, session, root, resolve_rev_range(root), store_root=tmp_path / "store")
+    assert second.id != first.id
+    reopened = store.get_session(session.id)
+    assert reopened is not None
+    assert reopened.current_revision_id == second.id
+    assert reopened.status == "open"
+
+
+def test_revision_pointer_waits_for_comment_that_arrives_during_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, _repo = _dirty_repo(tmp_path)
+    store = _store(tmp_path)
+    first_range = resolve_rev_range(root)
+    session = open_or_create_session(store, root, first_range)
+    first = snapshot_revision(store, session, root, first_range, store_root=tmp_path / "store")
+
+    _write(root, "src/session.py", _CHANGED.replace('"invalid"', '"new revision"'))
+    second_range = resolve_rev_range(root)
+    original_set_current = store.set_current_revision
+    calls = 0
+    created_annotation_id = ""
+
+    def racing_set_current(review_id: str, revision_id: str) -> bool:
+        nonlocal calls, created_annotation_id
+        calls += 1
+        if calls == 1:
+            comment = annotate(
+                store,
+                session,
+                first,
+                path="src/session.py",
+                start_line=8,
+                end_line=8,
+                body="arrived while the next revision was being published",
+                created_by="local",
+                created_by_actor="human",
+                source="human",
+                source_id="local",
+                new_text=_CHANGED,
+            )
+            created_annotation_id = comment.id
+        return original_set_current(review_id, revision_id)
+
+    monkeypatch.setattr(store, "set_current_revision", racing_set_current)
+    second = snapshot_revision(store, session, root, second_range, store_root=tmp_path / "store")
+
+    assert calls == 2, "first pointer advance must refuse the concurrently-created unreconciled comment"
+    assert created_annotation_id
+    latest = store.latest_revision(session.id)
+    assert latest is not None and latest.id == second.id
+    assert created_annotation_id in store.annotations_anchored_at(second.id)
+    assert store.annotations_needing_anchor_at(session.id, second.id) == ()
+
+
+def _npm_bump_repo(tmp_path: Path) -> Path:
+    """A committed npm manifest/lockfile plus an uncommitted dependency bump."""
+
+    def manifest(left_pad: str) -> str:
+        return json.dumps({"name": "demo", "version": "1.0.0", "dependencies": {"left-pad": left_pad}}, indent=2) + "\n"
+
+    def lock(left_pad: str, resolved: str) -> str:
+        return (
+            json.dumps(
+                {
+                    "name": "demo",
+                    "version": "1.0.0",
+                    "lockfileVersion": 3,
+                    "requires": True,
+                    "packages": {
+                        "": {"name": "demo", "version": "1.0.0", "dependencies": {"left-pad": left_pad}},
+                        "node_modules/left-pad": {
+                            "version": resolved,
+                            "resolved": f"https://registry.npmjs.org/left-pad/-/left-pad-{resolved}.tgz",
+                            "integrity": f"sha512-{resolved}",
+                        },
+                    },
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+
+    root = tmp_path / "npm-repo"
+    repo = _init_repo(root)
+    _write(root, "package.json", manifest("^1.3.0"))
+    _write(root, "package-lock.json", lock("^1.3.0", "1.3.0"))
+    _write(root, "src/app.py", "def greet(name):\n    return 'hi ' + name\n")
+    _commit(repo, "baseline", 0)
+    _write(root, "package.json", manifest("^1.3.1"))
+    _write(root, "package-lock.json", lock("^1.3.1", "1.3.1"))
+    _write(root, "src/app.py", "def greet(name):\n    return 'hello, ' + name\n")
+    return root
+
+
+def test_enrichment_keeps_the_dependency_targets_of_a_dependency_change(tmp_path: Path) -> None:
+    from lemoncrow.pro.capabilities.review.gitdiff import BlobPair
+
+    root = _npm_bump_repo(tmp_path)
+    rng = resolve_rev_range(root)
+    store = _store(tmp_path)
+    session = open_or_create_session(store, root, rng)
+    base = build_review_packet_with_blobs(
+        root, rng, store_root=tmp_path / "store", with_impact=False, with_patch_text=True
+    )
+    revision = snapshot_revision(store, session, root, rng, store_root=tmp_path / "store", build=base)
+    recorded = {unit.unit_key: unit for unit in store.list_units(revision.id)}
+    assert any(unit.kind == "dependency" for unit in recorded.values())
+
+    # The local server enriches with the new side only; impact/provenance must
+    # still attach to a Change whose dependency targets were derived at capture.
+    enriched_build = PacketBuild(
+        packet=replace(base.packet, degraded=()),
+        blobs=BlobPair(old={}, new=base.blobs.new, degraded=()),
+    )
+    enriched = enrich_revision_projection(store, session, revision, enriched_build)
+
+    assert enriched.id == revision.id
+    assert {unit.unit_key for unit in store.list_units(revision.id)} == set(recorded)
+
+
+def test_a_capture_that_could_not_read_a_dependency_base_side_degrades_visibly(tmp_path: Path) -> None:
+    from lemoncrow.pro.capabilities.review.gitdiff import BlobPair
+
+    root = _npm_bump_repo(tmp_path)
+    rng = resolve_rev_range(root)
+    store = _store(tmp_path)
+    session = open_or_create_session(store, root, rng)
+    base = build_review_packet_with_blobs(
+        root, rng, store_root=tmp_path / "store", with_impact=False, with_patch_text=True
+    )
+    dependency_paths = {"package.json", "package-lock.json"}
+    # Both dependency files were modified, but their base sides went unread
+    # (over the capture cap, unreadable). Absent is not empty: nothing may be
+    # asserted "added" from a side nobody read.
+    unread_base = PacketBuild(
+        packet=base.packet,
+        blobs=BlobPair(
+            old={path: text for path, text in base.blobs.old.items() if path not in dependency_paths},
+            new=base.blobs.new,
+            degraded=("large_file_skipped",),
+        ),
+    )
+    revision = snapshot_revision(store, session, root, rng, store_root=tmp_path / "store", build=unread_base)
+
+    assert not [unit for unit in store.list_units(revision.id) if unit.kind == "dependency"]
+    assert "dependency_side_unavailable" in revision.degraded
+
+    # Enrichment cannot re-derive a capture-time gap, so it must not erase it.
+    enriched = enrich_revision_projection(
+        store,
+        session,
+        revision,
+        PacketBuild(packet=base.packet, blobs=BlobPair(old={}, new=base.blobs.new, degraded=())),
+    )
+    assert "dependency_side_unavailable" in enriched.degraded
+
+
+def test_comment_anchors_and_errors_name_the_snapshot_the_reader_shows(tmp_path: Path) -> None:
+    root = _npm_bump_repo(tmp_path)
+    rng = resolve_rev_range(root)
+    store = _store(tmp_path)
+    session = open_or_create_session(store, root, rng)
+    revision = snapshot_revision(store, session, root, rng, store_root=tmp_path / "store")
+    text = (store.read_blob_artifact(session.id, revision.id) or {})["src/app.py"]
+
+    line = annotate(store, session, revision, path="src/app.py", start_line=1, end_line=1, body="line", new_text=text)
+    whole = annotate(store, session, revision, path="src/app.py", start_line=0, end_line=0, body="file", new_text=text)
+
+    # The Reader calls the first capture "Snapshot 0"; nothing may call it "revision 1".
+    assert revision.revision_number == 1
+    assert line.anchor_detail == "anchored on Snapshot 0"
+    assert whole.anchor_detail == "file-level comment on Snapshot 0"
+    with pytest.raises(ValueError, match="is not a file in Revision 0 of this review"):
+        annotate(store, session, revision, path="src/missing.py", start_line=1, end_line=1, body="nowhere")
+
+
+def test_working_tree_review_keeps_frozen_base_after_commit(tmp_path: Path) -> None:
+    root, repo = _dirty_repo(tmp_path)
+    store = _store(tmp_path)
+    initial = resolve_rev_range(root, working_tree=True)
+    session = open_or_create_session(store, root, initial)
+    assert session.review_base_sha == initial.base_sha
+
+    _commit(repo, "first review commit", 1)
+    _write(root, "src/helper.py", _HELPER.replace("+ 1", "+ 2"))
+
+    current = range_for_session(root, session)
+    assert current.mode == "working_tree"
+    assert current.base_sha == session.review_base_sha
+    assert current.base_sha != str(repo.head.target)
+
+
+def test_a_partial_commit_checkpoint_keeps_verdicts_on_files_still_uncommitted(tmp_path: Path) -> None:
+    root, repo = _dirty_repo(tmp_path)
+    _write(root, "src/helper.py", _HELPER.replace("+ 1", "+ 2"))
+    store = _store(tmp_path)
+    session = open_or_create_session(store, root, resolve_rev_range(root, working_tree=True))
+    first = refresh(store, session, root, store_root=tmp_path / "store", limit=5000)
+    assert {unit.path for unit in store.list_units(first.revision.id)} >= {"src/session.py", "src/helper.py"}
+    for unit in store.list_units(first.revision.id):
+        mark_unit(store, session, first.revision, unit, state="reviewed")
+    helper_keys = {unit.unit_key for unit in store.list_units(first.revision.id) if unit.path == "src/helper.py"}
+
+    # Commit only session.py; helper.py stays uncommitted and unchanged since review.
+    repo.index.add("src/session.py")
+    repo.index.write()
+    signature = pygit2.Signature("Fixture Tester", "fixture@example.test", 1700000100, 0)
+    repo.create_commit("HEAD", signature, signature, "partial", repo.index.write_tree(), [repo.head.target])
+    updated = store.get_session(session.id)
+    assert updated is not None
+    second = refresh(store, updated, root, store_root=tmp_path / "store", limit=5000)
+
+    assert [item.state for item in store.list_commits(session.id)] == ["active"]
+    assert second.revision.capture_kind == "draft"
+    kept = {mark.unit_key: mark.state for mark in store.list_marks(session.id, reviewer_id="local")}
+    assert helper_keys and all(kept.get(key) == "reviewed" for key in helper_keys)
+
+
+def test_a_scoped_review_stays_scoped_when_refreshed_from_the_session_alone(tmp_path: Path) -> None:
+    from dataclasses import replace as replace_range
+
+    root, _repo = _dirty_repo(tmp_path)
+    _write(root, "src/helper.py", _HELPER.replace("+ 1", "+ 2"))
+    store = _store(tmp_path)
+    scoped = replace_range(resolve_rev_range(root, working_tree=True), paths=("src/helper.py",))
+    session = open_or_create_session(store, root, scoped)
+    first = refresh(store, session, root, store_root=tmp_path / "store", rng=scoped, limit=5000)
+    assert {unit.path for unit in store.list_units(first.revision.id)} == {"src/helper.py"}
+
+    # The Reader's refresh only knows the session; another agent edits session.py meanwhile.
+    _write(root, "src/session.py", _CHANGED.replace('"invalid"', '"other agent"'))
+    _write(root, "src/helper.py", _HELPER.replace("+ 1", "+ 3"))
+    updated = store.get_session(session.id)
+    assert updated is not None
+    second = refresh(store, updated, root, store_root=tmp_path / "store", limit=5000)
+
+    assert second.revision.id != first.revision.id
+    assert {unit.path for unit in store.list_units(second.revision.id)} == {"src/helper.py"}
+
+
+def test_an_explicit_snapshot_takes_over_the_background_prepared_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    from lemoncrow.pro.capabilities.review import hosted
+    from lemoncrow.pro.capabilities.review.sources import local as local_source
+
+    root, _repo = _dirty_repo(tmp_path)
+    rng = resolve_rev_range(root, working_tree=True)
+    fresh_store = ReviewStore(tmp_path / "fresh")
+    fresh = refresh(fresh_store, open_or_create_session(fresh_store, root, rng), root, store_root=tmp_path / "fresh")
+
+    monkeypatch.setattr(hosted, "active_local_review_base", lambda *_args, **_kwargs: ("", ""))
+    config = SimpleNamespace(hosted=False, url="http://127.0.0.1:9")
+    prepared_root = tmp_path / "prepared"
+    assert hosted.prepare_local_source_build(config, root, rng, store_root=prepared_root, session_id=None, limit=40)
+
+    def no_rebuild(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("an explicit Snapshot must take over the prepared build, not rebuild it")
+
+    monkeypatch.setattr(local_source, "build_review_packet_with_blobs", no_rebuild)
+    prepared_store = ReviewStore(prepared_root)
+    taken = refresh(prepared_store, open_or_create_session(prepared_store, root, rng), root, store_root=prepared_root)
+
+    # Same Snapshot either way: units, impact and degradations match a fresh build.
+    assert [unit.unit_key for unit in prepared_store.list_units(taken.revision.id)] == [
+        unit.unit_key for unit in fresh_store.list_units(fresh.revision.id)
+    ]
+    fresh_packet = read_packet_json(fresh_store, fresh.revision)
+    taken_packet = read_packet_json(prepared_store, taken.revision)
+    for field in ("files", "symbols", "impact", "order", "degraded", "index_status"):
+        assert taken_packet[field] == fresh_packet[field], field
+
+
+def test_refresh_discovers_commit_checkpoint_before_current_draft(tmp_path: Path) -> None:
+    root, repo = _dirty_repo(tmp_path)
+    store = _store(tmp_path)
+    initial = resolve_rev_range(root, working_tree=True)
+    session = open_or_create_session(store, root, initial)
+    first = refresh(store, session, root, store_root=tmp_path / "store", limit=5000)
+    assert first.revision.capture_kind == "draft"
+
+    committed_sha = _commit(repo, "first review commit", 1)
+    _write(root, "src/helper.py", _HELPER.replace("+ 1", "+ 2"))
+    updated = store.get_session(session.id)
+    assert updated is not None
+    second = refresh(store, updated, root, store_root=tmp_path / "store", limit=5000)
+
+    commits = store.list_commits(session.id)
+    assert [item.commit_sha for item in commits] == [committed_sha]
+    checkpoint = store.get_revision(commits[0].revision_id)
+    assert checkpoint is not None
+    assert checkpoint.capture_kind == "commit"
+    assert checkpoint.dirty is False
+    assert checkpoint.commit_sha == committed_sha
+    assert checkpoint.base_sha == session.review_base_sha
+    assert second.revision.capture_kind == "draft"
+    assert second.revision.base_sha == session.review_base_sha
+    assert store.get_session(session.id).current_revision_id == second.revision.id
+
+
+def _checkout_branch(repo: Any, name: str) -> None:
+    ref = f"refs/heads/{name}"
+    repo.set_head(ref)
+    repo.checkout_head(strategy=pygit2.GIT_CHECKOUT_FORCE)
+
+
+def test_local_branches_get_independent_active_reviews(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    repo = _init_repo(root)
+    _write(
+        root,
+        "app.py",
+        "value = 0\
+",
+    )
+    _commit(repo, "baseline", 0)
+    base = repo.head.peel(pygit2.Commit)
+    repo.branches.local.create("feature-a", base)
+    repo.branches.local.create("feature-b", base)
+    store = _store(tmp_path)
+
+    _checkout_branch(repo, "feature-a")
+    _write(
+        root,
+        "app.py",
+        "value = 1\
+",
+    )
+    review_a = open_or_create_session(store, root, resolve_rev_range(root, working_tree=True))
+
+    _checkout_branch(repo, "feature-b")
+    _write(
+        root,
+        "app.py",
+        "value = 2\
+",
+    )
+    review_b = open_or_create_session(store, root, resolve_rev_range(root, working_tree=True))
+    assert review_b.id != review_a.id
+
+    _checkout_branch(repo, "feature-a")
+    _write(
+        root,
+        "app.py",
+        "value = 3\
+",
+    )
+    reopened_a = open_or_create_session(store, root, resolve_rev_range(root, working_tree=True))
+    assert reopened_a.id == review_a.id
+
+
+def test_finished_review_releases_branch_for_new_review(tmp_path: Path) -> None:
+    root, _repo = _dirty_repo(tmp_path)
+    store = _store(tmp_path)
+    rng = resolve_rev_range(root, working_tree=True)
+    session = open_or_create_session(store, root, rng)
+    revision = snapshot_revision(store, session, root, range_for_session(root, session), store_root=tmp_path / "store")
+    set_review_status(store, session, revision, status="finished")
+
+    replacement = open_or_create_session(store, root, resolve_rev_range(root, working_tree=True))
+    assert replacement.id != session.id
+    assert replacement.status == "open"
+
+
+def test_a_review_reopened_after_finishing_takes_its_branch_back(tmp_path: Path) -> None:
+    # The Reader's Reopen resumes the Review: the branch's next capture must
+    # continue it, not start another one.
+    root, _repo = _dirty_repo(tmp_path)
+    store = _store(tmp_path)
+    session = open_or_create_session(store, root, resolve_rev_range(root, working_tree=True))
+    revision = snapshot_revision(store, session, root, range_for_session(root, session), store_root=tmp_path / "store")
+    set_review_status(store, session, revision, status="finished")
+    set_review_status(store, store.get_session(session.id) or session, revision, status="open")
+
+    assert open_or_create_session(store, root, resolve_rev_range(root, working_tree=True)).id == session.id
+
+
+def test_reopening_a_finished_review_leaves_the_branchs_newer_review_active(tmp_path: Path) -> None:
+    root, _repo = _dirty_repo(tmp_path)
+    store = _store(tmp_path)
+    session = open_or_create_session(store, root, resolve_rev_range(root, working_tree=True))
+    revision = snapshot_revision(store, session, root, range_for_session(root, session), store_root=tmp_path / "store")
+    set_review_status(store, session, revision, status="finished")
+    replacement = open_or_create_session(store, root, resolve_rev_range(root, working_tree=True))
+    set_review_status(store, store.get_session(session.id) or session, revision, status="open")
+
+    assert open_or_create_session(store, root, resolve_rev_range(root, working_tree=True)).id == replacement.id
+
+
+def test_force_new_and_continue_control_branch_binding(tmp_path: Path) -> None:
+    root, _repo = _dirty_repo(tmp_path)
+    store = _store(tmp_path)
+    rng = resolve_rev_range(root, working_tree=True)
+    first = open_or_create_session(store, root, rng)
+
+    second = open_or_create_session(store, root, rng, force_new=True)
+    assert second.id != first.id
+    assert open_or_create_session(store, root, rng).id == second.id
+
+    continued = open_or_create_session(store, root, rng, continue_review_id=first.id)
+    assert continued.id == first.id
+    assert open_or_create_session(store, root, rng).id == first.id
+
+
+def test_rewritten_branch_supersedes_old_checkpoint_and_records_new_lineage(tmp_path: Path) -> None:
+    root, repo = _dirty_repo(tmp_path)
+    store = _store(tmp_path)
+    initial = resolve_rev_range(root, working_tree=True)
+    session = open_or_create_session(store, root, initial)
+    refresh(store, session, root, store_root=tmp_path / "store", limit=5000)
+
+    old_sha = _commit(repo, "old checkpoint", 1)
+    refresh(store, store.get_session(session.id) or session, root, store_root=tmp_path / "store", limit=5000)
+    assert store.find_commit(session.id, old_sha).state == "active"
+
+    repo.reset(pygit2.Oid(hex=session.review_base_sha), pygit2.enums.ResetMode.HARD)
+    _write(root, "src/session.py", _CHANGED.replace('"invalid"', '"renewed"'))
+    new_sha = _commit(repo, "rewritten checkpoint", 2)
+    refresh(store, store.get_session(session.id) or session, root, store_root=tmp_path / "store", limit=5000)
+
+    old = store.find_commit(session.id, old_sha)
+    new = store.find_commit(session.id, new_sha)
+    assert old is not None and old.state == "superseded"
+    assert new is not None and new.state == "active"
+    assert new.commit_number > old.commit_number
+
+
+def test_commit_checkpoint_writes_git_note_backlink(tmp_path: Path) -> None:
+    import subprocess
+
+    root, repo = _dirty_repo(tmp_path)
+    store = _store(tmp_path)
+    initial = resolve_rev_range(root, working_tree=True)
+    session = open_or_create_session(store, root, initial)
+    refresh(store, session, root, store_root=tmp_path / "store", limit=5000)
+    sha = _commit(repo, "noted checkpoint", 1)
+    refresh(store, store.get_session(session.id) or session, root, store_root=tmp_path / "store", limit=5000)
+
+    note = subprocess.run(
+        ["git", "-C", str(root), "notes", "--ref=refs/notes/lemoncrow", "show", sha],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    checkpoint = store.find_commit(session.id, sha)
+    assert checkpoint is not None
+    assert f"LemonCrow-Review: r/{store.short_session_reference(session.id)}" in note
+    assert f"LemonCrow-Commit: {checkpoint.commit_number}" in note
+
+
+def test_staged_review_does_not_steal_working_tree_branch_binding(tmp_path: Path) -> None:
+    root, repo = _dirty_repo(tmp_path)
+    store = _store(tmp_path)
+    working_rng = resolve_rev_range(root, working_tree=True)
+    working = open_or_create_session(store, root, working_rng)
+
+    repo.index.add("src/session.py")
+    repo.index.write()
+    staged_rng = resolve_rev_range(root, staged=True)
+    staged_review = open_or_create_session(store, root, staged_rng)
+
+    assert staged_review.id != working.id
+    assert staged_review.range_mode == "staged"
+    assert open_or_create_session(store, root, resolve_rev_range(root, working_tree=True)).id == working.id
+    assert open_or_create_session(store, root, resolve_rev_range(root, staged=True)).id == staged_review.id
+
+
+def test_closed_review_can_be_reopened_after_branch_was_unbound(tmp_path: Path) -> None:
+    root, _repo = _dirty_repo(tmp_path)
+    store = _store(tmp_path)
+    rng = resolve_rev_range(root, working_tree=True)
+    session = open_or_create_session(store, root, rng)
+    revision = snapshot_revision(store, session, root, rng, store_root=tmp_path / "store")
+
+    set_review_status(store, session, revision, status="archived")
+    restored = open_or_create_session(store, root, rng, restore_archived=True)
+    assert restored.id == session.id
+    assert restored.status == "open"
+
+    set_review_status(store, restored, revision, status="finished")
+    reopened = open_or_create_session(store, root, rng, restore_archived=True)
+    assert reopened.id == session.id
+    assert reopened.status == "finished"
+
+
+def test_continue_rejects_review_from_different_capture_mode(tmp_path: Path) -> None:
+    root, repo = _dirty_repo(tmp_path)
+    store = _store(tmp_path)
+    working = open_or_create_session(store, root, resolve_rev_range(root, working_tree=True))
+    repo.index.add("src/session.py")
+    repo.index.write()
+    staged = resolve_rev_range(root, staged=True)
+
+    with pytest.raises(ValueError, match=r"different|uses working_tree"):
+        open_or_create_session(store, root, staged, continue_review_id=working.id)
+
+
+def test_clean_worktree_after_commit_does_not_create_fake_draft(tmp_path: Path) -> None:
+    root, repo = _dirty_repo(tmp_path)
+    store = _store(tmp_path)
+    initial = resolve_rev_range(root, working_tree=True)
+    session = open_or_create_session(store, root, initial)
+    refresh(store, session, root, store_root=tmp_path / "store", limit=5000)
+
+    sha = _commit(repo, "review checkpoint", 1)
+    refreshed = refresh(
+        store,
+        store.get_session(session.id) or session,
+        root,
+        store_root=tmp_path / "store",
+        limit=5000,
+    )
+
+    checkpoint = store.find_commit(session.id, sha)
+    assert checkpoint is not None
+    assert refreshed.revision.id == checkpoint.revision_id
+    assert refreshed.revision.capture_kind == "commit"
+    assert [row.capture_kind for row in store.list_revisions(session.id)][-1] == "commit"
+
+
+def test_legacy_review_adoption_recovers_original_base_from_earliest_revision(tmp_path: Path) -> None:
+    root, repo = _dirty_repo(tmp_path)
+    store = _store(tmp_path)
+    initial = resolve_rev_range(root, working_tree=True)
+    legacy = store.create_session(
+        ReviewSession(
+            id="",
+            subject_type="local_change",
+            repo_root=str(root.resolve()),
+            range_mode="working_tree",
+            title="legacy",
+            source_ref="",
+            review_base_sha="",
+        )
+    )
+    first = snapshot_revision(store, legacy, root, initial, store_root=tmp_path / "store")
+    original_base = first.base_sha
+
+    _commit(repo, "legacy checkpoint", 1)
+    _write(root, "src/helper.py", _HELPER.replace("+ 1", "+ 9"))
+    adopted = open_or_create_session(store, root, resolve_rev_range(root, working_tree=True))
+
+    assert adopted.id == legacy.id
+    assert adopted.review_base_sha == original_base
+    assert adopted.review_base_sha != str(repo.head.target)
+
+
+def test_commit_checkpoint_backfill_skips_full_impact_and_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from lemoncrow.pro.capabilities.review.sources import local as local_source
+
+    root, repo = _dirty_repo(tmp_path)
+    store = _store(tmp_path)
+    session = open_or_create_session(store, root, resolve_rev_range(root, working_tree=True))
+    _commit(repo, "checkpoint", 1)
+
+    observed: list[tuple[bool, bool, str]] = []
+    original = local_source.build_review_packet_with_blobs
+
+    def recording_build(repo_root: Path, rng: Any, **kwargs: Any):
+        observed.append((bool(kwargs.get("with_impact", True)), bool(kwargs.get("with_provenance", True)), rng.mode))
+        return original(repo_root, rng, **kwargs)
+
+    monkeypatch.setattr(local_source, "build_review_packet_with_blobs", recording_build)
+    commits = sync_commit_checkpoints(store, session, root, store_root=tmp_path / "store", limit=5000)
+
+    assert len(commits) == 1
+    assert observed == [(False, False, "commit_range")]
+
+
+def test_commit_checkpoints_follow_first_parent_and_skip_merged_side_history(tmp_path: Path) -> None:
+    root = tmp_path / "merge-repo"
+    repo = _init_repo(root)
+    _write(root, "base.py", "BASE = 1\n")
+    _commit(repo, "baseline", 0)
+    baseline = repo.head.peel(pygit2.Commit)
+    repo.branches.local.create("feature", baseline)
+    repo.checkout("refs/heads/feature")
+
+    _write(root, "feature.py", "FEATURE = 1\n")
+    store = _store(tmp_path)
+    session = open_or_create_session(store, root, resolve_rev_range(root, working_tree=True))
+    refresh(store, session, root, store_root=tmp_path / "capture-store", limit=5000)
+    feature_sha = _commit(repo, "feature checkpoint", 1)
+
+    repo.checkout("refs/heads/main")
+    _write(root, "main.py", "MAIN = 1\n")
+    main_sha = _commit(repo, "main side commit", 2)
+
+    repo.checkout("refs/heads/feature")
+    feature_head = repo.head.peel(pygit2.Commit)
+    main_head = repo.branches["main"].peel(pygit2.Commit)
+    repo.merge(main_head.id)
+    merge_tree = repo.index.write_tree()
+    signature = pygit2.Signature("Fixture Tester", "fixture@example.test", 1700000003, 0)
+    merge_sha = str(
+        repo.create_commit(
+            "HEAD",
+            signature,
+            signature,
+            "merge main",
+            merge_tree,
+            [feature_head.id, main_head.id],
+        )
+    )
+    repo.state_cleanup()
+
+    sync_commit_checkpoints(store, session, root, store_root=tmp_path / "capture-store", limit=5000)
+    checkpoints = store.list_commits(session.id, include_superseded=False)
+    assert [item.commit_sha for item in checkpoints] == [feature_sha, merge_sha]
+    assert main_sha not in {item.commit_sha for item in checkpoints}
+
+
+def test_staged_review_records_commit_checkpoint_between_drafts(tmp_path: Path) -> None:
+    root, repo = _dirty_repo(tmp_path)
+    repo.index.add("src/session.py")
+    repo.index.write()
+    store = _store(tmp_path)
+    session = open_or_create_session(store, root, resolve_rev_range(root, staged=True))
+    first = refresh(store, session, root, store_root=tmp_path / "capture-store", limit=5000)
+    assert first.revision.capture_kind == "draft"
+
+    committed_sha = _commit(repo, "staged checkpoint", 4)
+    _write(root, "src/helper.py", _HELPER.replace("+ 1", "+ 7"))
+    repo.index.add("src/helper.py")
+    repo.index.write()
+    second = refresh(
+        store,
+        store.get_session(session.id) or session,
+        root,
+        store_root=tmp_path / "capture-store",
+        limit=5000,
+    )
+
+    commits = store.list_commits(session.id, include_superseded=False)
+    assert [item.commit_sha for item in commits] == [committed_sha]
+    checkpoint = store.get_revision(commits[0].revision_id)
+    assert checkpoint is not None and checkpoint.capture_kind == "commit"
+    assert second.revision.capture_kind == "draft"
+    assert [row.capture_kind for row in store.list_revisions(session.id)] == ["draft", "commit", "draft"]
+
+
+def test_unborn_review_keeps_empty_tree_base_and_records_first_commit(tmp_path: Path) -> None:
+    from lemoncrow.pro.capabilities.review.gitdiff import EMPTY_TREE_SHA
+
+    root = tmp_path / "unborn-repo"
+    repo = _init_repo(root)
+    _write(root, "first.py", "FIRST = 1\n")
+    rng = resolve_rev_range(root, working_tree=True)
+    assert rng.base_sha == EMPTY_TREE_SHA
+
+    store = _store(tmp_path)
+    session = open_or_create_session(store, root, rng)
+    assert session.review_base_sha == EMPTY_TREE_SHA
+    first = refresh(store, session, root, store_root=tmp_path / "capture-store", limit=5000)
+    assert first.revision.capture_kind == "draft"
+
+    first_commit = _commit(repo, "first commit", 5)
+    captured = refresh(
+        store,
+        store.get_session(session.id) or session,
+        root,
+        store_root=tmp_path / "capture-store",
+        limit=5000,
+    )
+    commits = store.list_commits(session.id, include_superseded=False)
+    assert [item.commit_sha for item in commits] == [first_commit]
+    checkpoint = store.get_revision(commits[0].revision_id)
+    assert checkpoint is not None
+    assert checkpoint.base_sha == EMPTY_TREE_SHA
+    assert checkpoint.capture_kind == "commit"
+    assert checkpoint.dirty is False
+    assert captured.revision.id == checkpoint.id

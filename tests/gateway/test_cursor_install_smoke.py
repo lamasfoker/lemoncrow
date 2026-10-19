@@ -59,25 +59,17 @@ def test_workspace_install_writes_consistent_artifacts(tmp_path: Path) -> None:
     home.mkdir()
     _run_install(ws, home)
 
-    # The server is registered GLOBALLY even for a --workspace install. A second
-    # project-scoped entry under the same `lemoncrow` key makes Cursor empty the
-    # project file mid-session and drop the live client ("Not connected"), after
-    # which the agent falls back to built-ins and never returns to LemonCrow.
-    assert not (ws / ".cursor" / "mcp.json").exists(), "workspace install must not create a server registration"
+    # Runtime Lite registration is global even for a --workspace install. A second
+    # project-scoped entry under the same lemoncrow key can make Cursor drop the
+    # live client, so workspace installs still keep one global MCP registration.
+    assert not (ws / ".cursor" / "mcp.json").exists(), "workspace install must not create a second registration"
     mcp = json.loads((home / ".cursor" / "mcp.json").read_text())
     server = mcp["mcpServers"]["lemoncrow"]
-    # The create-branch and merge-branch used to disagree (lemoncrow vs lc,
-    # shell vs bash); pin the one true shape so it can't drift again.
-    # Resolved to an absolute path (not bare "lc") -- Cursor's MCP subprocess
-    # spawn doesn't reliably inherit the shell PATH lc was installed onto.
+    # Resolve to an absolute lc path because Cursor subprocesses do not reliably
+    # inherit the shell PATH used during installation.
     assert server["command"].endswith("/lc")
     assert Path(server["command"]).is_absolute()
-    assert server["args"] == ["mcp", "--host", "cursor"]
-    # Must equal the visible-to-LLM surface exactly (mcp_tool_visible_to_llm()
-    # in src/lemoncrow/core/environment.py) -- not the full tool registry.
-    # Hidden tools (grep, sql, memory, codemod, ...) stay callable by name on
-    # the server side, so over-including them here would silently bypass
-    # Cursor's permission prompt on a call that reaches one directly.
+    assert server["args"] == ["runtime", "lite-mcp", "--host", "cursor"]
     assert set(server["autoApprove"]) == {"bash", "code_search", "edit", "read", "web_fetch"}
 
     hooks = json.loads((ws / ".cursor" / "hooks.json").read_text())["hooks"]
@@ -194,7 +186,7 @@ def test_session_start_hook_skips_placeholder_model(tmp_path: Path) -> None:
 
 
 def test_cursor_mcp_savings_row_is_attributed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    # `lc mcp --host cursor` does not set CURSOR_SESSION_ID for its own process;
+    # runtime lite-mcp is a stdio child and does not set CURSOR_SESSION_ID for its own process;
     # the sessionStart bridge does. Simulate the resolved state directly via the
     # env session id (the fast path _resolved_host_session tries before the
     # workspace bridge) and assert the row lands under the real cursor session,
@@ -251,6 +243,19 @@ def _make_cursor_agent_session(
     conn.execute("INSERT INTO blobs VALUES (?, ?)", ("link", b"\x00\x01\x02not-json"))
     conn.commit()
     conn.close()
+
+
+def test_cursor_agent_xdg_config_home_replaces_default_config_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from lemoncrow.gateway.hosts.session_parsers.cursor import _cursor_agent_chats_dirs
+
+    home = tmp_path / "home"
+    xdg = tmp_path / "xdg"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+
+    assert _cursor_agent_chats_dirs() == [xdg / "cursor" / "chats"]
 
 
 def test_cursor_agent_cli_chat_import(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, store) -> None:

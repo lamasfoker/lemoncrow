@@ -56,38 +56,49 @@ from __future__ import annotations
 import hashlib
 import os
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final
 
 from .gitindex import GitIndex, locate_index, read_index
+from .manifest import WalkCacheStats
+from .worktrees import WorktreeCatalog
 
 __all__ = [
     "CACHE_DIRECTORY",
     "MINIMUM_INDEX_MISSES",
     "CacheWrite",
     "WalkCache",
+    "WalkCacheProof",
     "WalkCacheStats",
     "cache_path",
     "load_walk_cache",
+    "peek_walk_cache_proof",
 ]
 
 #: Part of the file, so a format change is a miss rather than a misreading.
-_FORMAT: Final[str] = "lemoncrow-walkcache/1"
+_FORMAT: Final[str] = "lemoncrow-walkcache/4"
 _FIELD: Final[str] = "\x00"
 
 #: Under the state directory, so one repository's cache is one file.
 CACHE_DIRECTORY: Final[str] = "walk-cache"
 
-#: Past these the cache costs more to read than the hashing it saves, so it is
-#: declined rather than allowed to grow without bound.
+#: Keep persistence bounded by both serialized bytes and row count. The old
+#: 200k-row ceiling rejected the measured 250k enterprise tier even though its
+#: complete path proof is only ~42 MiB, comfortably inside the 64 MiB byte cap.
+#: 400k covers that tier while the byte cap remains the tighter bound for long
+#: paths / larger repositories.
 _MAX_CACHE_BYTES: Final[int] = 64 * 1024 * 1024
-_MAX_ENTRIES: Final[int] = 200_000
+_MAX_ENTRIES: Final[int] = 400_000
 #: The blob map is keyed by content, so unlike the path map it has no natural
 #: end: every branch ever checked out adds to it. This is where it stops.
 _MAX_BLOBS: Final[int] = 200_000
 #: Caches for this many worktrees are kept; the least recently used are dropped.
 _MAX_REPOSITORIES: Final[int] = 12
+#: v4 stores only bounded manifest IDs in the first line. Refuse an absurd
+#: header without reading the 64 MiB body merely to discover corruption.
+_MAX_PROOF_HEADER_BYTES: Final[int] = 1024 * 1024
 
 #: Parsing git's index is linear in the *whole* repository; the hashing it saves
 #: is linear in what *changed*. Measured: one index entry costs about 1.8 us to
@@ -127,20 +138,24 @@ class CacheWrite:
 
 
 @dataclass(frozen=True, slots=True)
-class WalkCacheStats:
-    """Where one walk's digests came from. Reported, so the claim is checkable."""
+class WalkCacheProof:
+    """Metadata sufficient to open an unchanged clean generation lazily."""
 
-    reused_by_path: int = 0
-    reused_by_blob: int = 0
-    hashed: int = 0
+    entry_count: int = 0
+    workspace_fingerprint: str = ""
+    generation_revision: str = ""
+    manifest_root: str = ""
+    manifest_chunk_rows: int = 0
+    manifest_chunk_ids: tuple[str, ...] = ()
 
     @property
-    def total(self) -> int:
-        return self.reused_by_path + self.reused_by_blob + self.hashed
-
-    @property
-    def reused(self) -> int:
-        return self.reused_by_path + self.reused_by_blob
+    def complete(self) -> bool:
+        return bool(
+            self.workspace_fingerprint
+            and self.generation_revision
+            and self.manifest_root
+            and self.manifest_chunk_rows > 0
+        )
 
 
 @dataclass
@@ -174,6 +189,21 @@ class WalkCache:
     index: GitIndex | None = field(default=None, repr=False)
     index_read: bool = field(default=False, repr=False)
     index_budget: int = field(default=-1, repr=False)
+    #: Exact source-state fingerprint that produced ``by_path``. Empty means
+    #: no complete-workspace proof is available, so callers perform an ordinary
+    #: walk rather than trusting incomplete cache state.
+    workspace_fingerprint: str = ""
+    #: Immutable Git revision proved to have exactly the same path set/content
+    #: as this complete workspace. Empty for dirty/sparse worktrees and older
+    #: cache formats. Reusing it is safe only together with an exact fingerprint
+    #: match, which is what whole-walk restoration already requires.
+    generation_revision: str = ""
+    #: Canonical manifest metadata proved by the same complete workspace. The
+    #: chunk IDs are valid only for ``manifest_chunk_rows``; a server that
+    #: negotiates a different chunk ceiling forces ordinary recomputation.
+    manifest_root: str = ""
+    manifest_chunk_rows: int = 0
+    manifest_chunk_ids: tuple[str, ...] = ()
 
     # -- the walk's interface ------------------------------------------- #
 
@@ -271,6 +301,23 @@ class WalkCache:
         self.index = read_index(self.repo_root)
         return self.index
 
+    def reuse_proven_paths(self, workspace_fingerprint: str) -> dict[str, tuple[str, str]] | None:
+        """Reuse the complete path map when an exact workspace proof matches.
+
+        This is stronger than the ordinary per-path stat cache: the caller has
+        already asked Git for the exact HEAD + dirty/untracked state and it is
+        byte-for-byte the state saved after the previous successful walk. Any
+        missing proof or old cache format declines to the normal filesystem
+        walk. Mark the paths fresh so persisting this session keeps the cache
+        complete rather than replacing it with an empty fast-path observation.
+        """
+        if not workspace_fingerprint or workspace_fingerprint != self.workspace_fingerprint or not self.by_path:
+            return None
+        self.begin()
+        self.reused_by_path = len(self.by_path)
+        self.fresh_path = dict(self.by_path)
+        return self.fresh_path
+
     def _budget(self) -> int:
         """How many misses make parsing the index cheaper than hashing."""
         if self.index_budget < 0:
@@ -287,7 +334,17 @@ class WalkCache:
 
     # -- persistence ---------------------------------------------------- #
 
-    def plan_write(self, state_dir: Path) -> CacheWrite | None:
+    def plan_write(
+        self,
+        state_dir: Path,
+        *,
+        workspace_fingerprint: str = "",
+        generation_revision: str = "",
+        manifest_root: str = "",
+        manifest_chunk_rows: int = 0,
+        manifest_chunk_ids: Sequence[str] = (),
+        generation_entry_count: int | None = None,
+    ) -> CacheWrite | None:
         """The bytes to persist and the stale caches to drop, or ``None``.
 
         Only what this walk actually saw is written: an entry for a file that no
@@ -301,9 +358,32 @@ class WalkCache:
         """
         if not self.started_ns or len(self.fresh_path) > _MAX_ENTRIES:
             return None
-        head = [f"{_FORMAT} {self.started_ns} {len(self.fresh_path)}"]
+        proof = workspace_fingerprint if workspace_fingerprint and " " not in workspace_fingerprint else "-"
+        revision = generation_revision.strip().lower()
+        if len(revision) not in {40, 64} or any(char not in "0123456789abcdef" for char in revision):
+            revision = "-"
+        root = manifest_root.strip().lower()
+        chunks = tuple(str(chunk).strip().lower() for chunk in manifest_chunk_ids)
+        valid_manifest = (
+            len(root) == 64
+            and all(char in "0123456789abcdef" for char in root)
+            and manifest_chunk_rows > 0
+            and all(len(chunk) == 64 and all(char in "0123456789abcdef" for char in chunk) for chunk in chunks)
+        )
+        if not valid_manifest:
+            root, manifest_chunk_rows, chunks = "-", 0, ()
+        chunk_token = ",".join(chunks) if chunks else "-"
+        head = [
+            f"{_FORMAT} {self.started_ns} {len(self.fresh_path)} {proof} {revision} "
+            f"{root} {manifest_chunk_rows} {chunk_token}"
+        ]
+        if generation_entry_count is not None:
+            # Git-only proofs have no per-path stat rows. Keep the independent
+            # generation row count so header validation still checks chunk counts.
+            head[0] += f" {generation_entry_count}"
         head.extend(
-            f"{relpath}{_FIELD}{identity}{_FIELD}{digest}" for relpath, (identity, digest) in self.fresh_path.items()
+            f"{relpath}{_FIELD}{identity}{_FIELD}{digest}"
+            for relpath, (identity, digest) in sorted(self.fresh_path.items())
         )
         head.append(_FORMAT)
         paths_only = "\n".join(head).encode("utf-8", "surrogatepass")
@@ -351,32 +431,149 @@ def _stale_caches(keep: Path) -> tuple[Path, ...]:
     return tuple(path for _mtime, path in dated[: len(dated) - _MAX_REPOSITORIES + 1])
 
 
-def load_walk_cache(state_dir: Path, repo_root: Path) -> WalkCache:
-    """Read the cache for ``repo_root``. Anything unreadable is an empty cache."""
-    cache = WalkCache(repo_root=repo_root)
+def peek_walk_cache_proof(state_dir: Path, repo_root: Path) -> WalkCacheProof:
+    """Read only a v4 cache header; older/corrupt caches have no fast proof."""
     target = cache_path(state_dir, repo_root)
     try:
         if target.stat().st_size > _MAX_CACHE_BYTES:
-            return cache
+            return WalkCacheProof()
+        with target.open("rb") as handle:
+            raw = handle.readline(_MAX_PROOF_HEADER_BYTES + 1)
+    except OSError:
+        return WalkCacheProof()
+    if not raw.endswith(b"\n") or len(raw) > _MAX_PROOF_HEADER_BYTES:
+        return WalkCacheProof()
+    try:
+        header = raw[:-1].decode("utf-8", "strict").split(" ")
+    except UnicodeDecodeError:
+        return WalkCacheProof()
+    if len(header) not in {8, 9} or header[0] != _FORMAT:
+        return WalkCacheProof()
+    try:
+        entry_count = int(header[8] if len(header) == 9 else header[2])
+        chunk_rows = int(header[6])
+    except ValueError:
+        return WalkCacheProof()
+    if entry_count < 0 or entry_count > _MAX_ENTRIES or chunk_rows <= 0:
+        return WalkCacheProof()
+    fingerprint = header[3]
+    revision = header[4].lower()
+    root = header[5].lower()
+    chunks = () if header[7] == "-" else tuple(part.lower() for part in header[7].split(",") if part)
+
+    def valid_hex(value: str, lengths: set[int]) -> bool:
+        return len(value) in lengths and all(char in "0123456789abcdef" for char in value)
+
+    expected_chunks = (entry_count + chunk_rows - 1) // chunk_rows if entry_count else 0
+    if (
+        not valid_hex(fingerprint.lower(), {64})
+        or not valid_hex(revision, {40, 64})
+        or not valid_hex(root, {64})
+        or len(chunks) != expected_chunks
+        or any(not valid_hex(chunk, {64}) for chunk in chunks)
+    ):
+        return WalkCacheProof()
+    return WalkCacheProof(
+        entry_count=entry_count,
+        workspace_fingerprint=fingerprint,
+        generation_revision=revision,
+        manifest_root=root,
+        manifest_chunk_rows=chunk_rows,
+        manifest_chunk_ids=chunks,
+    )
+
+
+def _read_parsed_cache(
+    target: Path,
+) -> tuple[dict[str, tuple[str, str]], dict[str, str], str, str, str, int, tuple[str, ...]] | None:
+    try:
+        if target.stat().st_size > _MAX_CACHE_BYTES:
+            return None
         raw = target.read_bytes()
     except OSError:
-        return cache
+        return None
     try:
         text = raw.decode("utf-8", "surrogatepass")
     except UnicodeDecodeError:
-        return cache
-    parsed = _parse(text)
+        return None
+    return _parse(text)
+
+
+def _linked_blob_cache(state_dir: Path, repo_root: Path) -> dict[str, str]:
+    """Blob digests learned by one sibling checkout of the same Git repository."""
+
+    current = repo_root.resolve()
+    for entry in WorktreeCatalog(current).entries():
+        root = entry.root.resolve()
+        if root == current:
+            continue
+        parsed = _read_parsed_cache(cache_path(state_dir, root))
+        if parsed is not None and parsed[1]:
+            return parsed[1]
+    return {}
+
+
+def load_walk_cache(state_dir: Path, repo_root: Path) -> WalkCache:
+    """Read this checkout's cache and import safe blob proofs from one linked checkout."""
+
+    cache = WalkCache(repo_root=repo_root)
+    parsed = _read_parsed_cache(cache_path(state_dir, repo_root))
     if parsed is not None:
-        cache.by_path, cache.by_blob = parsed
+        (
+            cache.by_path,
+            cache.by_blob,
+            cache.workspace_fingerprint,
+            cache.generation_revision,
+            cache.manifest_root,
+            cache.manifest_chunk_rows,
+            cache.manifest_chunk_ids,
+        ) = parsed
+    # Git blob ids are repository content identities, unlike path stat data and
+    # whole-worktree proofs. A linked checkout can therefore contribute only the
+    # blob->sha256 map safely; its paths/fingerprint/manifest proof stay local.
+    if not cache.by_blob:
+        for oid, digest in _linked_blob_cache(state_dir, repo_root).items():
+            if len(cache.by_blob) >= _MAX_BLOBS:
+                break
+            cache.by_blob.setdefault(oid, digest)
     return cache
 
 
-def _parse(text: str) -> tuple[dict[str, tuple[str, str]], dict[str, str]] | None:
+def _parse(
+    text: str,
+) -> tuple[dict[str, tuple[str, str]], dict[str, str], str, str, str, int, tuple[str, ...]] | None:
     """The cache file, or ``None`` for anything not exactly well-formed."""
     rows = iter(text.split("\n"))
     header = next(rows, "").split(" ")
-    if len(header) != 3 or header[0] != _FORMAT:
+    if not header:
         return None
+    if header[0] != _FORMAT or len(header) not in {8, 9}:
+        return None
+    marker = _FORMAT
+    workspace_fingerprint = "" if header[3] == "-" else header[3]
+    generation_revision = ""
+    candidate = header[4].lower()
+    if candidate != "-" and len(candidate) in {40, 64} and all(char in "0123456789abcdef" for char in candidate):
+        generation_revision = candidate
+    manifest_root = ""
+    manifest_chunk_rows = 0
+    manifest_chunk_ids: tuple[str, ...] = ()
+    root = header[5].lower()
+    try:
+        rows_per_chunk = int(header[6])
+    except ValueError:
+        return None
+    chunk_ids = () if header[7] == "-" else tuple(part.lower() for part in header[7].split(",") if part)
+    valid_manifest = (
+        len(root) == 64
+        and all(char in "0123456789abcdef" for char in root)
+        and rows_per_chunk > 0
+        and all(len(chunk) == 64 and all(char in "0123456789abcdef" for char in chunk) for chunk in chunk_ids)
+    )
+    if valid_manifest:
+        manifest_root = root
+        manifest_chunk_rows = rows_per_chunk
+        manifest_chunk_ids = chunk_ids
     try:
         declared = int(header[2])
     except ValueError:
@@ -386,7 +583,7 @@ def _parse(text: str) -> tuple[dict[str, tuple[str, str]], dict[str, str]] | Non
     by_path: dict[str, tuple[str, str]] = {}
     terminated = False
     for row in rows:
-        if row == _FORMAT:
+        if row == marker:
             terminated = True
             break
         fields = row.split(_FIELD)
@@ -405,4 +602,12 @@ def _parse(text: str) -> tuple[dict[str, tuple[str, str]], dict[str, str]] | Non
         if not separator:
             return None
         by_blob[oid] = digest
-    return by_path, by_blob
+    return (
+        by_path,
+        by_blob,
+        workspace_fingerprint,
+        generation_revision,
+        manifest_root,
+        manifest_chunk_rows,
+        manifest_chunk_ids,
+    )

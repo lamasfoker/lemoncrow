@@ -26,6 +26,8 @@ against what, and where the receipts live.
 
 The 2026-09-21 SWE-bench Lite hardening pass resolved **10/10** pinned tasks in a LemonCrow-only single-rep run at **$3.2270**, followed by a **2/2** post-ranking-fix smoke on the two targeted ranking cases. These are regression-validation results, not new headline A/B rows: the historical July spot-check did not record its Claude Code CLI version, and the September debugging run used live bind-mounted source while fixes were landing. Raw evidence: [`swe-lite-release-validation_2026-09-21/`](https://github.com/lemoncrow-lab/benchmarks/tree/main/codebench/results/swe-lite-release-validation_2026-09-21) and [`swe-lite-ranking-proof_2026-09-21/`](https://github.com/lemoncrow-lab/benchmarks/tree/main/codebench/results/swe-lite-ranking-proof_2026-09-21). See the [SWE-bench Lite section in BENCHMARKS.md](https://github.com/lemoncrow-lab/lemoncrow/blob/main/BENCHMARKS.md#swe-bench-lite) for the full metrics and caveat.
 
+The 2026-09-25 seven-repo exploration spot-check completed **7/7** in one rep per task at **$1.4634**, **31 turns**, and **246.7s** of summed task runtime. Raw evidence: [`exploration-release-validation_2026-09-25/`](https://github.com/lemoncrow-lab/benchmarks/tree/main/codebench/results/exploration-release-validation_2026-09-25). See the [Exploration Tasks section in BENCHMARKS.md](https://github.com/lemoncrow-lab/lemoncrow/blob/main/BENCHMARKS.md#exploration-tasks) for the per-repo results.
+
 CodeBench now pins **Claude Code 2.1.197** and emits `benchmark-manifest.json` with runtime provenance plus start/end source fingerprints. Future public raw-run uploads should include that manifest; any run marked `runtime_source_changed_during_run: true` is validation/debug evidence only, not a controlled release comparison.
 
 Full per-suite tables, setup notes, and reproduction commands are in
@@ -139,7 +141,7 @@ CODEBENCH_LEMONCROW_AGENT=lemoncrow:auto uv run --project benchmarks python -m b
   --min-changed-files 1 -a baseline lc --reps 5 --model claude-opus-4-8 --jobs 8
 
 # Retrieval evaluation
-uv run lemoncrow eval retrieval --channel lexical --full --resume --csv /tmp/retrieval_mrr.csv
+uv run lemoncrow dev eval retrieval --channel lexical --full --resume --csv /tmp/retrieval_mrr.csv
 
 # Telegraphic Q&A
 uv run lemoncrow benchmark telegraphic --arm baseline --arm lemoncrow --arm caveman --model claude-opus-4-8 --reps 5 --max-turns 50 --jobs 4 -y

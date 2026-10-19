@@ -3,8 +3,6 @@ import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import Swarms from "./Swarms";
 
-const NEW_SPEC_CHOICE = "__new_program_md__";
-
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -247,9 +245,9 @@ describe("Swarms page", () => {
       await screen.findByRole("heading", { name: /launch swarms/i })
     ).toBeInTheDocument();
     expect(await screen.findByText(/project directory/i)).toBeInTheDocument();
-    expect(
-      await screen.findByRole("option", { name: /\/workspace\/project/i })
-    ).toBeInTheDocument();
+    const projectSelect = container.querySelector("#swarm-working-directory");
+    expect(projectSelect).toHaveAttribute("data-value", "/workspace/project");
+    expect(projectSelect).toHaveTextContent("/workspace/project");
     expect(screen.getByText(/swarms working directory:/i)).toBeInTheDocument();
     expect(
       screen.getByText(/project-swarm-worktrees\/<generated-run-id>\//i)
@@ -289,18 +287,13 @@ describe("Swarms page", () => {
     expect(
       await screen.findByRole("heading", { name: /launch swarms/i })
     ).toBeInTheDocument();
-    expect(
-      await screen.findByRole("option", {
-        name: /\+ new file \(program\.md\)/i,
-      })
-    ).toBeInTheDocument();
-
     const specSelect = container.querySelector("#swarm-spec-select");
     expect(specSelect).not.toBeNull();
     if (!specSelect) {
       throw new Error("expected swarm spec select");
     }
-    await userEvent.selectOptions(specSelect, NEW_SPEC_CHOICE);
+    await userEvent.click(specSelect);
+    await userEvent.click(await screen.findByRole("option", { name: /\+ new file \(program\.md\)/i }));
 
     const textarea = await waitFor(() =>
       container.querySelector("#swarm-spec-content")
@@ -316,7 +309,8 @@ describe("Swarms page", () => {
     if (!providerSelect) {
       throw new Error("expected provider select");
     }
-    await userEvent.selectOptions(providerSelect, "openai");
+    await userEvent.click(providerSelect);
+    await userEvent.click(await screen.findByRole("option", { name: "OpenAI API" }));
 
     expect(container.querySelector("#swarm-runner")).toBeNull();
 
@@ -377,10 +371,11 @@ describe("Swarms page", () => {
       container.querySelector("#swarm-spec-select")
     );
     expect(specSelect).not.toBeNull();
-    if (!(specSelect instanceof HTMLSelectElement)) {
-      throw new Error("expected swarm spec select");
+    if (!(specSelect instanceof HTMLButtonElement)) {
+      throw new Error("expected swarm spec combobox");
     }
-    await userEvent.selectOptions(specSelect, NEW_SPEC_CHOICE);
+    await userEvent.click(specSelect);
+    await userEvent.click(await screen.findByRole("option", { name: /\+ new file \(program\.md\)/i }));
 
     const textarea = await waitFor(() =>
       container.querySelector("#swarm-spec-content")
@@ -393,10 +388,11 @@ describe("Swarms page", () => {
 
     const providerSelect = container.querySelector("#swarm-provider");
     expect(providerSelect).not.toBeNull();
-    if (!(providerSelect instanceof HTMLSelectElement)) {
-      throw new Error("expected provider select");
+    if (!(providerSelect instanceof HTMLButtonElement)) {
+      throw new Error("expected provider combobox");
     }
-    await userEvent.selectOptions(providerSelect, "openai");
+    await userEvent.click(providerSelect);
+    await userEvent.click(await screen.findByRole("option", { name: "OpenAI API" }));
 
     const apiKeyInput = await waitFor(() =>
       container.querySelector("#swarm-provider-api-key")

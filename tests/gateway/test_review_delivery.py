@@ -16,6 +16,7 @@ from lemoncrow.pro.capabilities.review.delivery import (
     mark_feedback_addressed,
 )
 from lemoncrow.pro.capabilities.review.session_inbox import claim_session_messages
+from lemoncrow.pro.capabilities.review.store import AnnotationVersionConflict
 
 SESSION = "11111111-2222-4333-8444-555555555555"
 
@@ -69,7 +70,8 @@ def test_delivery_resumes_and_verifies_the_exact_session(monkeypatch: pytest.Mon
 
     monkeypatch.setattr(subprocess, "run", run)
     result = deliver_to_claude_session(SESSION, tmp_path, "review feedback")
-    assert result.sent is True
+    assert result.state == "working"
+    assert result.sent is False
     assert result.remote_ref == "deadbeef"
     assert result.target_ref == f"claude:{SESSION}"
     assert agents_calls == 2
@@ -119,16 +121,101 @@ def test_delivery_stops_a_copy_instead_of_claiming_success(monkeypatch: pytest.M
 
 
 def test_delivery_fails_when_claude_is_missing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setattr("shutil.which", lambda _name: None)
+    monkeypatch.setattr(review_delivery, "host_executable", lambda _name: None)
     result = deliver_to_claude_session(SESSION, tmp_path, "review feedback")
     assert result.state == "failed"
     assert "not installed" in result.message
+
+
+def test_opencode_delivery_queues_when_exact_session_is_active(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from lemoncrow.core.foundation.paths import resolve_workspace_store_dir
+    from lemoncrow.pro.capabilities.review.session_inbox import claim_session_messages
+
+    store_root = tmp_path / "store"
+    monkeypatch.setenv("LEMONCROW_ROOT", str(store_root))
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/opencode" if name == "opencode" else None)
+    state_path = resolve_workspace_store_dir(workspace_root=tmp_path) / "session_state.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps({"host": "opencode", "session_id": SESSION, "activity": "active"}),
+        encoding="utf-8",
+    )
+
+    def forbidden_popen(*_args: object, **_kwargs: object):
+        raise AssertionError("active OpenCode delivery must not spawn a second process")
+
+    monkeypatch.setattr(subprocess, "Popen", forbidden_popen)
+    result = deliver_to_agent_session("opencode", SESSION, tmp_path, "review feedback")
+
+    assert result.state == "queued"
+    assert result.accepted is True
+    assert result.remote_ref.startswith("inbox:msg-")
+    (queued,) = claim_session_messages(store_root, host="opencode", session_id=SESSION)
+    assert "Human review feedback from LemonCrow" in queued.message
+    assert "review feedback" in queued.message
+
+
+def test_lemoncode_delivery_queues_when_exact_session_is_active(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from lemoncrow.core.foundation.paths import resolve_workspace_store_dir
+    from lemoncrow.pro.capabilities.review.session_inbox import claim_session_messages
+
+    store_root = tmp_path / "store"
+    monkeypatch.setenv("LEMONCROW_ROOT", str(store_root))
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/lemoncode" if name == "lemoncode" else None)
+    state_path = resolve_workspace_store_dir(workspace_root=tmp_path) / "session_state.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps({"host": "lemoncode", "session_id": SESSION, "activity": "active"}),
+        encoding="utf-8",
+    )
+
+    def forbidden_popen(*_args: object, **_kwargs: object):
+        raise AssertionError("active LemonCode delivery must not spawn a second process")
+
+    monkeypatch.setattr(subprocess, "Popen", forbidden_popen)
+    result = deliver_to_agent_session("lemoncode", SESSION, tmp_path, "review feedback")
+
+    assert result.state == "queued"
+    assert result.accepted is True
+    (queued,) = claim_session_messages(store_root, host="lemoncode", session_id=SESSION)
+    assert "review feedback" in queued.message
+
+
+def test_copilot_delivery_queues_into_exact_working_session(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from lemoncrow.core.foundation.paths import resolve_workspace_store_dir
+
+    store_root = tmp_path / "store"
+    monkeypatch.setenv("LEMONCROW_ROOT", str(store_root))
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/copilot" if name == "copilot" else None)
+    state_path = resolve_workspace_store_dir(workspace_root=tmp_path) / "session_state.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps({"host": "copilot", "session_id": SESSION, "activity": "working"}),
+        encoding="utf-8",
+    )
+
+    def forbidden_popen(*_args: object, **_kwargs: object):
+        raise AssertionError("working Copilot delivery must wait for the in-process agentStop continuation")
+
+    monkeypatch.setattr(subprocess, "Popen", forbidden_popen)
+    result = deliver_to_agent_session("copilot", SESSION, tmp_path, "review feedback")
+
+    assert result.state == "queued"
+    assert result.accepted is True
+    assert result.remote_ref.startswith("inbox:msg-")
+    assert "agentStop" in result.message
+    (queued,) = claim_session_messages(store_root, host="copilot", session_id=SESSION)
+    assert "Human review feedback from LemonCrow" in queued.message
+    assert "review feedback" in queued.message
 
 
 @pytest.mark.parametrize(
     ("host", "expected"),
     (
         ("opencode", ["/usr/bin/opencode", "run", "--session"]),
+        ("lemoncode", ["/usr/bin/lemoncode", "run", "--session"]),
         ("copilot", ["/usr/bin/copilot", f"--resume={SESSION}"]),
     ),
 )
@@ -150,10 +237,47 @@ def test_generic_delivery_uses_exact_session_resume_flags(
 
     monkeypatch.setattr(subprocess, "Popen", popen)
     result = deliver_to_agent_session(host, SESSION, tmp_path, "review feedback")
-    assert result.state == "sent"
+    assert result.state == "working"
+    assert "consumption is still in flight" in result.message
     assert result.target_ref == f"{host}:{SESSION}"
     assert seen[: len(expected)] == expected
     assert any(SESSION in token for token in seen)
+    # SL-3: the reviewed checkout may be untrusted; the host keeps its normal approvals.
+    assert not {"--dangerously-skip-permissions", "--allow-all", "--auto"} & set(seen)
+
+
+@pytest.mark.parametrize("host", ("codex", "opencode", "lemoncode"))
+def test_delivery_never_disables_host_approvals_or_sandbox(
+    host: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from lemoncrow.pro.capabilities.review import delivery
+
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}" if name == host else None)
+    seen: list[list[str]] = []
+
+    class FakeProcess:
+        pid = 4242
+
+        def wait(self, timeout: float) -> int:
+            raise subprocess.TimeoutExpired([], timeout)
+
+        def poll(self) -> int:
+            return 0
+
+    def popen(args: list[str], **_kwargs: object) -> FakeProcess:
+        seen.append(list(args))
+        return FakeProcess()
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    delivery.deliver_to_agent_session(host, SESSION, tmp_path, "review feedback")
+    delivery.launch_agent_session(host, tmp_path, "review feedback", log_dir=tmp_path / "logs", wait_s=0)
+
+    assert len(seen) == 2
+    for argv in seen:
+        assert not [arg for arg in argv if arg.startswith("--dangerously") or arg in {"--allow-all", "--auto"}]
+        if host == "codex":
+            assert "sandbox_workspace_write.network_access=false" in argv
+            assert "workspace-write" in argv or 'sandbox_mode="workspace-write"' in argv
 
 
 def test_codex_delivery_resumes_the_exact_thread_instead_of_queueing(
@@ -181,7 +305,7 @@ def test_codex_delivery_resumes_the_exact_thread_instead_of_queueing(
     monkeypatch.setattr(subprocess, "Popen", popen)
     result = deliver_to_agent_session("codex", SESSION, tmp_path, "review feedback")
 
-    assert result.state == "sent"
+    assert result.state == "working"
     assert seen[:3] == ["/usr/bin/codex", "exec", "resume"]
     assert "queue" not in seen
     assert SESSION in seen
@@ -195,7 +319,7 @@ def test_generic_prompt_delivery_does_not_inject_review_feedback_instructions(
     seen: list[str] = []
 
     class FakeProcess:
-        pid = 4242
+        pid = 4343
 
         def wait(self, timeout: float) -> int:
             raise subprocess.TimeoutExpired(seen, timeout)
@@ -207,9 +331,10 @@ def test_generic_prompt_delivery_does_not_inject_review_feedback_instructions(
     monkeypatch.setattr(subprocess, "Popen", popen)
     result = deliver_prompt_to_agent_session("codex", SESSION, tmp_path, "Inspect src/a.py:L3")
 
-    assert result.state == "sent"
+    assert result.state == "working"
     assert "feedback" not in result.message.lower()
     assert "prompt" in result.message.lower()
+    assert seen[:3] == ["/usr/bin/codex", "exec", "resume"]
     assert "Inspect src/a.py:L3" in seen
     assert not any("Human review feedback from LemonCrow" in token for token in seen)
 
@@ -230,6 +355,7 @@ class FakeReviewStore:
         delivered_to: str = SESSION,
         state: str = "open",
         delivery_state: str = "sent",
+        advance_version_on_enter: bool = False,
     ) -> None:
         self.annotation = SimpleNamespace(
             id="ann-1",
@@ -247,8 +373,13 @@ class FakeReviewStore:
             target_ref=f"claude:{delivered_to}",
             state=delivery_state,
             annotation_version=1,
+            revision_id="rrv-delivered",
         )
+        self.current_version = 1
+        self.advance_version_on_enter = advance_version_on_enter
         self.updated: dict[str, object] = {}
+        self.history: object = None
+        self.conflict_on_update = False
 
     def get_annotation(self, annotation_id: str):
         return self.annotation if annotation_id == self.annotation.id else None
@@ -260,13 +391,31 @@ class FakeReviewStore:
         return (self.delivery,) if annotation_id == self.annotation.id else ()
 
     def list_annotation_versions(self, annotation_id: str):
-        return (SimpleNamespace(version_number=1),) if annotation_id == self.annotation.id else ()
+        return (SimpleNamespace(version_number=self.current_version),) if annotation_id == self.annotation.id else ()
 
     def latest_revision(self, review_id: str):
-        return SimpleNamespace(id="rrv-1") if review_id == self.annotation.review_id else None
+        return SimpleNamespace(id="rrv-latest") if review_id == self.annotation.review_id else None
+
+    def atomic_review_transition(self):
+        store = self
+
+        class _Transition:
+            def __enter__(self):
+                if store.advance_version_on_enter:
+                    store.current_version += 1
+                return None
+
+            def __exit__(self, _exc_type, _exc, _tb):
+                return False
+
+        return _Transition()
 
     def update_annotation(self, annotation_id: str, history=None, /, **fields: object):
+
         assert annotation_id == self.annotation.id
+        self.history = history
+        if self.conflict_on_update:
+            raise AnnotationVersionConflict("edited between validation and write")
         self.updated = fields
         values = vars(self.annotation).copy()
         values.update(fields)
@@ -289,6 +438,20 @@ def test_author_addressed_claim_never_resolves_the_human_comment(tmp_path: Path,
     assert updated.author_response_source_id == SESSION
     assert updated.author_response_at
     assert "state" not in store.updated
+
+
+def test_author_claim_is_bound_to_the_delivered_version(tmp_path: Path) -> None:
+    store = FakeReviewStore(tmp_path)
+    mark_feedback_addressed(store, tmp_path, ["ann-1"], host="claude", session_id=SESSION)
+    assert store.history.expected_version  # type: ignore[attr-defined] == store.delivery.annotation_version
+
+
+def test_an_edit_racing_the_claim_invalidates_it(tmp_path: Path) -> None:
+    store = FakeReviewStore(tmp_path)
+    store.conflict_on_update = True
+    with pytest.raises(ValueError, match="changed after delivery"):
+        mark_feedback_addressed(store, tmp_path, ["ann-1"], host="claude", session_id=SESSION)
+    assert store.updated == {}
 
 
 def test_author_cannot_address_a_comment_the_human_already_resolved(tmp_path: Path) -> None:
@@ -324,3 +487,261 @@ def test_mcp_addressed_tool_is_an_author_claim_not_a_resolution(
     assert result["note"].endswith("remains open until the reviewer resolves it")
     assert seen["session_id"] == SESSION
     assert seen["host"] == "claude"
+
+
+def test_session_inbox_lease_ack_and_stale_recovery(tmp_path: Path) -> None:
+    import os
+    import time
+
+    from lemoncrow.pro.capabilities.review.session_inbox import (
+        ack_session_messages,
+        enqueue_session_message,
+        lease_session_messages,
+    )
+
+    root = tmp_path / "store"
+    first = enqueue_session_message(root, host="opencode", session_id=SESSION, message="recoverable feedback")
+    leased = lease_session_messages(root, host="opencode", session_id=SESSION, lease_timeout_s=60)
+    assert [item.id for item in leased] == [first.id]
+    assert lease_session_messages(root, host="opencode", session_id=SESSION, lease_timeout_s=60) == ()
+
+    inflight = root / "review" / "session-inbox" / "opencode" / SESSION / "inflight" / f"{first.id}.json"
+    old = time.time() - 120
+    os.utime(inflight, (old, old))
+    recovered = lease_session_messages(root, host="opencode", session_id=SESSION, lease_timeout_s=1)
+    assert [item.id for item in recovered] == [first.id]
+
+    ack_session_messages(
+        root,
+        host="opencode",
+        session_id=SESSION,
+        message_ids=[first.id],
+    )
+    assert lease_session_messages(root, host="opencode", session_id=SESSION, lease_timeout_s=1) == ()
+    retry = enqueue_session_message(root, host="opencode", session_id=SESSION, message="recoverable feedback")
+    assert retry.id == first.id
+    assert lease_session_messages(root, host="opencode", session_id=SESSION, lease_timeout_s=1) == ()
+
+
+def test_session_inbox_ack_is_a_durable_review_consumption_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from lemoncrow.pro.capabilities.review.session_inbox import (
+        ack_session_messages,
+        enqueue_session_message,
+        lease_session_messages,
+    )
+    from lemoncrow.pro.capabilities.review.store import ReviewStore
+
+    root = tmp_path / "store"
+    seen: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        ReviewStore,
+        "acknowledge_delivery_remote_refs",
+        lambda _self, refs: seen.append(tuple(refs)) or len(tuple(refs)),
+    )
+    message = enqueue_session_message(root, host="claude", session_id=SESSION, message="consume me")
+    assert [item.id for item in lease_session_messages(root, host="claude", session_id=SESSION)] == [message.id]
+
+    ack_session_messages(root, host="claude", session_id=SESSION, message_ids=[message.id])
+
+    assert seen == [(f"inbox:{message.id}",)]
+
+
+def test_session_inbox_release_returns_failed_hook_lease_to_pending(tmp_path: Path) -> None:
+    from lemoncrow.pro.capabilities.review.session_inbox import (
+        enqueue_session_message,
+        lease_session_messages,
+        release_session_messages,
+    )
+
+    root = tmp_path / "store"
+    first = enqueue_session_message(root, host="claude", session_id=SESSION, message="retry after hook failure")
+    leased = lease_session_messages(root, host="claude", session_id=SESSION)
+    assert [item.id for item in leased] == [first.id]
+    release_session_messages(root, host="claude", session_id=SESSION, message_ids=[first.id])
+    retry = lease_session_messages(root, host="claude", session_id=SESSION)
+    assert [item.id for item in retry] == [first.id]
+
+
+def test_session_inbox_retry_after_claim_is_not_redelivered(tmp_path: Path) -> None:
+    from lemoncrow.pro.capabilities.review.session_inbox import enqueue_session_message
+
+    root = tmp_path / "store"
+    first = enqueue_session_message(root, host="opencode", session_id=SESSION, message="same exact feedback")
+    claimed = claim_session_messages(root, host="opencode", session_id=SESSION)
+    assert [item.id for item in claimed] == [first.id]
+
+    retry = enqueue_session_message(root, host="opencode", session_id=SESSION, message="same exact feedback")
+    assert retry.id == first.id
+    assert claim_session_messages(root, host="opencode", session_id=SESSION) == ()
+
+
+def test_session_inbox_concurrent_same_payload_enqueue_is_idempotent(tmp_path: Path) -> None:
+    import threading
+
+    from lemoncrow.pro.capabilities.review.session_inbox import enqueue_session_message
+
+    root = tmp_path / "store"
+    results: list[str] = []
+    failures: list[BaseException] = []
+
+    def write() -> None:
+        try:
+            results.append(
+                enqueue_session_message(
+                    root,
+                    host="opencode",
+                    session_id=SESSION,
+                    message="one semantic payload",
+                ).id
+            )
+        except BaseException as exc:  # pragma: no cover - asserted empty below
+            failures.append(exc)
+
+    threads = [threading.Thread(target=write) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert failures == []
+    assert len(results) == 8
+    assert len(set(results)) == 1
+    claimed = claim_session_messages(root, host="opencode", session_id=SESSION)
+    assert len(claimed) == 1
+
+
+def test_session_inbox_enqueue_and_claim_race_delivers_semantic_message_once(tmp_path: Path) -> None:
+    import threading
+    import time
+
+    from lemoncrow.pro.capabilities.review.session_inbox import enqueue_session_message
+
+    root = tmp_path / "store"
+    delivered: list[str] = []
+    failures: list[BaseException] = []
+    start = threading.Barrier(3)
+
+    def producer() -> None:
+        try:
+            start.wait()
+            for _ in range(100):
+                enqueue_session_message(root, host="opencode", session_id=SESSION, message="one race-safe payload")
+        except BaseException as exc:  # pragma: no cover - asserted empty below
+            failures.append(exc)
+
+    def consumer() -> None:
+        try:
+            start.wait()
+            for _ in range(100):
+                delivered.extend(item.id for item in claim_session_messages(root, host="opencode", session_id=SESSION))
+                time.sleep(0)
+        except BaseException as exc:  # pragma: no cover - asserted empty below
+            failures.append(exc)
+
+    threads = [threading.Thread(target=producer), threading.Thread(target=consumer)]
+    for thread in threads:
+        thread.start()
+    start.wait()
+    for thread in threads:
+        thread.join()
+    delivered.extend(item.id for item in claim_session_messages(root, host="opencode", session_id=SESSION))
+
+    assert failures == []
+    assert len(delivered) == 1
+    assert len(set(delivered)) == 1
+
+
+# ----- new agent sessions (review handoff spec, phase 2) ----- #
+
+
+def _fake_cli(bin_dir: Path, name: str, script: str) -> None:
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    path = bin_dir / name
+    path.write_text("#!/bin/sh\n" + script, encoding="utf-8")
+    path.chmod(0o755)
+
+
+def test_a_new_codex_session_reports_its_thread_id(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    _fake_cli(bin_dir, "codex", 'echo \'{"type":"thread.started","thread_id":"thread-42"}\'\nsleep 2\n')
+    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+    logs = tmp_path / "logs"
+
+    result = review_delivery.launch_agent_session(
+        "codex", tmp_path, "review feedback", delivery_id="fop-1:abc", log_dir=logs
+    )
+
+    assert result.state == "working"
+    assert result.session_id == "thread-42"
+    assert result.target_ref == "codex:thread-42"
+    assert list(logs.iterdir()) == [], "the launch log is unlinked once the id is known"
+
+
+def test_a_new_session_that_never_reports_an_id_is_uncertain_not_relaunched(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    bin_dir = tmp_path / "bin"
+    _fake_cli(bin_dir, "opencode", "sleep 2\n")
+    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+
+    result = review_delivery.launch_agent_session(
+        "opencode", tmp_path, "review feedback", log_dir=tmp_path / "logs", wait_s=0.3
+    )
+
+    assert result.state == "uncertain"
+    assert result.session_id == ""
+    assert result.remote_ref.startswith("pid:")
+
+
+def test_a_new_session_that_exits_early_fails_cleanly(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    _fake_cli(bin_dir, "codex", "exit 3\n")
+    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+
+    result = review_delivery.launch_agent_session("codex", tmp_path, "review feedback", log_dir=tmp_path / "logs")
+
+    assert result.state == "failed"
+    assert "status 3" in result.message
+
+
+def test_a_new_claude_session_uses_the_chosen_id(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    argv_log = tmp_path / "argv"
+    _fake_cli(bin_dir, "claude", f'printf "%s\\n" "$@" > {argv_log}\necho "started 1a2b3c4d"\n')
+    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+    chosen = review_delivery.new_session_id("claude", "review-1\0rev-1\0ann-1")
+
+    result = review_delivery.launch_agent_session(
+        "claude", tmp_path, "review feedback", session_id=chosen, log_dir=tmp_path / "logs"
+    )
+
+    assert result.state == "working"
+    assert result.session_id == chosen
+    assert result.target_ref == f"claude:{chosen}"
+    argv = argv_log.read_text(encoding="utf-8").splitlines()
+    assert argv[:3] == ["--bg", "--session-id", chosen]
+    assert chosen == review_delivery.new_session_id("claude", "review-1\0rev-1\0ann-1"), "deterministic"
+
+
+def test_copilot_is_not_offered_for_new_sessions(tmp_path: Path) -> None:
+    supported, reason = review_delivery.new_session_supported("copilot")
+    assert supported is False
+    assert "session id" in reason
+
+
+def test_running_claude_sessions_are_limited_to_this_worktree(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    here = tmp_path / "repo"
+    here.mkdir()
+    elsewhere = tmp_path / "other"
+    elsewhere.mkdir()
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/claude" if name == "claude" else None)
+    listing = [
+        {"sessionId": "here-1", "cwd": str(here), "kind": "background", "state": "working"},
+        {"sessionId": "here-done", "cwd": str(here), "kind": "background", "state": "done"},
+        {"sessionId": "other-1", "cwd": str(elsewhere), "kind": "background", "state": "working"},
+    ]
+    monkeypatch.setattr(subprocess, "run", lambda *_a, **_k: _completed(stdout=json.dumps(listing)))
+
+    assert review_delivery.running_claude_sessions(here) == (("here-1", "working"),)

@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import os
+import sys
+import threading
 from collections.abc import Iterator
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from unittest.mock import patch
 
 import pytest
@@ -12,6 +15,86 @@ import pytest
 if TYPE_CHECKING:
     from lemoncrow.core.runtime import LemonCrowRuntimeCore
     from lemoncrow.infra.storage.bundle import StoreBundle
+
+# Project rule for every agent and person: verify a change with the tests it
+# touches, never the whole suite. The largest single test file is ~350 tests,
+# so this passes any focused file list and refuses tests/, tests/core and
+# tests/gateway. Counted after -k/-m/--lf/--deselect, so filters stay usable.
+FOCUSED_TEST_LIMIT = 1000
+FULL_SUITE_OPT_IN = "LEMONCROW_FULL_SUITE"
+
+
+def pytest_collection_finish(session: pytest.Session) -> None:
+    # xdist workers each collect everything; their controller refuses once, cleanly.
+    if not hasattr(session.config, "workerinput"):
+        enforce_focused_run(session.config, len(session.items))
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_xdist_node_collection_finished(node: Any, ids: list[str]) -> None:
+    enforce_focused_run(node.config, len(ids))
+
+
+def enforce_focused_run(config: pytest.Config, count: int) -> None:
+    if count <= FOCUSED_TEST_LIMIT or config.option.collectonly or os.environ.get(FULL_SUITE_OPT_IN) == "1":
+        return
+    pytest.exit(
+        f"Refusing to run {count} tests (limit {FOCUSED_TEST_LIMIT}). Run only the test files your change "
+        f"touches. Coding agents must never opt in; a person runs the whole suite with {FULL_SUITE_OPT_IN}=1 "
+        "on that one command.",
+        returncode=pytest.ExitCode.USAGE_ERROR,
+    )
+
+
+# Longest a test waits for the worker tick it started before failing it as a leak.
+WORKER_TICK_JOIN_S = 120.0
+_MCP_SERVER = "lemoncrow.gateway.adapters.mcp_server"
+
+
+def _worker_tick_thread() -> Any:
+    return getattr(sys.modules.get(_MCP_SERVER), "_worker_tick_thread", None)
+
+
+@pytest.fixture(autouse=True)
+def _the_worker_tick_stays_in_the_test_that_started_it(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """An MCP tool call starts the worker tick (``mcp_server._spawn_worker_if_idle``): a daemon
+    thread that drains jobs, then runs the maintenance duties, whose subprocesses import the host's
+    real agent sessions for up to 300s. In a test that background tick skips the duties (their own
+    tests call ``run_maintenance_tick`` on their own thread) and the test that started it joins it,
+    so it never runs inside a later test, one that patches the process-global ``subprocess.Popen``
+    for instance."""
+    from lemoncrow.core.service import maintenance_tick
+
+    real = maintenance_tick.run_maintenance_tick
+
+    def run_unless_background_tick(*args: Any, **kwargs: Any) -> Any:
+        if threading.current_thread() is _worker_tick_thread():
+            return {"ran": False, "reason": "background worker tick in a test"}
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(maintenance_tick, "run_maintenance_tick", run_unless_background_tick)
+    before = _worker_tick_thread()
+    yield
+    thread = _worker_tick_thread()
+    if thread is None or thread is before:
+        return
+    thread.join(WORKER_TICK_JOIN_S)
+    if thread.is_alive():
+        pytest.fail(f"the MCP worker tick this test started is still running after {WORKER_TICK_JOIN_S:.0f}s")
+
+
+@pytest.fixture(autouse=True)
+def _no_real_browser(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never launch a desktop browser from tests; print the URL instead."""
+    import webbrowser
+
+    monkeypatch.setenv("LEMONCROW_NO_BROWSER", "1")
+
+    def _print_url(url: str, *args: object, **kwargs: object) -> bool:
+        print(f"[test] browser open suppressed: {url}")
+        return True
+
+    monkeypatch.setattr(webbrowser, "open", _print_url)
 
 
 @pytest.fixture(autouse=True)
@@ -39,6 +122,34 @@ def _isolate_workspace_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> I
     # tests to the product's documented fallback host; host-detection tests
     # explicitly override or remove this value.
     monkeypatch.setenv("LEMONCROW_AGENT", "claude")
+    # Ordinary tests are not running inside a coding agent's session even when
+    # the developer's agent launched pytest; tests of agent-only behavior set
+    # these explicitly.
+    from lemoncrow.core.foundation.paths import AGENT_SESSION_ENVS
+
+    for env_var, _host in AGENT_SESSION_ENVS:
+        monkeypatch.delenv(env_var, raising=False)
+    # Knobs a host session injects into every child process (Claude Code's own
+    # CLAUDE_CODE_*, and the LemonCrow plugin's runtime tuning). Left in place
+    # they narrow the tool surface, skip verification paths or change hook
+    # output for whoever launched pytest; tests of those knobs set them.
+    for env_var in list(os.environ):
+        if env_var.startswith("CLAUDE_CODE_"):
+            monkeypatch.delenv(env_var, raising=False)
+    for env_var in (
+        "CLAUDE_PROJECT_DIR",
+        "LEMONCROW_MCP_TOOL_PROFILE",
+        "LEMONCROW_TELEGRAPHIC",
+        "LEMONCROW_HEADROOM_MCP_TAIL_MODE",
+        "LEMONCROW_HEADROOM_TAIL_STATS",
+        "LEMONCROW_VERIFY_SKIP_PATHS",
+        "LEMONCROW_AUTO_UPDATE",
+        "LEMONCROW_UPDATE_CHECK",
+        "LEMONCROW_REVIEW_CARRY",
+        "LEMONCROW_REVIEW_SHARED_BASE",
+        "LEMONCROW_REVIEW_CI_EQUIVALENCE",
+    ):
+        monkeypatch.delenv(env_var, raising=False)
     # Point host-transcript discovery at an isolated, empty dir. Savings/recall/
     # statusline code falls back to the developer's real ~/.claude/projects when
     # CLAUDE_CONFIG_DIR is unset, so an in-process test would replay every real
@@ -71,13 +182,26 @@ def _no_external_search_in_tests(monkeypatch: pytest.MonkeyPatch) -> Iterator[No
     constructor arguments.
     """
     from lemoncrow.infra.embeddings.factory import make_code_embedder
+    from lemoncrow.pro.capabilities.cross_vendor_routing.configuration import _detect_configured_vendors_cached
 
     make_code_embedder.cache_clear()
+    # Vendor detection is cached per process because a real process's env is
+    # fixed; tests set vendor keys per test, so an earlier test must not freeze it.
+    _detect_configured_vendors_cached.cache_clear()
     monkeypatch.setenv("LEMONCROW_ZOEKT_LOC_THRESHOLD", "100000000")
     monkeypatch.setenv("LEMONCROW_CODE_AUTOSYNC", "0")
     monkeypatch.setenv("LEMONCROW_CODE_EMBEDDER", "null")
     yield
     make_code_embedder.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _live_review_prewarm_includes_tmp(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fixture repos live under tmp_path, which live Review prewarm skips as scratch.
+
+    ``always`` keeps prewarm testable there; tests of the temp skip unset it.
+    """
+    monkeypatch.setenv("LEMONCROW_LIVE_REVIEW_PREWARM", "always")
 
 
 @pytest.fixture(autouse=True)
@@ -126,44 +250,32 @@ def store(tmp_path: Path) -> StoreBundle:
     return store
 
 
-# --- Engine availability ----------------------------------------------------
-# The engine is the entire ``src/lemoncrow/pro/`` package. Its source is
-# published (Apache-2.0, like the rest of the tree) and present in every
-# checkout, so every test runs against the real modules and nothing below fires.
-#
-# The guard below is a defensive net for an install that lacks the engine
-# entirely (e.g. a wheel built with ``pro`` stripped): pro-importing test
-# modules are deselected at collection time so pytest reports skips instead of
-# erroring on import.
-
-
-def _pro_importable() -> bool:
-    """True when the compiled engine (``lemoncrow.pro``) can be imported."""
+# --- Private code-intelligence availability ---------------------------------
+# Runtime Lite, local Review and the public contracts are OSS. The advanced
+# CodeContextEngine is supplied only by the private enterprise/runtime
+# distribution. Its regression tests live in tests/private/ (mirror-denied and
+# skipped there when the provider is absent). A public-surface test that needs
+# the engine for one case carries the explicit ``private_engine`` marker;
+# every other public test must import and pass with enterprise packages absent,
+# so a stray private import fails loudly instead of being skipped by content.
+def _private_code_intelligence_importable() -> bool:
     import importlib.util
 
     try:
-        return importlib.util.find_spec("lemoncrow.pro") is not None
+        return importlib.util.find_spec("lemoncrow_enterprise_runtime.code_intelligence.provider") is not None
     except (ImportError, ValueError):
         return False
 
 
-_PRO_AVAILABLE = _pro_importable()
+_PRIVATE_CODE_INTEL_AVAILABLE = _private_code_intelligence_importable()
 
 
-def pytest_ignore_collect(collection_path: Path) -> bool | None:
-    """Skip collecting test modules that import the engine when it is absent.
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Skip ``private_engine`` tests when enterprise/runtime is absent."""
 
-    No-op when ``lemoncrow.pro`` is importable (always, in this private repo).
-    On a source-only public checkout it prevents a wall of collection-time
-    ImportErrors by declining to collect any ``test_*.py`` that references
-    ``lemoncrow.pro``. Self-maintaining: no static file list to keep in sync.
-    """
-    if _PRO_AVAILABLE:
-        return None
-    if collection_path.suffix != ".py" or not collection_path.name.startswith("test_"):
-        return None
-    try:
-        source = collection_path.read_text(encoding="utf-8")
-    except OSError:
-        return None
-    return "lemoncrow.pro" in source or None
+    if _PRIVATE_CODE_INTEL_AVAILABLE:
+        return
+    skip = pytest.mark.skip(reason="requires the private code-intelligence engine (enterprise/runtime)")
+    for item in items:
+        if item.get_closest_marker("private_engine") is not None:
+            item.add_marker(skip)

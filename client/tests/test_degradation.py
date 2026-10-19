@@ -75,16 +75,34 @@ def test_an_unreachable_server_produces_exactly_one_visible_line(
     assert "server_unreachable" in report.reason
 
 
-def test_read_falls_back_to_disk_and_is_flagged_degraded(unreachable_config: ClientConfig) -> None:
-    """The one row of the table with a local answer, and it says so."""
+def test_a_degraded_answer_carries_one_visible_line_saying_why() -> None:
+    from lemoncrow_client.dispatcher import ToolOutcome
+
+    rendered = ToolOutcome(
+        content=({"type": "text", "text": "relations ok"},), degraded=True, degraded_reason="link:building"
+    ).to_mcp()
+    assert [block["text"] for block in rendered["content"]] == ["relations ok", "! degraded: link:building"]
+    assert rendered["_meta"]["lemoncrow/degraded_reason"] == "link:building"
+
+    already = ToolOutcome(
+        content=({"type": "text", "text": "hits\n\n! degraded: semantic:building"},),
+        degraded=True,
+        degraded_reason="semantic:building",
+    ).to_mcp()
+    assert len(already["content"]) == 1  # code_search renders its own line; never twice
+    assert "_meta" not in ToolOutcome(content=({"type": "text", "text": "ok"},)).to_mcp()
+
+
+def test_ordinary_read_stays_local_when_server_is_unreachable(unreachable_config: ClientConfig) -> None:
+    """Standard file reads execute locally from disk without degrading."""
     session = RemoteSession(unreachable_config)
     session.bootstrap(deadline_s=2.0)
     outcome = Dispatcher(unreachable_config, session).call("read", {"files": ["pkg/alpha.py"]})
     assert not outcome.is_error
-    assert outcome.degraded
-    assert outcome.site == "client_offline_fallback"
+    assert not outcome.degraded
+    assert outcome.site == "client"
     assert "def alpha" in outcome.content[0]["text"]
-    assert outcome.to_mcp()["_meta"]["lemoncrow/degraded"] is True
+    assert "_meta" not in outcome.to_mcp() or not outcome.to_mcp().get("_meta", {}).get("lemoncrow/degraded")
 
 
 def test_online_absolute_read_stays_local(
@@ -131,6 +149,43 @@ def test_every_other_server_tool_refuses_with_a_typed_error(
     assert payload["retryable"] is True
 
 
+def test_a_directory_outside_git_is_never_indexed_and_says_so(
+    stub: StubServer, tmp_path: Path, state_dir: Path
+) -> None:
+    """A plain folder (a home, a folder of projects) opens no view and uploads nothing."""
+    from conftest import make_config
+
+    plain = tmp_path / "projects"
+    (plain / "nested").mkdir(parents=True)
+    (plain / "nested" / "alpha.py").write_text("def alpha():\n    return 1\n", encoding="utf-8")
+    config = make_config(url=stub.url, worktree=plain, state_dir=state_dir)
+    session = RemoteSession(config)
+    report = session.bootstrap(deadline_s=10.0)
+    assert report.ok and session.bootstrapped and not session.indexed
+    assert stub.state.view_id == "" and not stub.state.blobs and not stub.state.manifest
+    line = report.one_line(config.url)
+    assert line.count("\n") == 0 and "is not a git repository" in line
+
+    dispatcher = Dispatcher(config, session)
+    for tool, arguments in (
+        ("code_search", {"query": "alpha"}),
+        ("search", {"query": "alpha"}),
+        ("relations", {"path": "nested/alpha.py"}),
+        ("index", {}),
+    ):
+        outcome = dispatcher.call(tool, arguments)
+        assert outcome.is_error, tool
+        payload = json.loads(outcome.content[0]["text"].splitlines()[-1])
+        assert payload["code"] == ErrorCode.NOT_INDEXED.value, tool
+        assert payload["retryable"] is False
+        assert payload["action"] == "use_client_tool"
+        assert "not a git repository" in payload["message"]
+    read = dispatcher.call("read", {"files": ["nested/alpha.py"]})
+    assert not read.is_error and not read.degraded and read.site == "client"
+    assert "def alpha" in read.content[0]["text"]
+    assert stub.state.tool_calls == []
+
+
 def test_index_refuses_rather_than_building_one_locally(unreachable_config: ClientConfig) -> None:
     session = RemoteSession(unreachable_config)
     session.bootstrap(deadline_s=2.0)
@@ -139,33 +194,62 @@ def test_index_refuses_rather_than_building_one_locally(unreachable_config: Clie
     assert "never builds a local index" in outcome.content[0]["text"]
 
 
-def test_nothing_in_the_package_can_build_a_local_index() -> None:
-    """A structural check behind the behavioural one.
+#: The hosted thin-client execution path. It must never reach Runtime Lite,
+#: whose repo-local index is a separate, local-only execution boundary.
+_THIN_CLIENT_MODULES = frozenset({"mcpserver.py", "dispatcher.py", "session.py"})
 
-    An index needs somewhere to put itself. The package imports no persistence
-    module and no numeric or model runtime anywhere except the ``sql`` tool's
-    engine (``kit/sql.py``), which connects to the *developer's own* database
-    and, on a read, creates nothing; and it issues no DDL at all.
-    """
+
+def _imports(path: Path) -> tuple[set[str], set[str]]:
+    """Top-level absolute imports, and relative/absolute package-local imports."""
     import ast
 
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    absolute: set[str] = set()
+    local: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            absolute |= {alias.name.split(".")[0] for alias in node.names}
+            local |= {alias.name for alias in node.names if alias.name.startswith("lemoncrow_client.")}
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if node.level == 0:
+                absolute.add(module.split(".")[0])
+                if module.startswith("lemoncrow_client."):
+                    local.add(module.removeprefix("lemoncrow_client."))
+            else:
+                local.add(module)
+                local |= {alias.name for alias in node.names if not module}
+    return absolute, local
+
+
+def test_nothing_in_the_thin_client_can_build_a_local_index() -> None:
+    """A structural check behind the behavioural one.
+
+    An index needs somewhere to put itself. Outside Runtime Lite (``lite/``,
+    whose repo-local index is its purpose and which never talks to a server),
+    the package imports no persistence module and no numeric or model runtime
+    except the ``sql`` tool's engine (``kit/sql.py``), which connects to the
+    *developer's own* database and, on a read, creates nothing; and it issues no
+    DDL at all. The thin-client execution path never imports Lite.
+    """
     persistence = {"sqlite3", "dbm", "shelve", "pickle", "marshal", "numpy", "torch"}
     for path in iter_modules():
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        imported: set[str] = set()
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                imported |= {alias.name.split(".")[0] for alias in node.names}
-            elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
-                imported.add(node.module.split(".")[0])
-        offending = imported & persistence
+        if path.parent.name == "lite":
+            continue
+        absolute, local = _imports(path)
+        offending = absolute & persistence
         if path.name == "sql.py" and path.parent.name == "kit":
             # The one exception, and it is narrow: the developer's database.
             assert offending == {"sqlite3"}, f"kit/sql.py imports {offending}"
             continue
         assert not offending, f"{path.name} imports {sorted(offending)}"
+        if path.name in _THIN_CLIENT_MODULES and path.parent.name == "lemoncrow_client":
+            lite = sorted(name for name in local if name == "lite" or name.startswith("lite."))
+            assert not lite, f"thin client {path.name} imports Runtime Lite: {lite}"
 
     for path in iter_modules():
+        if path.parent.name == "lite":
+            continue
         body = code_only(path).upper()
         for statement in ("CREATE TABLE", "CREATE INDEX", "CREATE VIRTUAL TABLE"):
             assert statement not in body, f"{path.name} issues {statement!r}"
@@ -185,7 +269,8 @@ def test_mcp_initialize_stays_alive_and_reports_one_process_degradation(unreacha
     server = McpServer(unreachable_config)
     answer = server.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize"})
     assert answer is not None
-    instructions = str(answer["result"]["instructions"])
+    server._ensure_session(retry=True)
+    instructions = server._session_status()
     assert "server-side tools unavailable" in instructions
     assert "client-side tools still work" in instructions
     assert server.dispatcher.session.bootstrapped is False
@@ -201,17 +286,11 @@ def test_mcp_initialize_stays_alive_and_reports_one_process_degradation(unreacha
 def test_a_server_lost_mid_session_returns_typed_errors_not_a_local_answer(
     stub: StubServer, bootstrapped: RemoteSession, config: ClientConfig
 ) -> None:
-    """``read`` must **not** quietly switch to reading from disk here.
-
-    The session came up, so the agent has been told the index is available; a
-    silent change of answer source is exactly the kind of drift the typed error
-    exists to prevent.
-    """
     dispatcher = Dispatcher(config, bootstrapped)
-    assert not dispatcher.call("read", {"files": ["pkg/alpha.py"]}).is_error
+    assert not dispatcher.call("relations", {"path": "pkg/alpha.py"}).is_error
 
     stub.close()
-    outcome = dispatcher.call("read", {"files": ["pkg/alpha.py"]})
+    outcome = dispatcher.call("relations", {"path": "pkg/alpha.py"})
     assert outcome.is_error
     assert outcome.site == "refused"
     assert ErrorCode.SERVER_UNREACHABLE.value in outcome.content[0]["text"]
@@ -230,14 +309,21 @@ def test_client_tools_are_unaffected_by_a_mid_session_loss(
 def test_an_edit_that_cannot_be_pushed_keeps_the_write_and_says_the_view_is_behind(
     stub: StubServer, bootstrapped: RemoteSession, config: ClientConfig, worktree: Path
 ) -> None:
-    """The file is already written; losing that would be worse than a warning."""
+    """The file is already written; losing that would be worse than a warning.
+
+    And reporting it as an error is how agents came to redo applied edits: the
+    edit succeeded, so the result says so, flagged with why the View lags.
+    """
     stub.close()
     outcome = Dispatcher(config, bootstrapped).call(
         "edit", {"edits": [{"path": "pkg/alpha.py", "old": "'alpha'", "new": "'LOCAL'"}]}
     )
     assert (worktree / "pkg/alpha.py").read_text() == "def alpha():\n    return 'LOCAL'\n"
-    assert outcome.is_error
-    assert "the server's view is behind" in outcome.content[0]["text"]
+    assert not outcome.is_error
+    assert outcome.degraded
+    assert "the server's view is behind" in outcome.degraded_reason
+    rendered = outcome.to_mcp()
+    assert any("the server's view is behind" in block["text"] for block in rendered["content"])
 
 
 def test_a_degraded_server_answer_is_carried_through_unchanged(
@@ -284,13 +370,43 @@ def test_session_unknown_reopens_once_and_retries_the_tool(
 
     monkeypatch.setattr(RemoteSession, "_post_tool", stale_once)
     monkeypatch.setattr(RemoteSession, "bootstrap", counted_bootstrap)
-    outcome = dispatcher.call("read", {"files": ["pkg/alpha.py"]})
+    outcome = dispatcher.call("read", {"symbol": "alpha"})
     assert not outcome.is_error
     assert calls == {"post_tool": 2, "bootstrap": 1}
     assert bootstrapped.state.online is True
     events = [event for event in bootstrapped.state.recovery_events if event.kind == "session_reopen"]
     assert [event.outcome for event in events[-2:]] == ["retrying", "recovered"]
     assert events[-1].tool == "read"
+
+
+def test_view_unknown_reopens_once_and_retries_the_tool(
+    stub: StubServer, bootstrapped: RemoteSession, config: ClientConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dispatcher = Dispatcher(config, bootstrapped)
+    original_post_tool = RemoteSession._post_tool
+    original_bootstrap = RemoteSession.bootstrap
+    calls = {"post_tool": 0, "bootstrap": 0}
+
+    def stale_once(self: RemoteSession, tool: str, arguments, *, reuse_validator: str = ""):
+        calls["post_tool"] += 1
+        if calls["post_tool"] == 1:
+            from lemoncrow_client.errors import AgentAction, ClientError
+
+            raise ClientError(ErrorCode.VIEW_UNKNOWN, "view is not bound", action=AgentAction.REOPEN_VIEW)
+        return original_post_tool(self, tool, arguments, reuse_validator=reuse_validator)
+
+    def counted_bootstrap(self: RemoteSession, **kwargs):
+        calls["bootstrap"] += 1
+        return original_bootstrap(self, **kwargs)
+
+    monkeypatch.setattr(RemoteSession, "_post_tool", stale_once)
+    monkeypatch.setattr(RemoteSession, "bootstrap", counted_bootstrap)
+    outcome = dispatcher.call("read", {"symbol": "alpha"})
+    assert not outcome.is_error
+    assert calls == {"post_tool": 2, "bootstrap": 1}
+    events = [event for event in bootstrapped.state.recovery_events if event.kind == "session_reopen"]
+    assert [event.outcome for event in events[-2:]] == ["retrying", "recovered"]
+    assert events[-1].error_code == ErrorCode.VIEW_UNKNOWN.value
 
 
 def test_session_unknown_rebootstrap_failure_returns_retryable_typed_error(
@@ -332,3 +448,16 @@ def test_session_unknown_rebootstrap_failure_returns_retryable_typed_error(
     assert "retry_later" in body
     events = [event for event in bootstrapped.state.recovery_events if event.kind == "session_reopen"]
     assert [event.outcome for event in events[-2:]] == ["retrying", "failed"]
+
+
+def test_project_id_is_refused_rather_than_silently_ignored(unreachable_config: ClientConfig) -> None:
+    """This client serves one workspace; running the call there would be the wrong tree."""
+    dispatcher = Dispatcher(unreachable_config, RemoteSession(unreachable_config))
+
+    for tool in ("bash", "edit", "read", "code_search"):
+        outcome = dispatcher.call(tool, {"project_id": "proj_00000000000000000000"})
+        assert outcome.is_error, tool
+        assert "project_id" in outcome.content[0]["text"], tool
+
+    ran = dispatcher.call("bash", {"command": "printf here", "project_id": ""})
+    assert not ran.is_error and "here" in ran.content[0]["text"]

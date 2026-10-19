@@ -12,10 +12,12 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -23,11 +25,13 @@ from _audit_source import PACKAGE_ROOT, code_only, iter_modules
 from lemoncrow_client.config import load_config
 from lemoncrow_client.errors import ClientError, ErrorCode
 from lemoncrow_client.localtools import LocalContext, executor_for
-from lemoncrow_client.localtools.shell import cancel_active_bash_commands
+from lemoncrow_client.localtools.shell import background_running, cancel_active_bash_commands, close_background
 
 
 @pytest.fixture
-def context(worktree: Path, state_dir: Path) -> LocalContext:
+def context(worktree: Path, state_dir: Path, monkeypatch: pytest.MonkeyPatch) -> LocalContext:
+    # Keep tool-output spills isolated from the developer's real runtime/temp dir.
+    monkeypatch.setenv("LEMONCROW_MCP_SPILL_DIR", str(state_dir / "spill"))
     config = load_config({"LEMONCROW_HOME": str(state_dir), "HOME": str(state_dir.parent)}, cwd=worktree)
     return LocalContext(config=config, repo_root=worktree, sync=None, environment=dict(os.environ))
 
@@ -51,6 +55,19 @@ def test_bash_runs_a_command_in_the_worktree_and_reports_the_exit_code(context: 
     assert "hello" in text(result)
     assert "[exit 0]" in text(result)
     assert not result.is_error
+
+
+def test_bash_runs_commands_under_bash_not_posix_sh(context: LocalContext) -> None:
+    result = run(context, "bash", {"command": "k=abcdef; printf '%s ' \"${k:0:3}\"; [[ a == a ]] && printf ok"})
+    assert "abc ok" in text(result)
+    assert not result.is_error
+
+
+def test_bash_names_the_directory_that_is_missing(context: LocalContext, tmp_path: Path) -> None:
+    gone = tmp_path / "removed-worktree"
+    with pytest.raises(ClientError) as caught:
+        run(dataclasses.replace(context, repo_root=gone), "bash", {"command": "pwd"})
+    assert str(gone) in caught.value.message
 
 
 def test_bash_reports_a_failure_as_an_error_result_not_an_exception(context: LocalContext) -> None:
@@ -204,8 +221,8 @@ def test_server_drain_can_cancel_an_active_foreground_bash(context: LocalContext
     assert outcome and outcome[0].is_error
 
 
-@pytest.mark.parametrize("argument", [{"bg": True}, {"interactive": True}, {"id": "abc"}])
-def test_bash_refuses_every_mode_that_would_outlive_the_call(
+@pytest.mark.parametrize("argument", [{"interactive": True}, {"id": "abc", "action": "send"}])
+def test_bash_refuses_the_interactive_modes_it_has_no_stdin_for(
     context: LocalContext, argument: dict[str, object]
 ) -> None:
     with pytest.raises(ClientError) as caught:
@@ -213,10 +230,143 @@ def test_bash_refuses_every_mode_that_would_outlive_the_call(
     assert caught.value.code is ErrorCode.LOCAL_TOOL_UNAVAILABLE
 
 
-def test_bash_refuses_a_cwd_outside_the_worktree(context: LocalContext, tmp_path: Path) -> None:
+def _bg_id(result) -> str:
+    match = re.search(r"\[bg id=([0-9a-f]+) pid=(\d+)", text(result))
+    assert match, text(result)
+    return match.group(1)
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def test_bg_run_returns_at_once_and_poll_waits_for_it(context: LocalContext) -> None:
+    started = time.monotonic()
+    result = run(context, "bash", {"command": "sleep 1; printf finished-bg", "bg": True})
+    assert time.monotonic() - started < 1.0, "bg must return before the command finishes"
+    assert not result.is_error
+    run_id = _bg_id(result)
+
+    running = run(context, "bash", {"id": run_id, "action": "status"})
+    assert f"[running id={run_id}" in text(running)
+
+    done = run(context, "bash", {"id": run_id, "timeout": 30})
+    assert "finished-bg" in text(done)
+    assert "[exit 0]" in text(done)
+    assert not done.is_error
+
+    again = run(context, "bash", {"id": run_id, "action": "status"})
+    assert not again.is_error
+    assert "already finished" in text(again) and "[exit 0]" in text(again)
+
+    gone = run(context, "bash", {"id": "nosuchid"})
+    assert gone.is_error and "unknown bg id" in text(gone)
+
+
+def test_bg_poll_returns_only_new_output_and_a_failing_exit_is_an_error(context: LocalContext) -> None:
+    run_id = _bg_id(run(context, "bash", {"command": "echo one; sleep 1; echo two; exit 3", "bg": True}))
+    deadline = time.monotonic() + 20
+    first = ""
+    while "one" not in first and time.monotonic() < deadline:
+        first = text(run(context, "bash", {"id": run_id, "action": "status"}))
+        time.sleep(0.1)
+    assert "one" in first
+
+    final = run(context, "bash", {"id": run_id, "timeout": 30})
+    assert "two" in text(final) and "[exit 3]" in text(final)
+    assert final.is_error
+
+
+def test_bg_kill_takes_down_the_whole_process_group(context: LocalContext, tmp_path: Path) -> None:
+    pid_file = tmp_path / "child.pid"
+    run_id = _bg_id(run(context, "bash", {"command": f"sleep 300 & echo $! > {pid_file}; wait", "bg": True}))
+    for _ in range(100):
+        if pid_file.exists() and pid_file.read_text().strip():
+            break
+        time.sleep(0.05)
+    child = int(pid_file.read_text().strip())
+    assert _alive(child)
+
+    killed = run(context, "bash", {"id": run_id, "action": "kill"})
+    assert "[killed]" in text(killed)
+    for _ in range(100):
+        if not _alive(child):
+            break
+        time.sleep(0.05)
+    assert not _alive(child), "kill must reach grandchildren, not just the shell"
+
+
+def test_bg_deadline_kills_a_run_and_update_moves_it(context: LocalContext) -> None:
+    doomed = _bg_id(run(context, "bash", {"command": "sleep 300", "bg": True}))
+    moved = run(context, "bash", {"id": doomed, "action": "update", "timeout": 1})
+    assert "deadline moved" in text(moved)
+    done = run(context, "bash", {"id": doomed, "timeout": 30})
+    assert "timed out" in text(done)
+
+
+def test_closing_the_session_kills_its_bg_runs(context: LocalContext, tmp_path: Path) -> None:
+    pid_file = tmp_path / "bg.pid"
+    _bg_id(run(context, "bash", {"command": f"echo $$ > {pid_file}; sleep 300", "bg": True}))
+    for _ in range(100):
+        if pid_file.exists() and pid_file.read_text().strip():
+            break
+        time.sleep(0.05)
+    pid = int(pid_file.read_text().strip())
+    assert background_running(context.memory) and _alive(pid)
+
+    assert close_background(context.memory) == 1
+    assert not background_running(context.memory)
+    for _ in range(100):
+        if not _alive(pid):
+            break
+        time.sleep(0.05)
+    assert not _alive(pid), "nothing may outlive the session"
+
+
+def test_bg_takes_one_command_and_honours_the_command_policy(context: LocalContext) -> None:
     with pytest.raises(ClientError) as caught:
-        run(context, "bash", {"command": "pwd", "cwd": str(tmp_path)})
+        run(context, "bash", {"command": ["true", "true"], "bg": True})
+    assert caught.value.code is ErrorCode.LOCAL_TOOL_UNAVAILABLE
+
+    blocked = run(context, "bash", {"command": "git reset --hard", "bg": True})
+    assert blocked.is_error and not background_running(context.memory)
+
+
+def test_bash_allows_a_cwd_under_the_os_temp_directory(context: LocalContext, tmp_path: Path) -> None:
+    result = run(context, "bash", {"command": "pwd", "cwd": str(tmp_path)})
+    assert str(tmp_path.resolve()) in text(result)
+    assert not result.is_error
+
+
+def test_bash_refuses_a_cwd_outside_the_worktree_and_temp_roots(context: LocalContext) -> None:
+    filesystem_root = Path(context.repo_root.anchor or os.sep).resolve()
+    with pytest.raises(ClientError) as caught:
+        run(context, "bash", {"command": "pwd", "cwd": str(filesystem_root)})
     assert caught.value.code is ErrorCode.PAYLOAD_INVALID
+    assert "allowed temporary directories" in caught.value.message
+
+
+def test_bash_write_policy_keeps_standard_tmp_when_tmpdir_is_custom(
+    context: LocalContext, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from lemoncrow_client.kit import command_policy
+
+    custom_tmp = context.repo_root / "custom-tmp"
+    custom_tmp.mkdir()
+    monkeypatch.setattr(command_policy.tempfile, "gettempdir", lambda: str(custom_tmp))
+    target = tmp_path / "scratch.txt"
+
+    decision = command_policy.classify_command(
+        f"cat > {target}", allowed_write_roots=[context.repo_root], cwd=context.repo_root
+    )
+
+    assert decision.action != "block"
+    if os.name != "nt":
+        assert Path("/tmp").resolve() in command_policy.temporary_roots()
 
 
 def test_the_package_never_starts_a_detached_session() -> None:
@@ -511,10 +661,10 @@ def test_grep_spills_a_large_result_to_a_named_file(context: LocalContext) -> No
 # --------------------------------------------------------------------------- #
 
 
-def test_read_from_disk_is_always_flagged_degraded(context: LocalContext) -> None:
+def test_read_from_disk_is_not_degraded(context: LocalContext) -> None:
     result = run(context, "read_from_disk", {"files": ["pkg/alpha.py"]})
-    assert result.degraded
-    assert result.degraded_reason == "server_unreachable:read_from_disk"
+    assert not result.degraded
+    assert result.degraded_reason == ""
     assert "1\tdef alpha():" in text(result)
 
 
@@ -537,6 +687,21 @@ def test_read_from_disk_parses_the_read_tools_path_grammar(context: LocalContext
     assert read("pkg/beta.py:head=1") == "1\tfrom pkg.alpha import alpha"
     assert read("pkg/beta.py:tail=1") == "5\t    return alpha()"
     assert read("pkg/beta.py:weird") == "[no such file]"
+
+
+def test_read_from_disk_accepts_unambiguous_spellings_of_a_range(context: LocalContext) -> None:
+    def read(spelled: object) -> str:
+        entry = {"path": "pkg/beta.py", "range": spelled}
+        return text(run(context, "read_from_disk", {"files": [entry]})).split("\n", 1)[1]
+
+    both = "4\tdef beta():\n5\t    return alpha()"
+    for spelled in ([4, 5], (4, 5), ["4", "5"], "4:5", "4..5", "L4, 5", "l4-l5"):
+        assert read(spelled) == both, spelled
+    assert read(5) == "5\t    return alpha()"
+    assert read([5]) == "5\t    return alpha()"
+    with pytest.raises(ClientError) as caught:
+        read("lines four to five")
+    assert "use L10-L20" in caught.value.message
 
 
 def test_read_from_disk_accepts_an_explicit_absolute_file(context: LocalContext, tmp_path: Path) -> None:
@@ -701,8 +866,13 @@ def test_codemod_previews_a_rewrite_unless_dry_run_is_false(context: LocalContex
     assert target.read_text(encoding="utf-8") == "if x is None:\n    pass\n"
 
 
-def test_no_module_in_the_package_can_download_or_self_update() -> None:
-    """The findings that got the previous install rejected, as a code scan."""
+def test_only_explicit_install_paths_can_download_or_self_update() -> None:
+    """Reject implicit installers; allow only the reviewed explicit/lazy install paths.
+
+    Runtime-only Pi downloads require their pinned SHA-256; the Review/Runtime
+    CLI may fetch a missing product or perform an explicit update. Dedicated
+    packaging and update tests enforce those entry-point and checksum guards.
+    """
     forbidden = (
         "urlretrieve",
         "pip install",
@@ -716,10 +886,37 @@ def test_no_module_in_the_package_can_download_or_self_update() -> None:
         "tarfile",
         "unpack_archive",
     )
+    # Reviewed installer exceptions: cli.py is the explicit/lazy product path;
+    # pi_host.py belongs to Runtime only and checks pinned release SHA-256.
+    # No other shipped module is permitted to install anything.
+    reviewed_installers = {"cli.py": {"install.sh"}, "pi_host.py": {"tarfile"}}
+    # ``runtime mcp serve --persistent`` only: the opt-in remote MCP gateway's
+    # user units and the cloudflared they supervise. It downloads nothing.
+    remote_supervision = {"remote/cli.py", "remote/service.py", "remote/tunnel.py"}
+    # The opt-in Review user service (``service`` under the Review client): the per-checkout
+    # service writes one systemd --user unit or LaunchAgent. It downloads nothing.
+    remote_supervision |= {"review_service.py", "review_launchd.py"}
+    supervision = {"cloudflared", "enable-linger", "LaunchAgents", "systemd"}
     for path in iter_modules():
         body = code_only(path)
+        relative = path.relative_to(PACKAGE_ROOT).as_posix()
         for needle in forbidden:
-            assert needle not in body, f"{path.name} uses {needle!r}"
+            if relative in remote_supervision and needle in supervision:
+                continue
+            if needle in reviewed_installers.get(relative, set()):
+                continue
+            assert needle not in body, f"{relative} uses {needle!r} outside an explicit installer"
+    # The Pi installer must never enter the Review-only or local-Lite distribution.
+    for artifact in ("review-files.txt", "lite-files.txt"):
+        entries = (PACKAGE_ROOT.parents[1] / artifact).read_text(encoding="utf-8").split()
+        assert "pi_host.py" not in entries, artifact
+    from lemoncrow_client import pi_host
+
+    assert all(len(sha) == 64 for sha in pi_host._ASSET_SHA256.values())
+    # That supervision ships in the Runtime artifact only, never Review or Lite.
+    for allowlist in ("review-files.txt", "lite-files.txt"):
+        listed = (PACKAGE_ROOT.parents[1] / allowlist).read_text(encoding="utf-8").split()
+        assert not [entry for entry in listed if entry.startswith("remote/")], allowlist
 
 
 # --------------------------------------------------------------------------- #

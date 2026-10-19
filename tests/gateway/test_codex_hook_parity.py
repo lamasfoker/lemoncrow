@@ -174,7 +174,7 @@ def test_pre_tool_use_allows_ranges_and_unedited_files(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------
 # PostToolUse run-ledger capture + failure rescue
 # --------------------------------------------------------------------------
-def test_post_tool_use_records_file_edit(tmp_path: Path) -> None:
+def test_post_tool_use_records_file_edit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     root = tmp_path / ".lemoncrow"
     session_id = "run1"
     _seed_run_file(root, session_id)
@@ -185,8 +185,19 @@ def test_post_tool_use_records_file_edit(tmp_path: Path) -> None:
         "tool_input": {"file_path": "a.py", "old_string": "x = 1", "new_string": "x = 2"},
         "cwd": str(tmp_path),
     }
+    from lemoncrow.pro.capabilities.review import live_runtime
+
+    prepared: list[tuple[Path, Path, str, str]] = []
+    monkeypatch.setattr(
+        live_runtime,
+        "request_live_review_prepare",
+        lambda store_root, repo_root, *, host, session_id: prepared.append(
+            (Path(store_root), Path(repo_root), host, session_id)
+        ),
+    )
     out = plugin_runtime.build_codex_post_tool_use_ledger_output(root, payload)
     assert out.get("no_output") is True
+    assert prepared == [(root, tmp_path, "codex", session_id)]
     events = _events(root, session_id)
     file_edits = [e for e in events if e["kind"] == "file_edit"]
     assert len(file_edits) == 1
@@ -475,55 +486,50 @@ def test_user_prompt_skips_compaction_credit_when_delta_not_visible(
 # --------------------------------------------------------------------------
 # PermissionRequest auto-deny (Codex-exclusive)
 # --------------------------------------------------------------------------
-@pytest.mark.parametrize(
-    "command",
-    [
-        "rm -rf /",
-        "rm -rf /*",
-        "rm -rf ~",
-        "rm -rf $HOME",
-        "sudo rm -rf /",
-        "rm -rf /usr",
-        "rm -rf /etc/",
-        "rm --recursive --force /",
-        "git push --force origin main",
-        "git push -f",
-        "git push -f origin main",
-        "dd if=/dev/zero of=/dev/sda",
-        ":(){ :|:& };:",
-    ],
-)
-def test_permission_request_denies_destructive_commands(tmp_path: Path, command: str) -> None:
-    payload = {
-        "hook_event_name": "PermissionRequest",
-        "tool_name": "shell",
-        "tool_input": {"command": command},
-    }
-    out = plugin_runtime.build_codex_permission_request_output(tmp_path / ".lemoncrow", payload)
-    assert (out.get("hookSpecificOutput") or {}).get("behavior") == "deny", command
+def test_permission_request_denies_destructive_commands(tmp_path: Path) -> None:
+    for case_index, command in enumerate(
+        [
+            "rm -rf /",
+            "rm -rf /*",
+            "rm -rf ~",
+            "rm -rf $HOME",
+            "sudo rm -rf /",
+            "rm -rf /usr",
+            "rm -rf /etc/",
+            "rm --recursive --force /",
+            "git push --force origin main",
+            "git push -f",
+            "git push -f origin main",
+            "dd if=/dev/zero of=/dev/sda",
+            ":(){ :|:& };:",
+        ]
+    ):
+        case_tmp_path = tmp_path / f"case-{case_index}"
+        case_tmp_path.mkdir()
+        payload = {"hook_event_name": "PermissionRequest", "tool_name": "shell", "tool_input": {"command": command}}
+        out = plugin_runtime.build_codex_permission_request_output(case_tmp_path / ".lemoncrow", payload)
+        assert (out.get("hookSpecificOutput") or {}).get("behavior") == "deny", command
 
 
-@pytest.mark.parametrize(
-    "command",
-    [
-        "rm -rf build/",
-        "rm -rf ./node_modules",
-        "rm -rf /usr/local/foo",
-        "git push --force-with-lease",
-        "git push origin main",
-        "ls -la",
-        "pytest -q",
-    ],
-)
-def test_permission_request_allows_safe_commands(tmp_path: Path, command: str) -> None:
-    payload = {
-        "hook_event_name": "PermissionRequest",
-        "tool_name": "shell",
-        "tool_input": {"command": command},
-    }
-    assert (
-        plugin_runtime.build_codex_permission_request_output(tmp_path / ".lemoncrow", payload).get("no_output") is True
-    )
+def test_permission_request_allows_safe_commands(tmp_path: Path) -> None:
+    for case_index, command in enumerate(
+        [
+            "rm -rf build/",
+            "rm -rf ./node_modules",
+            "rm -rf /usr/local/foo",
+            "git push --force-with-lease",
+            "git push origin main",
+            "ls -la",
+            "pytest -q",
+        ]
+    ):
+        case_tmp_path = tmp_path / f"case-{case_index}"
+        case_tmp_path.mkdir()
+        payload = {"hook_event_name": "PermissionRequest", "tool_name": "shell", "tool_input": {"command": command}}
+        assert (
+            plugin_runtime.build_codex_permission_request_output(case_tmp_path / ".lemoncrow", payload).get("no_output")
+            is True
+        )
 
 
 def test_permission_request_ignores_non_bash_tools(tmp_path: Path) -> None:
@@ -641,6 +647,7 @@ def test_codex_hooks_manifest_includes_new_lifecycle_events() -> None:
     data = json.loads((ROOT / "integrations" / "codex" / "hooks" / "hooks.json").read_text(encoding="utf-8"))
     for event in (
         "SessionStart",
+        "SessionEnd",
         "UserPromptSubmit",
         "PreToolUse",
         "PostToolUse",

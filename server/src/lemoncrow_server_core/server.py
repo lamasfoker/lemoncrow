@@ -78,6 +78,9 @@ class ServerRunner:
         self._runner = runner
         self._site = site
         self._url = _resolve_url(runner, self._config, scheme=self._scheme())
+        index_worker = getattr(self._server, "index_worker", None)
+        if index_worker is not None:
+            index_worker.start()
         if self._config.maintenance_interval_s > 0:
             self._maintenance = asyncio.create_task(self._maintenance_loop(), name="lemoncrow-server-maintenance")
         return self._url
@@ -103,6 +106,9 @@ class ServerRunner:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
         self._server.begin_drain()
+        index_worker = getattr(self._server, "index_worker", None)
+        if index_worker is not None:
+            await asyncio.to_thread(index_worker.close)
         drained = await self._server.wait_drained(self._config.shutdown_timeout_s)
         if not drained:
             _LOG.warning("shutdown drain timed out with %d request(s) in flight", self._server.in_flight)
@@ -145,3 +151,17 @@ class LocalServer(ServerRunner):
 
     def __init__(self, state: LocalServerApp, app: web.Application, config: LocalServerConfig) -> None:
         super().__init__(state, app, config)
+        self._local_app = state
+
+    async def start(self) -> str:
+        url = await super().start()
+        # Services call back into this listener, so they start once it is bound.
+        self._local_app.start_services(url)
+        return url
+
+    async def stop(self) -> None:
+        try:
+            # Drain first: forwarded requests still in flight need their worker.
+            await super().stop()
+        finally:
+            await self._local_app.stop_services()

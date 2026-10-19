@@ -1,0 +1,23 @@
+[project]
+name = "lemoncrow-review-csv"
+version = "0.1.0"
+description = "Example LemonCrow Review preview plugin: changed CSV files as old/new table previews."
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+# LemonCrow itself provides the contract at runtime. Install this package into
+# the same environment as the LemonCrow Review server instead of depending on it,
+# so installing the plugin never replaces the installed LemonCrow.
+dependencies = []
+
+[project.entry-points."lemoncrow.review_surface_providers"]
+csv-table = "lemoncrow_review_csv:CsvTableSurfaceProvider"
+
+[project.entry-points."lemoncrow.review_preview_renderers"]
+csv-table = "lemoncrow_review_csv:CsvTableRenderer"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lemoncrow_review_csv"]

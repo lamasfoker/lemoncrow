@@ -35,6 +35,7 @@ def _write_workspace(root: Path) -> Path:
     return billing
 
 
+@pytest.mark.private_engine
 def test_code_search_routes_across_workspace_repos_and_keeps_paths_readable(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -99,12 +100,12 @@ def test_code_search_routes_across_workspace_repos_and_keeps_paths_readable(
         "_code_context_engine",
         lambda repo_root=".": FakeEngine(Path(repo_root)),
     )
-    monkeypatch.setattr(mcp_server, "_check_repeat_query", lambda query: False)
 
     handler = mcp_server.TOOLS["code_search"]["handler"]
     result = handler({"query": "shared_config"})
 
-    assert calls == [tmp_path.resolve(), billing.resolve()]
+    # The router searches repos concurrently; which one appends first is a race.
+    assert sorted(calls) == sorted([tmp_path.resolve(), billing.resolve()])
     assert [entry["path"] for entry in result["files"]] == ["billing/src/billing.py", "src/local.py"]
     assert {entry["path"] for entry in result.get("related_symbols", [])} <= {
         "src/local.py",

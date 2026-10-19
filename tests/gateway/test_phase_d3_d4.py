@@ -34,6 +34,7 @@ EXPECTED_TOOLS = {
     "review_rationale",
     "review_evidence",
     "review_feedback_addressed",
+    "review_guidance",
 }
 
 

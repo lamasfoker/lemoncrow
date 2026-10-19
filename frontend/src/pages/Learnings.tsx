@@ -1,5 +1,8 @@
+import { Select, SelectItem } from "../components/ui/select";
+import { Button as UiButton } from "../components/ui/button";
+import { Input as UiInput } from "../components/ui/input";
 import { useEffect, useState, useMemo, type ReactNode } from "react";
-import { useParams, useNavigate } from "react-router-dom";
+import { useMatch, useParams, useNavigate } from "react-router-dom";
 import {
   AlertTriangle,
   Brain,
@@ -11,6 +14,7 @@ import {
   ChevronRight,
   ClipboardList,
   Database,
+  GitBranch,
   Scale,
   X,
 } from "lucide-react";
@@ -22,23 +26,33 @@ import {
   SectionHeader,
   ToggleGroup,
 } from "../components/WorkbenchUI";
+import { useProductCapabilities, type ProductFeature } from "../lib/RuntimeCapabilities";
 import Memory from "./Memory";
+import ProjectKnowledge from "./ProjectKnowledge";
 import Rubrics from "./Rubrics";
 
-type Section = "blocks" | "memory" | "failures" | "plans" | "rubrics";
+type Section = "project" | "blocks" | "memory" | "failures" | "plans" | "rubrics";
 
 const SECTIONS: {
   id: Section;
   label: string;
   icon: React.ElementType;
   desc: string;
+  feature?: ProductFeature;
 }[] = [
-  { id: "blocks", label: "Blocks", icon: Brain, desc: "Curated procedures" },
+  {
+    id: "project",
+    label: "Project",
+    icon: GitBranch,
+    desc: "Project Knowledge: what the repository's committed history says",
+    feature: "runtime.project_knowledge",
+  },
+  { id: "blocks", label: "Playbooks", icon: Brain, desc: "Agent playbooks: curated procedures learned from runs" },
   {
     id: "memory",
-    label: "Memory",
+    label: "Agent Memory",
     icon: Database,
-    desc: "Pinned + archival recall",
+    desc: "What your agents recall: pinned + archival memory",
   },
   {
     id: "failures",
@@ -53,7 +67,13 @@ const SECTIONS: {
 export default function Learnings() {
   const { section } = useParams<{ section?: string }>();
   const navigate = useNavigate();
-  const active = (section as Section) || "blocks";
+  const capabilities = useProductCapabilities();
+  // The full-index sections need runtime.knowledge; a local Dashboard serves only
+  // Project Knowledge, so offer only the sections this server can answer.
+  const sections = SECTIONS.filter((s) => capabilities.features[s.feature ?? "runtime.knowledge"]);
+  // /knowledge/project is its own (separately gated) route, so it carries no :section.
+  const projectRoute = useMatch("/knowledge/project") !== null;
+  const active = (section as Section) || (projectRoute ? "project" : "blocks");
 
   const setSection = (s: Section) =>
     navigate(`/knowledge/${s}`, { replace: true });
@@ -61,9 +81,10 @@ export default function Learnings() {
   return (
     <PageFrame className="space-y-4">
       <ToggleGroup
+        aria-label="Knowledge section"
         variant="underline"
         size="xs"
-        options={SECTIONS.map((s) => ({
+        options={sections.map((s) => ({
           value: s.id,
           label: (
             <span className="flex items-center gap-1.5">
@@ -77,6 +98,7 @@ export default function Learnings() {
         onChange={(value) => setSection(value as Section)}
       />
 
+      {active === "project" && <ProjectKnowledge />}
       {active === "blocks" && <BlocksSection />}
       {active === "memory" && <Memory />}
       {active === "failures" && <FailuresSection />}
@@ -138,25 +160,25 @@ function BlocksSection() {
   ).length;
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-4">
       <section className="grid gap-4 md:grid-cols-4">
         <MetricCard
           label="Catalog size"
           value={String(items.length)}
           detail="All reviewable procedures in the runtime."
-          tone="amber"
+          tone="warning"
         />
         <MetricCard
           label="Standing rules"
           value={String(standingRules)}
           detail="Blocks broad enough to shape many tasks."
-          tone="emerald"
+          tone="success"
         />
         <MetricCard
           label="High-signal blocks"
           value={String(highSignal)}
           detail="Blocks carrying failure or verification signals."
-          tone="violet"
+          tone="neutral"
         />
         <MetricCard
           label="Visible now"
@@ -166,45 +188,45 @@ function BlocksSection() {
         />
       </section>
 
-      <section className="border border-neutral-800 bg-neutral-950/70 p-5">
+      <section className="rounded-lg border border-border/70 bg-background/60 p-4">
         <SectionHeader
           eyebrow="Catalog controls"
           title="Search by title, id, domain, and operating shape"
           description="Use the filters to narrow the knowledge base before you open a block. The goal is to find the right procedure quickly, then inspect why it exists."
         />
         <div className="mt-5 flex gap-2 flex-wrap items-center">
-          {(["all", "active", "retired", "deprecated"] as const).map((f) => (
-            <button
-              key={f}
-              onClick={() => setFilter(f)}
-              className={`text-[10px] px-2.5 py-1 uppercase font-bold tracking-tight font-mono transition border ${
-                filter === f
-                  ? "border-neutral-500 bg-neutral-800 text-neutral-100"
-                  : "border-neutral-700 text-neutral-400 hover:text-neutral-300"
-              }`}
-            >
-              {f}
-            </button>
-          ))}
-          <select
+          <ToggleGroup
+            aria-label="Filter learnings by status"
+            value={filter}
+            onChange={(value) => setFilter(value as typeof filter)}
+            size="xs"
+            options={[
+              { value: "all", label: "All" },
+              { value: "active", label: "Active" },
+              { value: "retired", label: "Retired" },
+              { value: "deprecated", label: "Deprecated" },
+            ]}
+          />
+          <Select
             aria-label="Filter learnings by domain"
             value={domainFilter}
-            onChange={(e) => setDomainFilter(e.target.value)}
-            className="text-[10px] bg-neutral-900/50 border border-neutral-700 px-2 py-1 text-neutral-400 font-mono"
+            onValueChange={setDomainFilter}
+            uiSize="xs"
           >
-            <option value="all">All domains</option>
+            <SelectItem value="all">All domains</SelectItem>
             {domains.map((d) => (
-              <option key={d} value={d}>
+              <SelectItem key={d} value={d}>
                 {d}
-              </option>
+              </SelectItem>
             ))}
-          </select>
-          <input
-            type="text"
+          </Select>
+          <UiInput
+            type="search"
             placeholder="Search…"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            className="ml-auto text-[11px] bg-neutral-900/50 border border-neutral-700 px-2 py-1 text-neutral-300 placeholder:text-neutral-400 w-40 font-mono"
+            uiSize="xs"
+            className="ml-auto w-48"
           />
         </div>
       </section>
@@ -227,7 +249,7 @@ function BlocksSection() {
         )}
       </div>
 
-      <section className="border border-neutral-800 bg-neutral-950/70 p-5">
+      <section className="rounded-lg border border-border/70 bg-background/60 p-4">
         <SectionHeader
           eyebrow="How to read a block"
           title="Each card is organized around application, verification, and avoidance"
@@ -257,7 +279,7 @@ function FailuresSection() {
 
   if (items.length === 0)
     return (
-      <div className="py-8 text-center text-neutral-400">
+      <div className="py-6 text-center text-neutral-400">
         <Check size={32} className="mx-auto mb-3 text-emerald-300" />
         <p>No failure clusters detected — agents running smoothly.</p>
       </div>
@@ -276,14 +298,14 @@ function FailuresSection() {
         return (
           <div
             key={c.id}
-            className="border border-neutral-800 bg-neutral-900/50 overflow-hidden"
+            className="border border-border bg-muted/50 overflow-hidden"
           >
-            <button
+            <UiButton unstyled
               onClick={() => setExpandedId(isExpanded ? null : c.id)}
               className="w-full px-5 py-4 text-left hover:bg-neutral-800/50 transition-colors flex items-start gap-3"
             >
               <span
-                className={`text-[10px] px-2 py-1 font-mono font-bold uppercase flex-shrink-0 mt-0.5 ${severityColor}`}
+                className={`text-caption px-2 py-1 font-mono font-bold uppercase flex-shrink-0 mt-0.5 ${severityColor}`}
               >
                 {c.severity}
               </span>
@@ -302,27 +324,27 @@ function FailuresSection() {
                   {c.trace_ids.length !== 1 ? "s" : ""} · {c.id}
                 </p>
               </div>
-            </button>
+            </UiButton>
             {isExpanded && (
-              <div className="border-t border-neutral-800 bg-neutral-950/50 px-5 py-4 space-y-4 text-xs">
+              <div className="border-t border-border bg-background/50 px-5 py-4 space-y-4 text-xs">
                 <div>
-                  <div className="text-[10px] uppercase tracking-widest text-neutral-400 mb-2 font-mono">
+                  <div className="text-caption uppercase tracking-widest text-neutral-400 mb-2 font-mono">
                     Fingerprint
                   </div>
-                  <div className="font-mono text-red-300 whitespace-pre-wrap break-words bg-neutral-950 p-2 border border-neutral-800">
+                  <div className="font-mono text-red-300 whitespace-pre-wrap break-words rounded-md border border-border/70 bg-surface-code p-2">
                     {c.fingerprint}
                   </div>
                 </div>
                 {c.sample_errors && c.sample_errors.length > 0 && (
                   <div>
-                    <div className="text-[10px] uppercase tracking-widest text-neutral-400 mb-2 font-mono">
+                    <div className="text-caption uppercase tracking-widest text-neutral-400 mb-2 font-mono">
                       Sample errors
                     </div>
                     <div className="space-y-1">
                       {c.sample_errors.map((e, j) => (
                         <div
                           key={j}
-                          className="font-mono text-neutral-400 bg-neutral-950 p-2 border border-neutral-800"
+                          className="font-mono text-neutral-400 rounded-md border border-border/70 bg-surface-code p-2"
                         >
                           {e}
                         </div>
@@ -332,24 +354,24 @@ function FailuresSection() {
                 )}
                 {c.suggested_block_title && (
                   <div>
-                    <div className="text-[10px] uppercase tracking-widest text-neutral-400 mb-2 font-mono">
+                    <div className="text-caption uppercase tracking-widest text-neutral-400 mb-2 font-mono">
                       Suggested block
                     </div>
-                    <div className="text-neutral-300 bg-neutral-950 p-2 border border-neutral-800">
+                    <div className="text-neutral-300 rounded-md border border-border/70 bg-surface-code p-2">
                       {c.suggested_block_title}
                     </div>
                   </div>
                 )}
                 {c.trace_ids && c.trace_ids.length > 0 && (
-                  <div className="pt-2 border-t border-neutral-800">
-                    <div className="text-[10px] uppercase tracking-widest text-neutral-400 mb-2 font-mono">
+                  <div className="pt-2 border-t border-border">
+                    <div className="text-caption uppercase tracking-widest text-neutral-400 mb-2 font-mono">
                       Trace IDs
                     </div>
                     <div className="flex flex-wrap gap-1">
                       {c.trace_ids.slice(0, 10).map((t, j) => (
                         <span
                           key={j}
-                          className="font-mono text-neutral-400 bg-neutral-950 px-2 py-0.5 border border-neutral-800"
+                          className="font-mono text-neutral-400 bg-background px-2 py-0.5 border border-border"
                         >
                           {t}
                         </span>
@@ -390,7 +412,7 @@ function PlansSection() {
 
   if (items.length === 0)
     return (
-      <div className="py-8 text-center text-neutral-400">
+      <div className="py-6 text-center text-neutral-400">
         <ClipboardList size={32} className="mx-auto mb-3" />
         <p>No plan validation results yet.</p>
       </div>
@@ -407,14 +429,14 @@ function PlansSection() {
         return (
           <div
             key={p.trace_id}
-            className="border border-neutral-800 bg-neutral-900/50 overflow-hidden"
+            className="border border-border bg-muted/50 overflow-hidden"
           >
-            <button
+            <UiButton unstyled
               onClick={() => setExpandedId(isExpanded ? null : p.trace_id)}
               className="w-full px-5 py-4 text-left hover:bg-neutral-800/50 transition-colors flex items-start gap-3"
             >
               <span
-                className={`text-[10px] px-2 py-1 font-mono font-bold uppercase flex-shrink-0 mt-0.5 ${statusColor}`}
+                className={`text-caption px-2 py-1 font-mono font-bold uppercase flex-shrink-0 mt-0.5 ${statusColor}`}
               >
                 {p.status}
               </span>
@@ -430,25 +452,25 @@ function PlansSection() {
                 </div>
                 <p className="text-xs text-neutral-400 truncate">{p.task}</p>
               </div>
-            </button>
+            </UiButton>
             {isExpanded && (
-              <div className="border-t border-neutral-800 bg-neutral-950/50 px-5 py-4 space-y-3 text-xs">
+              <div className="border-t border-border bg-background/50 px-5 py-4 space-y-3 text-xs">
                 <div>
-                  <div className="text-[10px] uppercase tracking-widest text-neutral-400 mb-2 font-mono">
+                  <div className="text-caption uppercase tracking-widest text-neutral-400 mb-2 font-mono">
                     Task
                   </div>
                   <p className="text-neutral-300">{p.task}</p>
                 </div>
                 <div>
-                  <div className="text-[10px] uppercase tracking-widest text-neutral-400 mb-2 font-mono">
+                  <div className="text-caption uppercase tracking-widest text-neutral-400 mb-2 font-mono">
                     Trace ID
                   </div>
-                  <code className="font-mono text-neutral-400 bg-neutral-950 px-2 py-1 block border border-neutral-800">
+                  <code className="font-mono text-neutral-400 bg-background px-2 py-1 block border border-border">
                     {p.trace_id}
                   </code>
                 </div>
                 <div>
-                  <div className="text-[10px] uppercase tracking-widest text-neutral-400 mb-2 font-mono">
+                  <div className="text-caption uppercase tracking-widest text-neutral-400 mb-2 font-mono">
                     Checks
                   </div>
                   <ul className="space-y-1">
@@ -467,7 +489,7 @@ function PlansSection() {
                         <div className="flex-1">
                           <div>{c.name}</div>
                           {c.detail && (
-                            <div className="text-[10px] text-neutral-400 mt-0.5">
+                            <div className="text-caption text-neutral-400 mt-0.5">
                               {c.detail}
                             </div>
                           )}
@@ -517,8 +539,8 @@ function BlockCard({
   onToggle: () => void;
 }) {
   return (
-    <div className="border border-neutral-800 bg-neutral-900/50 overflow-hidden">
-      <button
+    <div className="border border-border bg-muted/50 overflow-hidden">
+      <UiButton unstyled
         onClick={onToggle}
         className="w-full px-5 py-4 text-left hover:bg-neutral-800/50 transition-colors flex items-start gap-4"
       >
@@ -537,35 +559,35 @@ function BlockCard({
               size={14}
               className={`text-amber-300 transition-transform ${isExpanded ? "rotate-90" : ""}`}
             />
-            <h3 className="font-mono font-bold text-neutral-200 text-sm">
+            <h3 className="font-bold text-neutral-200 text-sm">
               {block.title}
             </h3>
             <StatusBadge status={block.status} />
             {block.domain && (
-              <span className="text-[10px] px-1.5 py-0.5 bg-neutral-800 text-neutral-300 uppercase font-bold tracking-tight font-mono">
+              <span className="text-caption px-1.5 py-0.5 bg-neutral-800 text-neutral-300 uppercase font-bold tracking-tight font-mono">
                 {block.domain}
               </span>
             )}
-            <Chip tone="violet">{blockTier(block)}</Chip>
+            <Chip tone="neutral">{blockTier(block)}</Chip>
             <Chip
               tone={
                 blockSeverity(block) === "high"
-                  ? "amber"
+                  ? "warning"
                   : blockSeverity(block) === "medium"
-                    ? "cyan"
+                    ? "info"
                     : "neutral"
               }
             >
               {blockSeverity(block)} signal
             </Chip>
           </div>
-          <div className="text-[10px] text-neutral-400 font-mono">
+          <div className="text-caption text-neutral-400 font-mono">
             {block.id}
           </div>
         </div>
-      </button>
+      </UiButton>
       {isExpanded && (
-        <div className="border-t border-neutral-800 bg-neutral-950/50 px-5 py-4">
+        <div className="border-t border-border bg-background/50 px-5 py-4">
           <BlockDetail block={block} />
         </div>
       )}
@@ -581,7 +603,7 @@ function StatusBadge({ status }: { status: string }) {
   };
   return (
     <span
-      className={`text-[10px] px-1.5 py-0.5 font-bold uppercase tracking-tight font-mono ${map[status] || map.retired}`}
+      className={`text-caption px-1.5 py-0.5 font-bold uppercase tracking-tight font-mono ${map[status] || map.retired}`}
     >
       {status}
     </span>
@@ -595,16 +617,16 @@ function BlockDetail({ block }: { block: Playbook }) {
 
   return (
     <div className="space-y-5 text-sm">
-      <header className="pb-4 border-b border-neutral-800">
+      <header className="pb-4 border-b border-border">
         <div className="flex items-center gap-2 mb-2 flex-wrap">
           <StatusBadge status={block.status} />
-          <span className="text-[10px] px-1.5 py-0.5 bg-neutral-800 text-neutral-300 uppercase font-bold tracking-tight">
+          <span className="text-caption px-1.5 py-0.5 bg-neutral-800 text-neutral-300 uppercase font-bold tracking-tight">
             {block.domain}
           </span>
           {block.task_types.map((t) => (
             <span
               key={t}
-              className="text-[10px] px-1.5 py-0.5 bg-neutral-900 border border-neutral-700 text-neutral-400 font-mono"
+              className="text-caption px-1.5 py-0.5 bg-muted border border-neutral-700 text-neutral-400 font-mono"
             >
               {t}
             </span>
@@ -613,26 +635,26 @@ function BlockDetail({ block }: { block: Playbook }) {
         <h2 className="text-base font-bold text-neutral-300 leading-snug">
           {block.title}
         </h2>
-        <div className="font-mono text-[10px] text-neutral-400 mt-1">
+        <div className="font-mono text-caption text-neutral-400 mt-1">
           {block.id}
         </div>
-        <div className="flex gap-2 mt-1 text-[10px] text-neutral-400">
+        <div className="flex gap-2 mt-1 text-caption text-neutral-400">
           <span>Created {new Date(block.created_at).toLocaleString()}</span>
           {block.updated_at && (
             <span>· Updated {new Date(block.updated_at).toLocaleString()}</span>
           )}
         </div>
         <div className="mt-3 grid gap-3 md:grid-cols-3">
-          <div className="border border-neutral-800 bg-neutral-950/60 p-3">
-            <div className="text-[10px] uppercase tracking-widest text-neutral-400">
+          <div className="rounded-md border border-border/70 bg-background/60 p-3">
+            <div className="text-caption uppercase tracking-widest text-neutral-400">
               Tier
             </div>
             <div className="mt-1 text-sm text-neutral-200">
               {blockTier(block)}
             </div>
           </div>
-          <div className="border border-neutral-800 bg-neutral-950/60 p-3">
-            <div className="text-[10px] uppercase tracking-widest text-neutral-400">
+          <div className="rounded-md border border-border/70 bg-background/60 p-3">
+            <div className="text-caption uppercase tracking-widest text-neutral-400">
               Used by
             </div>
             <div className="mt-1 text-sm text-neutral-200">
@@ -641,8 +663,8 @@ function BlockDetail({ block }: { block: Playbook }) {
                 : "General retrieval"}
             </div>
           </div>
-          <div className="border border-neutral-800 bg-neutral-950/60 p-3">
-            <div className="text-[10px] uppercase tracking-widest text-neutral-400">
+          <div className="rounded-md border border-border/70 bg-background/60 p-3">
+            <div className="text-caption uppercase tracking-widest text-neutral-400">
               Focus
             </div>
             <div className="mt-1 text-sm text-neutral-200">
@@ -673,16 +695,16 @@ function BlockDetail({ block }: { block: Playbook }) {
       </header>
 
       <section className="grid gap-3 md:grid-cols-3">
-        <div className="border border-neutral-800 bg-neutral-950/60 p-3">
-          <div className="text-[10px] uppercase tracking-widest text-neutral-400">
+        <div className="rounded-md border border-border/70 bg-background/60 p-3">
+          <div className="text-caption uppercase tracking-widest text-neutral-400">
             Detects
           </div>
           <p className="mt-2 text-xs leading-relaxed text-neutral-300">
             {block.situation.trim()}
           </p>
         </div>
-        <div className="border border-neutral-800 bg-neutral-950/60 p-3">
-          <div className="text-[10px] uppercase tracking-widest text-neutral-400">
+        <div className="rounded-md border border-border/70 bg-background/60 p-3">
+          <div className="text-caption uppercase tracking-widest text-neutral-400">
             Catches
           </div>
           <p className="mt-2 text-xs leading-relaxed text-neutral-300">
@@ -692,8 +714,8 @@ function BlockDetail({ block }: { block: Playbook }) {
                 "General task drift and re-derivation."}
           </p>
         </div>
-        <div className="border border-neutral-800 bg-neutral-950/60 p-3">
-          <div className="text-[10px] uppercase tracking-widest text-neutral-400">
+        <div className="rounded-md border border-border/70 bg-background/60 p-3">
+          <div className="text-caption uppercase tracking-widest text-neutral-400">
             Why it matters
           </div>
           <p className="mt-2 text-xs leading-relaxed text-neutral-300">
@@ -707,7 +729,7 @@ function BlockDetail({ block }: { block: Playbook }) {
       {block.situation && (
         <section>
           <SL>When to apply</SL>
-          <p className="text-neutral-300 text-[13px] leading-relaxed bg-neutral-900/40 border border-neutral-800 px-3 py-2.5">
+          <p className="text-neutral-300 text-heading leading-relaxed bg-muted/40 border border-border px-3 py-2.5">
             {block.situation.trim()}
           </p>
         </section>
@@ -720,12 +742,12 @@ function BlockDetail({ block }: { block: Playbook }) {
             {block.procedure.map((step, i) => (
               <li
                 key={i}
-                className="flex gap-3 bg-neutral-900/40 border border-neutral-800 px-3 py-2.5"
+                className="flex gap-3 bg-muted/40 border border-border px-3 py-2.5"
               >
-                <span className="shrink-0 w-5 h-5 bg-neutral-800 text-neutral-400 text-[10px] font-bold flex items-center justify-center mt-0.5">
+                <span className="shrink-0 w-5 h-5 bg-neutral-800 text-neutral-400 text-caption font-bold flex items-center justify-center mt-0.5">
                   {i + 1}
                 </span>
-                <span className="text-neutral-300 text-[13px] leading-relaxed">
+                <span className="text-neutral-300 text-heading leading-relaxed">
                   {step}
                 </span>
               </li>
@@ -741,17 +763,17 @@ function BlockDetail({ block }: { block: Playbook }) {
           <SL>Relationships</SL>
           <div className="flex flex-wrap gap-2">
             {block.task_types.map((item) => (
-              <Chip key={`task-${item}`} tone="violet">
+              <Chip key={`task-${item}`} tone="neutral">
                 task {item}
               </Chip>
             ))}
             {block.triggers.map((item) => (
-              <Chip key={`trigger-${item}`} tone="cyan">
+              <Chip key={`trigger-${item}`} tone="info">
                 trigger {item}
               </Chip>
             ))}
             {block.required_rubrics.map((item) => (
-              <Chip key={`rubric-${item}`} tone="emerald">
+              <Chip key={`rubric-${item}`} tone="success">
                 rubric {item}
               </Chip>
             ))}
@@ -766,7 +788,7 @@ function BlockDetail({ block }: { block: Playbook }) {
             {block.verification.map((v, i) => (
               <li
                 key={i}
-                className="flex gap-2 items-start text-[13px] text-emerald-300 bg-emerald-950/20 border border-emerald-900/30 px-3 py-2"
+                className="flex gap-2 items-start text-heading text-emerald-300 bg-emerald-950/20 border border-emerald-900/30 px-3 py-2"
               >
                 <Check size={14} className="shrink-0 text-emerald-300 mt-0.5" />
                 {v}
@@ -783,7 +805,7 @@ function BlockDetail({ block }: { block: Playbook }) {
             {block.dead_ends.map((d, i) => (
               <li
                 key={i}
-                className="flex gap-2 items-start text-[13px] text-red-300 bg-red-950/20 border border-red-900/30 px-3 py-2"
+                className="flex gap-2 items-start text-heading text-red-300 bg-red-950/20 border border-red-900/30 px-3 py-2"
               >
                 <X size={14} className="shrink-0 text-red-300 mt-0.5" />
                 {d}
@@ -800,7 +822,7 @@ function BlockDetail({ block }: { block: Playbook }) {
             {block.failure_signals.map((s, i) => (
               <li
                 key={i}
-                className="flex gap-2 items-start text-[13px] text-amber-300 bg-amber-950/20 border border-amber-900/30 px-3 py-2"
+                className="flex gap-2 items-start text-heading text-amber-300 bg-amber-950/20 border border-amber-900/30 px-3 py-2"
               >
                 <AlertTriangle
                   size={14}
@@ -816,7 +838,7 @@ function BlockDetail({ block }: { block: Playbook }) {
       {block.when_not_to_apply?.trim() && (
         <section>
           <SL>When NOT to apply</SL>
-          <p className="text-neutral-400 text-[13px] leading-relaxed bg-neutral-900/40 border border-neutral-700 px-3 py-2.5 italic">
+          <p className="text-neutral-400 text-heading leading-relaxed bg-muted/40 border border-neutral-700 px-3 py-2.5 italic">
             {block.when_not_to_apply.trim()}
           </p>
         </section>
@@ -831,7 +853,7 @@ function BlockDetail({ block }: { block: Playbook }) {
 
 function SL({ children }: { children: ReactNode }) {
   return (
-    <div className="text-[10px] uppercase font-bold tracking-widest text-neutral-400 mb-2">
+    <div className="text-caption uppercase font-bold tracking-widest text-neutral-400 mb-2">
       {children}
     </div>
   );
@@ -847,9 +869,9 @@ function Stat({
   color?: string;
 }) {
   return (
-    <div className="flex flex-col items-center bg-neutral-900/60 border border-neutral-800 px-2.5 py-1.5 min-w-[48px]">
+    <div className="flex flex-col items-center bg-muted/60 border border-border px-2.5 py-1.5 min-w-[48px]">
       <span className={`text-sm font-bold ${color}`}>{value}</span>
-      <span className="text-[10px] text-neutral-400 uppercase tracking-wide">
+      <span className="text-caption text-neutral-400 uppercase tracking-wide">
         {label}
       </span>
     </div>
@@ -860,13 +882,13 @@ function MatchHints({ block }: { block: Playbook }) {
   const [open, setOpen] = useState(false);
   return (
     <section>
-      <button
+      <UiButton unstyled
         onClick={() => setOpen(!open)}
-        className="flex items-center gap-2 text-[10px] uppercase font-bold tracking-widest text-neutral-400 hover:text-neutral-400 transition mb-2"
+        className="flex items-center gap-2 text-caption uppercase font-bold tracking-widest text-neutral-400 hover:text-neutral-400 transition mb-2"
       >
         {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />} Match
         hints
-      </button>
+      </UiButton>
       {open && (
         <div className="space-y-2">
           {block.triggers.length > 0 && (
@@ -911,12 +933,12 @@ function ChipRow({
 }) {
   return (
     <div>
-      <div className="text-[10px] uppercase text-neutral-400 mb-1">{label}</div>
+      <div className="text-caption uppercase text-neutral-400 mb-1">{label}</div>
       <div className="flex flex-wrap gap-1.5">
         {items.map((item) => (
           <span
             key={item}
-            className={`text-[11px] px-2 py-0.5 border ${color} ${mono ? "font-mono" : ""}`}
+            className={`text-label px-2 py-0.5 border ${color} ${mono ? "font-mono" : ""}`}
           >
             {item}
           </span>

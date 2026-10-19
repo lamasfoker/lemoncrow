@@ -77,12 +77,15 @@ def test_the_walk_respects_gitignore_never_enters_git_and_never_follows_symlinks
     (worktree / "pkg" / "link.py").symlink_to(worktree / "pkg" / "alpha.py")
     (worktree / ".lc-worktrees" / "nested").mkdir(parents=True)
     (worktree / ".lc-worktrees" / "nested" / "duplicate.py").write_text("def duplicate(): pass\n")
+    (worktree / ".claude" / "worktrees" / "nested").mkdir(parents=True)
+    (worktree / ".claude" / "worktrees" / "nested" / "duplicate.py").write_text("def duplicate(): pass\n")
     (worktree / ".lemoncrow").mkdir()
     (worktree / ".lemoncrow" / "runtime.py").write_text("def runtime_state(): pass\n")
     walked = walk_worktree(worktree, size_cap=CAP)
     paths = {file.path for file in walked.files}
     assert "pkg/alpha.py" in paths
     assert not any(path.startswith(".lc-worktrees/") for path in paths)
+    assert not any(path.startswith(".claude/") for path in paths), ".claude must never be walked"
     assert not any(path.startswith(".lemoncrow/") for path in paths)
     assert "build/artifact.o" not in paths, ".gitignore directory rule was not applied"
     assert "noisy.log" not in paths, ".gitignore glob rule was not applied"
@@ -90,6 +93,53 @@ def test_the_walk_respects_gitignore_never_enters_git_and_never_follows_symlinks
     assert "pkg/link.py" not in paths
     assert walked.symlinks == 1
     assert walked.ignored >= 2
+
+
+def test_the_committed_review_config_is_the_one_walked_lemoncrow_file(worktree: Path) -> None:
+    """Server-side Review reads surface config from the captured View."""
+    state = worktree / ".lemoncrow"
+    (state / "workspace").mkdir(parents=True)
+    (state / "review.yaml").write_text("version: 1\nsurfaces: []\n")
+    (state / "runtime.py").write_text("def runtime_state(): pass\n")
+    (state / "workspace" / "review.yaml").write_text("not the config\n")
+    (worktree / "pkg" / ".lemoncrow").mkdir()
+    (worktree / "pkg" / ".lemoncrow" / "review.yaml").write_text("nested state\n")
+    # Repositories commonly ignore the state directory and force-add the config;
+    # local Review reads it from disk either way, so ignore rules do not hide it.
+    ignore = worktree / ".gitignore"
+    ignore.write_text(ignore.read_text() + ".lemoncrow/\n")
+
+    walked = walk_worktree(worktree, size_cap=CAP)
+
+    assert sorted(file.path for file in walked.files if ".lemoncrow" in file.path) == [".lemoncrow/review.yaml"]
+
+
+def test_a_symlinked_review_config_or_state_dir_stays_outside_the_view(worktree: Path, tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "review.yaml").write_text("version: 1\n")
+    (worktree / ".lemoncrow").mkdir()
+    (worktree / ".lemoncrow" / "review.yaml").symlink_to(outside / "review.yaml")
+    assert not any(".lemoncrow" in file.path for file in walk_worktree(worktree, size_cap=CAP).files)
+
+    (worktree / ".lemoncrow" / "review.yaml").unlink()
+    (worktree / ".lemoncrow").rmdir()
+    (worktree / ".lemoncrow").symlink_to(outside, target_is_directory=True)
+    assert not any(".lemoncrow" in file.path for file in walk_worktree(worktree, size_cap=CAP).files)
+
+
+def test_the_walk_stops_at_nested_git_repository_boundaries(worktree: Path) -> None:
+    nested = worktree / "vendor" / "nested"
+    nested.mkdir(parents=True)
+    (nested / ".git").write_text("gitdir: /tmp/not-used-by-the-walker\n", encoding="utf-8")
+    (nested / "inside.py").write_text("def nested(): pass\n", encoding="utf-8")
+    (worktree / "vendor" / "owned.py").write_text("def owned(): pass\n", encoding="utf-8")
+
+    walked = walk_worktree(worktree, size_cap=CAP)
+    paths = {file.path for file in walked.files}
+
+    assert "vendor/owned.py" in paths
+    assert not any(path.startswith("vendor/nested/") for path in paths)
 
 
 def test_a_file_over_the_cap_is_manifested_but_not_uploadable(worktree: Path) -> None:
@@ -113,8 +163,8 @@ def test_mode_is_gits_two_modes_and_nothing_host_specific(worktree: Path) -> Non
 
 
 def test_parser_profile_is_derived_from_the_extension_only() -> None:
-    assert profile_for_path("a/b/c.py") == "python-1"
-    assert profile_for_path("a/b/c.PY") == "python-1"
+    assert profile_for_path("a/b/c.py") == "python-3"
+    assert profile_for_path("a/b/c.PY") == "python-3"
     assert profile_for_path("Makefile") == "lexical-1"
     assert profile_for_path("a.tar.gz") == "lexical-1"
     assert profile_for_path("x/.hidden") == "lexical-1", "a dotfile has no extension"
@@ -139,6 +189,17 @@ def _random_tree(root: Path, seed: int) -> None:
             "\n".join(rng.sample(["*.md", "build/", "/file1*", "**/*.rs", "!keep.md"], k=3)),
             encoding="utf-8",
         )
+    # LemonCrow state is never walked except the committed Review config, which
+    # both walks must pick up identically -- also when the state dir is ignored.
+    if rng.random() < 0.7:
+        state = root / ".lemoncrow"
+        state.mkdir()
+        (state / "review.yaml").write_text(f"version: 1\n# seed {seed}\n", encoding="utf-8")
+        (state / "index.sqlite").write_bytes(b"local state")
+        if rng.random() < 0.5:
+            ignore = root / ".gitignore"
+            existing = ignore.read_text(encoding="utf-8") if ignore.exists() else ""
+            ignore.write_text(existing + "\n.lemoncrow/\n", encoding="utf-8")
 
 
 @pytest.mark.skipif(not server_available(), reason=REASON)

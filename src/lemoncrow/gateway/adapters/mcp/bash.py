@@ -15,6 +15,8 @@ import logging
 import os
 import re
 import shlex
+import shutil
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -230,6 +232,12 @@ _BASH_IDLE_FLOOR_S = _bash_env_float("LEMONCROW_BASH_IDLE_FLOOR", 120.0)
 _BASH_IDLE_GRACE_S = _bash_env_float("LEMONCROW_BASH_IDLE_GRACE", 75.0)
 # How often progress is sampled while waiting.
 _BASH_IDLE_TICK_S = _bash_env_float("LEMONCROW_BASH_IDLE_TICK", 3.0)
+# Small synchronous completion-edge grace: if the child exits exactly as its
+# response budget expires, give the watcher/poller one final chance to reap the
+# terminal result instead of returning a handle that immediately flips state.
+# This must stay tiny: `timeout` is a response wait budget, not `timeout + 10s`.
+_BASH_COMPLETION_EDGE_GRACE_S = 0.25
+
 # Bound one MCP response independently from the managed command's own wait
 # budget. Hosts often impose a shorter RPC/orchestration window; returning the
 # durable shell id before that boundary avoids losing the run and re-starting it.
@@ -403,6 +411,149 @@ def _start_idle_deadline_watcher(
     thread.start()
 
 
+_HOST_MARKERS = ("LEMONCROW_AGENT", "CLAUDE_CODE", "CLAUDECODE", "CLAUDE_CODE_SESSION_ID")
+
+
+def _verified_work_host() -> str:
+    """Host label for the Auto gate.
+
+    ``detect_host`` falls back to ``claude`` when nothing identifies the host;
+    that fallback must not qualify an unknown host (e.g. Codex without a
+    label) for transparent repair, so it maps to ``""`` (unsupported).
+    """
+    from lemoncrow.gateway.adapters.mcp.ledger import _detect_agent, _request_session
+
+    ctx = getattr(_request_session, "value", None)
+    if isinstance(ctx, dict) and ctx.get("host"):
+        return str(ctx["host"])
+    host = _detect_agent()
+    if host == "claude" and not any(os.environ.get(name, "").strip() for name in _HOST_MARKERS):
+        return ""
+    return host
+
+
+def _apply_verified_work_after_bash(command: str, effective_cwd: str, result: dict[str, Any]) -> dict[str, Any]:
+    """Apply optional verifier-triggered local work to a terminal Bash result.
+
+    Shadow mode queues background observation and returns the exact original
+    result. Enforce mode changes the result only after a candidate has passed the
+    exact verifier, promoted transactionally, and passed the verifier again in
+    the live checkout -- and only in a repository that opted in to Auto for
+    that model and kind on a qualified host. Otherwise enforce behaves like
+    Learning; the first refusal for want of an opt-in appends one notice.
+    All failures are fail-open to the original Bash result.
+    """
+
+    try:
+        exit_code = int(result.get("exit_code", 0) or 0)
+    except (TypeError, ValueError):
+        return result
+    if exit_code == 0 or result.get("blocked"):
+        return result
+    if os.environ.get("LEMONCROW_BASH_WORKSPACE_ROOT", "").strip():
+        return result
+    try:
+        from lemoncrow.core.capabilities.verified_work import (
+            build_opportunity,
+            evaluate_eligibility,
+            load_verified_work_settings,
+        )
+
+        settings = load_verified_work_settings()
+        if settings.mode == "off":
+            return result
+
+        from lemoncrow.gateway.adapters.mcp.ledger import _get_claude_session_id, _get_ledger
+        from lemoncrow.pro.capabilities.verified_work.consent import auto_gate, consent_notice_for
+        from lemoncrow.pro.capabilities.verified_work.repairs import promotion_notice
+        from lemoncrow.pro.capabilities.verified_work.runtime import run_enforced_repair_bounded
+
+        workspace_raw = (
+            os.environ.get("CLAUDE_WORKSPACE_ROOT") or os.environ.get("LEMONCROW_WORKSPACE_ROOT") or effective_cwd
+        )
+        workspace = Path(workspace_raw).expanduser().resolve()
+        cwd = Path(effective_cwd).expanduser().resolve()
+        if not workspace.is_dir() or not cwd.is_dir():
+            return result
+        opportunity = build_opportunity(
+            session_id=_get_claude_session_id() or "_global",
+            workspace=workspace,
+            command=command,
+            cwd=cwd,
+            exit_code=exit_code,
+            stdout=str(result.get("stdout") or ""),
+            stderr=str(result.get("stderr") or ""),
+        )
+        if opportunity is None:
+            return result
+        decision = evaluate_eligibility(opportunity, settings)
+        host = _verified_work_host()
+        gate = (
+            auto_gate(settings, workspace=workspace, kind=opportunity.kind, host=host)
+            if settings.mode == "enforce" and decision.eligible
+            else None
+        )
+        if settings.mode == "shadow" or (gate is not None and not gate.allowed):
+            if decision.eligible:
+                from lemoncrow.core.foundation.paths import default_store_root
+                from lemoncrow.pro.capabilities.verified_work.jobs import enqueue_and_spawn
+
+                enqueue_and_spawn(
+                    default_store_root(),
+                    {
+                        "host": "mcp",
+                        "session_id": opportunity.session_id,
+                        "workspace": str(workspace),
+                        "cwd": str(cwd),
+                        "command": command,
+                        "exit_code": exit_code,
+                        "stdout": str(result.get("stdout") or ""),
+                        "stderr": str(result.get("stderr") or ""),
+                    },
+                )
+            notice = consent_notice_for(gate)
+            if not notice:
+                return result
+            noticed = dict(result)
+            stdout = str(result.get("stdout") or "")
+            separator = "\n" if stdout and not stdout.endswith("\n") else ""
+            noticed["stdout"] = f"{stdout}{separator}{notice}\n"
+            return noticed
+
+        sink = _get_ledger()
+        repair = run_enforced_repair_bounded(
+            opportunity,
+            decision,
+            sink=sink,
+            settings=settings,
+            host=host,
+            allowed_models=gate.models if gate is not None else None,
+        )
+        if not repair.promoted:
+            return result
+        updated = dict(result)
+        updated["exit_code"] = 0
+        updated["stderr"] = ""
+        updated["stdout"] = promotion_notice(
+            repair.changed_paths, attempts=repair.attempts, record_id=repair.repair_record_id
+        )
+        updated["verified_work"] = {
+            "promoted": True,
+            "model": repair.model,
+            "attempts": repair.attempts,
+            "changed_paths": list(repair.changed_paths),
+            "diff_lines": repair.diff_lines,
+            "verifier_duration_ms": repair.verifier_duration_ms,
+            "network_isolated": repair.network_isolated,
+            "resource_limited": repair.resource_limited,
+            "repair_record_id": repair.repair_record_id,
+        }
+        return updated
+    except Exception:
+        logger.debug("verified-work execution failed", exc_info=True)
+        return result
+
+
 def _run_bash_tool(
     command: str = "",
     timeout: int | None = None,
@@ -449,15 +600,27 @@ def _run_bash_tool(
             return json.dumps(matches, ensure_ascii=False)
         return json.dumps(payload, ensure_ascii=False)
 
-    workspace = os.environ.get("CLAUDE_WORKSPACE_ROOT", os.getcwd())
-    # A misconfigured CLAUDE_WORKSPACE_ROOT -- e.g. a host path that leaked into
-    # a container via the environment and does not exist here -- would make every
-    # cwd-less command fail with a raw FileNotFoundError from Popen, surfaced as
-    # an opaque "MCP error -32000". Fall back to the process cwd (always a real
-    # directory) so the command still runs instead of hard-failing.
+    review_execution_root = os.environ.get("LEMONCROW_BASH_WORKSPACE_ROOT", "").strip()
+    workspace = review_execution_root or os.environ.get("CLAUDE_WORKSPACE_ROOT", os.getcwd())
+    # A misconfigured host workspace would otherwise make every cwd-less command
+    # fail with an opaque FileNotFoundError. Review Ask is stricter: its execution
+    # root is an explicit disposable copy, so a missing root is a configuration
+    # error rather than a reason to fall back to the live process cwd.
     if not Path(workspace).is_dir():
+        if review_execution_root:
+            raise ValueError(f"Review Bash execution root is unavailable: {workspace}")
         workspace = os.getcwd()
-    effective_cwd = cwd or workspace
+    if review_execution_root:
+        shell_root = Path(workspace).resolve()
+        requested_cwd = Path(cwd) if cwd else shell_root
+        resolved_cwd = (
+            requested_cwd.resolve() if requested_cwd.is_absolute() else (shell_root / requested_cwd).resolve()
+        )
+        if resolved_cwd != shell_root and shell_root not in resolved_cwd.parents:
+            raise ValueError("Review Bash cwd must stay inside the disposable execution workspace")
+        effective_cwd = str(resolved_cwd)
+    else:
+        effective_cwd = cwd or workspace
 
     if action in {"poll", "kill", "status", "update", "send"}:
         if not session_id:
@@ -554,9 +717,12 @@ def _run_bash_tool(
         background = True
 
     _shell_workspace_root = Path(workspace).resolve()
+    allowed_write_roots = [_shell_workspace_root]
+    if not review_execution_root:
+        allowed_write_roots.extend(_claude_additional_dirs(_shell_workspace_root))
     policy = classify_command(
         command,
-        allowed_write_roots=[_shell_workspace_root, *_claude_additional_dirs(_shell_workspace_root)],
+        allowed_write_roots=allowed_write_roots,
         cwd=effective_cwd,
     )
 
@@ -568,6 +734,17 @@ def _run_bash_tool(
             "blocked": True,
             "blocked_reason": policy.reason,
         }
+
+    child_env: dict[str, str] | None = None
+    if review_execution_root:
+        from lemoncrow.core.foundation.paths import pin_workspace_env
+
+        child_env = dict(os.environ)
+        pin_workspace_env(_shell_workspace_root, child_env)
+        child_env["LEMONCROW_BASH_WORKSPACE_ROOT"] = str(_shell_workspace_root)
+        child_env["LEMONCROW_SERVICE_URL"] = ""
+        child_env["LEMONCROW_MCP_TOOL_PROFILE"] = "review"
+        child_env.pop("LEMONCROW_REVIEW_SNAPSHOT_ROOT", None)
 
     # Soft external-compactor pass-through (e.g. rtk, when detected and
     # enabled -- see tool_supervision.external_compactors): substitute the
@@ -787,6 +964,52 @@ def _run_bash_tool(
                 "duration_ms": 0,
             }
 
+    # Review Ask gets a writable disposable copy of the immutable Snapshot.
+    # On Linux, Bubblewrap makes the rest of the host filesystem read-only while
+    # leaving only that execution copy writable. This protects the canonical
+    # Snapshot even from indirect writes hidden inside test/build scripts.
+    if review_execution_root and sys.platform.startswith("linux"):
+        bwrap = shutil.which("bwrap")
+        if bwrap:
+            scratch_root = _shell_workspace_root / ".lemoncrow-review-tmp"
+            scratch_root.mkdir(parents=True, exist_ok=True)
+            command = " ".join(
+                shlex.quote(part)
+                for part in (
+                    bwrap,
+                    "--die-with-parent",
+                    "--ro-bind",
+                    "/",
+                    "/",
+                    "--bind",
+                    str(_shell_workspace_root),
+                    str(_shell_workspace_root),
+                    "--dev-bind",
+                    "/dev",
+                    "/dev",
+                    "--proc",
+                    "/proc",
+                    "--chdir",
+                    str(effective_cwd),
+                    "--setenv",
+                    "TMPDIR",
+                    str(scratch_root),
+                    "--setenv",
+                    "XDG_CACHE_HOME",
+                    str(scratch_root / ".cache"),
+                    "--setenv",
+                    "UV_CACHE_DIR",
+                    str(scratch_root / "uv-cache"),
+                    "--setenv",
+                    "npm_config_cache",
+                    str(scratch_root / "npm-cache"),
+                    "--",
+                    "/bin/bash",
+                    "-lc",
+                    command,
+                )
+            )
+
     # One execution model: every command runs as a managed session; the only
     # variable is how long we block inline before returning a poll handle.
     #   background → 0s (detach immediately, poll/cancel by session)
@@ -799,6 +1022,7 @@ def _run_bash_tool(
     started = start_managed_command(
         command,
         cwd=effective_cwd,
+        env=child_env,
         timeout=timeout,
         max_lines=max_lines,
         max_chars=max_output_tokens * 4 if max_output_tokens is not None else None,
@@ -812,6 +1036,15 @@ def _run_bash_tool(
     if started.get("status") != "running" or not managed_id:
         return started  # blocked by policy
     _record_mcp_managed_bash(started)
+
+    if background:
+        # Detach means detach immediately. A very short command can finish
+        # between start_managed_command() and the first poll below; polling it
+        # here would reap the session and strip its id, making bg batches return
+        # `?` for whichever command won that race. The durable handle remains
+        # pollable even when the watcher records completion immediately after
+        # this return.
+        return started
 
     if interactive:
         # An interactive session never finishes on its own -- hand the handle
@@ -862,6 +1095,7 @@ def _run_bash_tool(
                 shipped_chars=len(str(polled.get("stdout") or "")) + len(str(polled.get("stderr") or "")),
                 omitted_chars=chars_omitted,
             )
+            polled = _apply_verified_work_after_bash(_stats_command, effective_cwd, polled)
             return polled
 
         def _register(cb: Callable[[], None]) -> bool:
@@ -891,7 +1125,7 @@ def _run_bash_tool(
     # deadline, so we return that reaped terminal result instead of a handle
     # to a session that's about to change state anyway.
     if inline_wait >= float(timeout):
-        inline_wait = float(timeout) + 10.0
+        inline_wait = float(timeout) + _BASH_COMPLETION_EDGE_GRACE_S
     start_wait = time.monotonic()
     deadline = start_wait + inline_wait
     # Idle early-return for the synchronous path (CLI/tests; the MCP server takes
@@ -946,6 +1180,7 @@ def _run_bash_tool(
         shipped_chars=len(str(polled.get("stdout") or "")) + len(str(polled.get("stderr") or "")),
         omitted_chars=chars_omitted,
     )
+    polled = _apply_verified_work_after_bash(_stats_command, effective_cwd, polled)
     return polled
 
 
@@ -986,7 +1221,7 @@ BASH_TOOL_INPUT_SCHEMA: dict[str, Any] = {
         "timeout": {
             "type": "integer",
             "default": _DEFAULT_BASH_SOFT_TIMEOUT,
-            "description": "Command wait budget. Long MCP waits may return the same durable run id earlier to stay inside the host orchestration window; the command continues. Long builds → 21600.",
+            "description": "Wait budget; long MCP waits may return the durable run id early while the command continues. Long builds → 21600.",
         },
         "bg": {
             "type": "boolean",
@@ -1020,9 +1255,9 @@ BASH_TOOL_INPUT_SCHEMA: dict[str, Any] = {
     name="bash",
     input_schema=BASH_TOOL_INPUT_SCHEMA,
     description=(
-        "Execute git/build/test/install commands; use indexed tools for code reads/search. "
-        "cd doesn't persist → set cwd or use absolute paths. timeout budgets the command wait; long MCP waits return a durable id early. "
-        "Servers → bg=true; REPLs → interactive=true. Batch checks with command=[...]."
+        "Execute git/build/test/install; indexed tools handle code reads/search. "
+        "cd doesn't persist → set cwd or absolute paths. Long waits may return an id early. "
+        "Servers → bg=true; REPLs → interactive=true; batches → command=[...]."
     ),
     param_aliases={"session_id": "id", "background": "bg", "is_background": "bg"},
     recover_args=_lift_bash_command_list,

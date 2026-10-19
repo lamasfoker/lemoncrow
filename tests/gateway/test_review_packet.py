@@ -21,9 +21,15 @@ from lemoncrow.pro.capabilities.review.gitdiff import (
     load_blobs,
     resolve_rev_range,
 )
-from lemoncrow.pro.capabilities.review.packet import build_review_packet, build_review_packet_with_blobs
+from lemoncrow.pro.capabilities.review.packet import (
+    attach_changed_symbols,
+    attach_impact,
+    build_review_packet,
+    build_review_packet_with_blobs,
+)
 from lemoncrow.pro.capabilities.review.session_models import ReviewSession
 from lemoncrow.pro.capabilities.review.sources.local import range_for_session, source_ref
+from lemoncrow.pro.capabilities.review.units import derive_units
 
 _HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
@@ -646,7 +652,7 @@ def test_submodule_pointer_bump_names_its_commits_and_claims_no_unreadable_blob(
     reads necessarily fail (the old side is a commit this repository does not
     contain, the new side is a directory on disk), so a perfectly ordinary
     submodule bump raised ``blob_unreadable`` -- a degraded signal whose only
-    published remedy is ``lc code index``, which cannot help: there is no blob to
+    published remedy is ``lc runtime index``, which cannot help: there is no blob to
     read and no index that would ever have held one. Telling a reviewer to
     rebuild an index to recover content that does not exist is worse than saying
     nothing. The row instead carries the two commit ids, which *are* the change,
@@ -927,3 +933,54 @@ def test_an_explicit_pair_that_is_not_the_fallback_carries_nothing(tmp_path: Pat
     assert unrelated.submodule_dirt_discounted == 0
     assert _submodule_signals(parent, unrelated) == []
     assert _reopened(parent, unrelated).submodule_dirt_discounted == 0
+
+
+def test_symbol_only_startup_and_impact_enrichment_preserve_review_unit_identity(tmp_path: Path) -> None:
+    root = tmp_path / "progressive"
+    repo = _init_repo(root)
+    _write(root, "src/app.py", "def value():\n    return 1\n")
+    _commit(repo, "base", 0)
+    _write(root, "src/app.py", "def value():\n    return 2\n")
+    rng = resolve_rev_range(root, working_tree=True)
+
+    base = build_review_packet_with_blobs(
+        root,
+        rng,
+        store_root=tmp_path / "store",
+        with_impact=False,
+        with_provenance=False,
+        with_patch_text=True,
+        unbounded_patch_text=True,
+    )
+    source_ready = attach_changed_symbols(root, base)
+    enriched = attach_impact(root, rng, source_ready)
+
+    before = derive_units(source_ready.packet, source_ready.blobs.new)
+    after = derive_units(enriched.packet, enriched.blobs.new)
+    before_identity = {
+        unit.unit_key: (
+            unit.kind,
+            unit.path,
+            unit.symbol,
+            unit.ordinal,
+            unit.start_line,
+            unit.end_line,
+            unit.content_fingerprint,
+            unit.fingerprint_method,
+        )
+        for unit in before
+    }
+    after_identity = {
+        unit.unit_key: (
+            unit.kind,
+            unit.path,
+            unit.symbol,
+            unit.ordinal,
+            unit.start_line,
+            unit.end_line,
+            unit.content_fingerprint,
+            unit.fingerprint_method,
+        )
+        for unit in after
+    }
+    assert before_identity == after_identity

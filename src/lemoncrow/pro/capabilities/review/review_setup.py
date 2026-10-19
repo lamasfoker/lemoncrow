@@ -35,6 +35,8 @@ class ReviewSetupReport:
     candidates: tuple[SetupCandidate, ...]
     runtime_candidates: tuple[RunnerSetupCandidate, ...]
     issues: tuple[SetupIssue, ...]
+    preview_renderers: tuple[str, ...] = ()
+    surface_comparators: tuple[str, ...] = ()
 
     @property
     def auto_candidates(self) -> tuple[SetupCandidate, ...]:
@@ -78,6 +80,8 @@ class ReviewSetupReport:
                 for candidate in self.runtime_candidates
             ],
             "issues": [{"level": issue.level, "message": issue.message} for issue in self.issues],
+            "preview_renderers": list(self.preview_renderers),
+            "surface_comparators": list(self.surface_comparators),
         }
 
 
@@ -94,6 +98,14 @@ def inspect_review_setup(
     candidates = registry.setup_candidates(root)
     runtime_candidates = runner_registry.setup_candidates(root)
     issues: list[SetupIssue] = []
+
+    from lemoncrow.pro.capabilities.review.comparisons import built_in_comparator_registry
+    from lemoncrow.pro.capabilities.review.previews import built_in_preview_registry
+
+    preview_registry = built_in_preview_registry()
+    comparator_registry = built_in_comparator_registry()
+    for plugin_issue in (*getattr(registry, "issues", ()), *preview_registry.issues, *comparator_registry.issues):
+        issues.append(SetupIssue("error", f"{plugin_issue.kind} plugin {plugin_issue.plugin!r}: {plugin_issue.reason}"))
 
     available_providers = {provider.provider_id for provider in registry.providers()}
     available_runners = {runner.runner_id for runner in runner_registry.runners()}
@@ -151,7 +163,15 @@ def inspect_review_setup(
                 "no built-in surfaces or runtimes detected; add .lemoncrow/review.yaml or install provider/runner plugins",
             )
         )
-    return ReviewSetupReport(root, config, candidates, runtime_candidates, tuple(issues))
+    return ReviewSetupReport(
+        root,
+        config,
+        candidates,
+        runtime_candidates,
+        tuple(issues),
+        tuple(renderer.renderer_id for renderer in preview_registry.renderers()),
+        tuple(comparator.comparator_id for comparator in comparator_registry.comparators()),
+    )
 
 
 def _auto_service_surfaces(runtime_candidates: tuple[RunnerSetupCandidate, ...]) -> tuple[SetupCandidate, ...]:
@@ -202,6 +222,8 @@ def render_review_setup(report: ReviewSetupReport) -> str:
                 detail = f" · {candidate.details.get('framework', '')} · routes auto"
             elif candidate.provider == "bruno":
                 detail = f" · {candidate.details.get('collection', '')}"
+            elif candidate.provider == "storybook":
+                detail = f" · {candidate.details.get('config_dir', '')} · stories auto"
             flag = "auto" if candidate.auto_write else "manual"
             lines.append(f"  {candidate.provider:<8} {candidate.id:<26} {root}{detail}  [{flag}]")
     else:
@@ -233,6 +255,8 @@ def render_review_setup(report: ReviewSetupReport) -> str:
             "",
             "Surface plugins: lemoncrow.review_surface_providers",
             "Runner plugins:  lemoncrow.review_runners",
+            "Preview plugins: lemoncrow.review_preview_renderers"
+            + (f" · installed: {', '.join(report.preview_renderers)}" if report.preview_renderers else ""),
         )
     )
     return "\n".join(lines)

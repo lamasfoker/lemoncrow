@@ -54,8 +54,8 @@ WORKSPACE="$(cd "$WORKSPACE" && pwd)"
 # the repo's own AGENTS.md (that is LemonCrow's dev entrypoint, not a user persona).
 AGENTS_SOURCE="${LEMONCROW_REPO}/integrations/AGENTS.lemoncrow.md"
 
-info()  { [[ "${LEMONCROW_VERBOSE:-0}" == "1" ]] && echo "[lemoncrow:agents] $*" || true; }
-warn()  { echo "[lemoncrow:agents] WARN: $*" >&2; }
+info()  { [[ "${LEMONCROW_VERBOSE:-0}" == "1" ]] && echo "[lc:agents] $*" || true; }
+warn()  { echo "[lc:agents] WARN: $*" >&2; }
 run()   { $DRY_RUN && echo "  [dry-run] $*" || "$@"; }
 
 if $PRINT_ONLY; then
@@ -68,7 +68,7 @@ if $PRINT_ONLY; then
     echo "   Source: ${AGENTS_SOURCE}"
     echo ""
     echo "2. Install the Git prepare-commit-msg hook for LemonCrow co-author attribution"
-    echo "   Trailer: Co-Authored-By: lemoncrow <302591943+lemoncrow-agent[bot]@users.noreply.github.com>"
+    echo "   Trailer: Co-Authored-By: lemoncrow+<model> <302591943+lemoncrow-agent[bot]@users.noreply.github.com>"
     echo ""
     echo "After install, AGENTS.md will contain the lemoncrow:code agent persona and commits will carry LemonCrow attribution."
     exit 0

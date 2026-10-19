@@ -56,9 +56,8 @@ def tool_web_fetch(
         str | None,
         Field(
             description=(
-                "Search term. Long page → keep the most relevant sections/table-rows "
-                "(embedding rank if a local embedder is configured, else keyword coverage) "
-                "instead of a blind head cut. Omit = head truncation."
+                "Search term: long page → keep the most relevant sections/rows (embedding "
+                "rank if configured, else keyword) instead of a head cut. Omit = head truncation."
             )
         ),
     ] = None,
@@ -66,9 +65,9 @@ def tool_web_fetch(
         bool,
         Field(
             description=(
-                "Bounded gist instead of the rendered page (LLM summary if configured, else "
-                "extractive). Full page spilled first; the footer names the path — recover "
-                "via `read`. Ignored when `query` or `type='html'` is set."
+                "Bounded gist instead of the page (LLM summary if configured, else extractive); "
+                "the full page is spilled and the footer names its path for `read`. "
+                "Ignored with `query` or `type='html'`."
             )
         ),
     ] = False,

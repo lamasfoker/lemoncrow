@@ -12,7 +12,7 @@
 #   Global mode: installs lemoncode user config and user agent under ~/.config/lemoncode.
 #   Workspace mode (--workspace DIR): installs project-local lemoncode artifacts under DIR.
 #   Config merge includes both:
-#     - MCP server entry (lc mcp)
+#     - MCP server entry (lc runtime mcp)
 #     - OpenAI-compatible provider entry (LemonCrow service /v1 endpoint)
 #
 # Options:
@@ -51,7 +51,7 @@ print(Path(str(importlib.resources.files("lemoncrow"))))
 _PY
     )"
     if [[ -z "$DIST_ROOT" || ! -d "$DIST_ROOT/integrations" ]]; then
-        echo "[lemoncrow:lemoncode] ERROR: cannot locate lemoncrow distribution assets" >&2
+        echo "[lc:lemoncode] ERROR: cannot locate lemoncrow distribution assets" >&2
         exit 1
     fi
 fi
@@ -117,8 +117,8 @@ else
     LEMONCROW_OPENAI_BASE="${LEMONCROW_GATEWAY_BASE}/v1"
 fi
 
-info()  { [[ "${LEMONCROW_VERBOSE:-0}" == "1" ]] && echo "[lemoncrow:lemoncode] $*" || true; }
-warn()  { echo "[lemoncrow:lemoncode] WARN: $*" >&2; }
+info()  { [[ "${LEMONCROW_VERBOSE:-0}" == "1" ]] && echo "[lc:lemoncode] $*" || true; }
+warn()  { echo "[lc:lemoncode] WARN: $*" >&2; }
 run()   { $DRY_RUN && echo "  [dry-run] $*" || eval "$@"; }
 PYTHON_CMD=("${DIST_PYTHON[@]}")
 backup_file() {
@@ -160,7 +160,7 @@ if $WORKSPACE_SET; then
   "mcp": {
     "lc": {
       "type": "local",
-      "command": ["lemoncrow", "mcp", "--host", "lemoncode"],
+      "command": ["lemoncrow", "runtime", "mcp", "--host", "lemoncode"],
       "environment": {
         "LEMONCROW_WORKSPACE_ROOT": "${WORKSPACE}",
         "LEMONCROW_MCP_TOOL_PROFILE": "core"
@@ -197,7 +197,7 @@ else
   "mcp": {
     "lc": {
       "type": "local",
-      "command": ["lemoncrow", "mcp", "--host", "lemoncode"],
+      "command": ["lemoncrow", "runtime", "mcp", "--host", "lemoncode"],
       "environment": {
         "LEMONCROW_MCP_TOOL_PROFILE": "core"
       }
@@ -228,21 +228,21 @@ fi
 # third-party installers, this one downloads the missing host instead of
 # skipping. The binary lands at <store>/bin/lemoncode-host.
 #
-# Note this is NOT `command -v lemoncode`: that name is a lemoncrow wheel
-# console script (an alias for `lc code`) present after every LemonCrow install.
+# Do not use `command -v lemoncode` as the managed-host check: users may have a
+# separate LemonCode executable. LemonCrow's managed binary is `lemoncode-host`.
 if ! lemoncrow_lemoncode_host_installed; then
     if $DRY_RUN; then
-        echo "  [dry-run] lc code host install"
+        echo "  [dry-run] lc host install"
     else
-        echo "[lemoncrow:lemoncode] LemonCode host not found - installing it now..."
+        echo "[lc:lemoncode] LemonCode host not found - installing it now..."
         if ! lemoncrow_lemoncode_host_install; then
             if $STRICT; then
-                echo "[lemoncrow:lemoncode] ERROR: could not install the LemonCode host." \
-                     "Run 'lc code host install' or 'lc code host build --source lemoncode'" >&2
+                echo "[lc:lemoncode] ERROR: could not install the LemonCode host." \
+                     "Run 'lc host install' or 'lc host build --source lemoncode'" >&2
                 exit 1
             fi
             warn "could not install the LemonCode host - SKIPPING." \
-                 "Retry with 'lc code host install'"
+                 "Retry with 'lc host install'"
             echo "=== SKIPPED (LemonCode host unavailable) ==="
             exit 0
         fi
@@ -277,7 +277,7 @@ existing['default_agent'] = new_entry['default_agent']
 existing.pop('model', None)
 existing.setdefault('permission', {}).update(new_entry['permission'])
 path.write_text(json.dumps(existing, indent=2) + '\n', encoding='utf-8')
-print(f"[lemoncrow:lemoncode] merged lc entry into {path}")
+print(f"[lc:lemoncode] merged lc entry into {path}")
 PYEOF
     fi
 else
@@ -301,7 +301,7 @@ from pathlib import Path
 from lemoncrow.core.capabilities.workspace_host_overrides import write_workspace_opencode_agents
 
 written = write_workspace_opencode_agents(Path("${WORKSPACE}"), role_ids=tuple(r for r in "${ROLES}".split(",") if r))
-print(f"[lemoncrow:lemoncode] projected {len(written)} workspace-local LemonCode agents into ${AGENT_DEST_DIR}")
+print(f"[lc:lemoncode] projected {len(written)} workspace-local LemonCode agents into ${AGENT_DEST_DIR}")
 PYEOF
     fi
 elif [[ "$ROLES" == "code" ]]; then
@@ -338,7 +338,7 @@ from pathlib import Path
 from lemoncrow.core.capabilities.workspace_host_overrides import write_opencode_agents
 
 written = write_opencode_agents(Path("${AGENT_DEST_DIR}"), role_ids=tuple(r for r in "${ROLES}".split(",") if r))
-print(f"[lemoncrow:lemoncode] projected {len(written)} global LemonCode agents into ${AGENT_DEST_DIR}")
+print(f"[lc:lemoncode] projected {len(written)} global LemonCode agents into ${AGENT_DEST_DIR}")
 PYEOF
         "${PYTHON_CMD[@]}" - <<PYEOF2
 import json
@@ -362,6 +362,7 @@ else
     run "mkdir -p $(printf %q "$PLUGIN_DEST_DIR")"
     run "cp -f $(printf %q "$PLUGIN_SRC_DIR/lemoncrow-nudge.js") $(printf %q "$PLUGIN_DEST_DIR/lemoncrow-nudge.js")"
     run "cp -f $(printf %q "$PLUGIN_SRC_DIR/lemoncrow_nudge.py") $(printf %q "$PLUGIN_DEST_DIR/lemoncrow_nudge.py")"
+    run "printf '%s\n' lemoncode > $(printf %q "$PLUGIN_DEST_DIR/.lemoncrow-host")"
     info "LemonCrow nudge plugin installed -> $PLUGIN_DEST_DIR/lemoncrow-nudge.js"
 fi
 
@@ -375,7 +376,7 @@ fi
 info "Running post-install verification..."
 VFAIL=0
 vpass() { info "PASS: $*"; }
-vfail() { echo "[lemoncrow:lemoncode] FAIL: $*" >&2; VFAIL=1; }
+vfail() { echo "[lc:lemoncode] FAIL: $*" >&2; VFAIL=1; }
 
 if [ -f "$OC_FILE" ]; then
     HAS=$(LEMONCROW_OC_FILE="$OC_FILE" "${PYTHON_CMD[@]}" - <<PYEOF
@@ -452,6 +453,12 @@ fi
 
 PLUGIN_FILE="${PLUGIN_DEST_DIR}/lemoncrow-nudge.js"
 PLUGIN_HELPER="${PLUGIN_DEST_DIR}/lemoncrow_nudge.py"
+PLUGIN_HOST_MARKER="${PLUGIN_DEST_DIR}/.lemoncrow-host"
+if [ "$(cat "$PLUGIN_HOST_MARKER" 2>/dev/null || true)" = "lemoncode" ]; then
+    vpass "lemoncode LemonCrow plugin host marker is correct"
+else
+    vfail "lemoncode LemonCrow plugin host marker is missing or incorrect"
+fi
 if [ -f "$PLUGIN_FILE" ] && [ -f "$PLUGIN_HELPER" ]; then
     vpass "lemoncode LemonCrow prompt nudge plugin installed: $PLUGIN_FILE"
 else
@@ -485,7 +492,7 @@ else
 fi
 
 if [ "$VFAIL" -ne 0 ]; then
-    echo "[lemoncrow:lemoncode] ERROR: post-install verification failed." >&2
+    echo "[lc:lemoncode] ERROR: post-install verification failed." >&2
     exit 1
 fi
 info "All post-install checks passed"

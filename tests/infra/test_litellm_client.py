@@ -21,10 +21,17 @@ class _Choice:
 
 
 class _Response:
-    def __init__(self, content: str, *, usage: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        content: str,
+        *,
+        usage: dict[str, Any] | None = None,
+        response_cost: float | None = None,
+    ) -> None:
         self.choices = [_Choice(content)]
         self.usage = usage or {}
         self.id = "litellm-response"
+        self._hidden_params = {} if response_cost is None else {"response_cost": response_cost}
 
 
 class _FakeLiteLLM:
@@ -34,17 +41,19 @@ class _FakeLiteLLM:
         *,
         usage: dict[str, Any] | None = None,
         reject_response_format: bool = False,
+        response_cost: float | None = None,
     ) -> None:
         self._content = content
         self._usage = usage or {}
         self._reject_response_format = reject_response_format
+        self._response_cost = response_cost
         self.calls: list[dict[str, Any]] = []
 
     def completion(self, **kwargs: Any) -> _Response:
         self.calls.append(kwargs)
         if self._reject_response_format and "response_format" in kwargs:
             raise ValueError("response_format unsupported for this provider")
-        return _Response(self._content, usage=self._usage)
+        return _Response(self._content, usage=self._usage, response_cost=self._response_cost)
 
 
 def test_chat_json_schema_requests_json_object(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -148,3 +157,20 @@ def test_chat_with_result_preserves_structured_messages_and_prompt_cache_usage(
     assert fake.calls[0]["api_key"] == "bedrock-token"
     assert result.cache_read_input_tokens == 900
     assert result.cache_write_input_tokens == 300
+
+
+def test_chat_with_result_preserves_provider_reported_cost(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _FakeLiteLLM(
+        '{"ok": true}',
+        usage={"prompt_tokens": 10, "completion_tokens": 4},
+        response_cost=0.0125,
+    )
+    monkeypatch.setattr(litellm_client, "_litellm_module", lambda: fake)
+
+    result = litellm_client.chat_with_result(
+        [{"role": "user", "content": "Return JSON"}],
+        json_schema={"type": "object"},
+    )
+
+    assert result.provider_cost == pytest.approx(0.0125)
+    assert result.currency == "USD"

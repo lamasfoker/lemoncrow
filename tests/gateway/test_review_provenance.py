@@ -18,6 +18,7 @@ from lemoncrow.core.foundation.models import CommandRecord, FileEditRecord, Trac
 from lemoncrow.pro.capabilities.review.models import ImpactSite, ProvenanceRecord
 from lemoncrow.pro.capabilities.review.provenance import (
     collect_evidence,
+    collect_exact_file_attributions,
     collect_provenance,
     link_impact_to_provenance,
     load_trace_for_session,
@@ -319,8 +320,20 @@ def test_a_tie_is_not_a_match_and_names_nobody(tmp_path: Path) -> None:
     edited = _abs(repo, *_PACKET_PATHS[:4])
     store_root = _seed(
         tmp_path / "store",
-        _trace(trace_id="t1", session_id="s1", workspace=repo, edited=edited),
-        _trace(trace_id="t2", session_id="s2", workspace=repo, edited=edited),
+        _trace(
+            trace_id="t1",
+            session_id="s1",
+            workspace=repo,
+            edited=edited,
+            created_at=datetime.now(tz=UTC) - timedelta(hours=2),
+        ),
+        _trace(
+            trace_id="t2",
+            session_id="s2",
+            workspace=repo,
+            edited=edited,
+            created_at=datetime.now(tz=UTC) - timedelta(hours=2),
+        ),
     )
 
     record = _correlate(store_root, repo)
@@ -359,8 +372,20 @@ def test_a_tie_is_reported_in_degraded(tmp_path: Path) -> None:
     edited = _abs(repo, *_PACKET_PATHS[:4])
     store_root = _seed(
         tmp_path / "store",
-        _trace(trace_id="t1", session_id="s1", workspace=repo, edited=edited),
-        _trace(trace_id="t2", session_id="s2", workspace=repo, edited=edited),
+        _trace(
+            trace_id="t1",
+            session_id="s1",
+            workspace=repo,
+            edited=edited,
+            created_at=datetime.now(tz=UTC) - timedelta(hours=2),
+        ),
+        _trace(
+            trace_id="t2",
+            session_id="s2",
+            workspace=repo,
+            edited=edited,
+            created_at=datetime.now(tz=UTC) - timedelta(hours=2),
+        ),
     )
 
     _, _, degraded = collect_provenance(
@@ -382,7 +407,13 @@ def test_a_matched_host_that_records_no_reads_is_named_in_degraded(tmp_path: Pat
     repo.mkdir()
     store_root = _seed(
         tmp_path / "store",
-        _trace(trace_id="t1", session_id="s1", workspace=repo, edited=_abs(repo, *_PACKET_PATHS)),
+        _trace(
+            trace_id="t1",
+            session_id="s1",
+            workspace=repo,
+            edited=_abs(repo, *_PACKET_PATHS),
+            created_at=datetime.now(tz=UTC) - timedelta(hours=2),
+        ),
     )
 
     record, _, degraded = collect_provenance(
@@ -962,6 +993,30 @@ def _working_tree(store_root: Path, repo_root: Path, paths: tuple[str, ...] = _P
     """Correlate the way `lc review` does by default: no head sha to anchor on."""
 
     return collect_provenance(store_root, repo_root, paths, head_sha="", head_commit_time=None)[0]
+
+
+def test_exact_file_attributions_preserve_mixed_authorship_without_picking_a_winner(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    store_root = _seed(
+        tmp_path / "store",
+        _trace(trace_id="t1", session_id="session-a", workspace=repo, created_at=_recent(), host="claude"),
+        _trace(trace_id="t2", session_id="session-b", workspace=repo, created_at=_recent(), host="codex"),
+    )
+    _write_run(store_root, "session-a", _abs(repo, "src/app/service.py"), host="claude", model="sonnet")
+    _write_run(store_root, "session-b", _abs(repo, "src/app/router.py"), host="codex", model="gpt-5.6")
+
+    rows = collect_exact_file_attributions(
+        store_root,
+        repo,
+        ("src/app/service.py", "src/app/router.py"),
+        head_commit_time=None,
+    )
+
+    assert [(item.scope_key, item.host, item.session_id, item.certainty) for item in rows] == [
+        ("src/app/router.py", "codex", "session-b", "exact"),
+        ("src/app/service.py", "claude", "session-a", "exact"),
+    ]
 
 
 def test_a_recorded_edit_is_an_exact_anchor_in_working_tree_mode(tmp_path: Path) -> None:

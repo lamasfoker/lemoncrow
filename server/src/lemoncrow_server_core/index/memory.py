@@ -19,7 +19,7 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Final
 
 from ..context import new_opaque_id
@@ -31,10 +31,13 @@ from .contracts import (
     IndexBackend,
     ManifestEntry,
     RepoIdentityClaim,
+    RepositoryGeneration,
+    SemanticUnit,
     SweepResult,
     SymbolDef,
     ViewOpenResult,
     ViewState,
+    repository_generation_id,
     sha256_hex,
 )
 from .layers import (
@@ -42,9 +45,10 @@ from .layers import (
     InMemoryLinkGraphStore,
     LayerSources,
     LinkLayer,
-    SemanticLayer,
 )
 from .manifest import manifest_root as canonical_manifest_root
+from .ops import IndexOpsMetrics
+from .semantic import create_semantic_index
 
 __all__ = [
     "DEFAULT_CONTENT_SIZE_CAP",
@@ -109,6 +113,14 @@ class InMemoryContentStore:
         with self._lock:
             return self._blobs.get(org_id, {}).get(digest)
 
+    def get_many(self, org_id: str, digests: Sequence[str]) -> Mapping[str, bytes]:
+        wanted = tuple(dict.fromkeys(digests))
+        if not wanted:
+            return {}
+        with self._lock:
+            held = self._blobs.get(org_id, {})
+            return {digest: held[digest] for digest in wanted if digest in held}
+
     def stored_bytes(self, org_id: str) -> int:
         with self._lock:
             return sum(len(blob) for blob in self._blobs.get(org_id, {}).values())
@@ -145,21 +157,26 @@ class InMemoryContentStore:
                         self._unreferenced[key] = now
             return len(self._unreferenced)
 
-    def sweep_marked(self, before: float) -> SweepResult:
+    def sweep_marked(self, before: float, *, limit: int | None = None, dry_run: bool = False) -> SweepResult:
         dropped: dict[str, list[str]] = {}
         reclaimed: dict[str, int] = {}
+        batch_limit = None if limit is None else max(0, int(limit))
         with self._lock:
-            for (org_id, digest), marked_at in list(self._unreferenced.items()):
-                if marked_at > before:
-                    continue
+            candidates = [(key, at) for key, at in self._unreferenced.items() if at <= before]
+            candidates.sort(key=lambda row: row[0])
+            if batch_limit is not None:
+                candidates = candidates[:batch_limit]
+            for (org_id, digest), _marked_at in candidates:
                 held = self._blobs.get(org_id)
                 if held is not None and digest in held:
                     reclaimed[org_id] = reclaimed.get(org_id, 0) + len(held[digest])
-                    del held[digest]
                     dropped.setdefault(org_id, []).append(digest)
-                    if not held:
-                        del self._blobs[org_id]
-                del self._unreferenced[(org_id, digest)]
+                    if not dry_run:
+                        del held[digest]
+                        if not held:
+                            del self._blobs[org_id]
+                if not dry_run:
+                    self._unreferenced.pop((org_id, digest), None)
         return SweepResult(
             dropped={org_id: tuple(sorted(digests)) for org_id, digests in dropped.items()},
             bytes_reclaimed=reclaimed,
@@ -172,12 +189,7 @@ class InMemoryContentStore:
 
 
 class InMemoryContentProvenance:
-    """Who demonstrated possession of what, keyed ``(org, repo, subject)``.
-
-    A set per scope rather than a row per digest: the two questions asked of it
-    are both "which of these digests", and a scope holds at most one
-    organization's working set.
-    """
+    """Exact opaque possession scopes, keyed ``(partition, repo, scope)``."""
 
     __slots__ = ("_held", "_lock")
 
@@ -186,10 +198,7 @@ class InMemoryContentProvenance:
         self._lock = threading.Lock()
 
     def record(self, org_id: str, repo_id: str, subject: str, digests: Sequence[str]) -> int:
-        if not repo_id or not subject or not digests:
-            # An unattributed row would be indistinguishable from the
-            # repository-wide scope on read, which is the one thing that must
-            # not be forgeable. Nothing is better than something unattributable.
+        if not repo_id or not digests:
             return 0
         with self._lock:
             scope = self._held.setdefault((org_id, repo_id, subject), set())
@@ -202,13 +211,7 @@ class InMemoryContentProvenance:
         if not wanted or not repo_id:
             return frozenset()
         with self._lock:
-            if subject:
-                return frozenset(wanted & self._held.get((org_id, repo_id, subject), set()))
-            found: set[str] = set()
-            for (owner, repo, _subject), scope in self._held.items():
-                if owner == org_id and repo == repo_id:
-                    found |= wanted & scope
-            return frozenset(found)
+            return frozenset(wanted & self._held.get((org_id, repo_id, subject), set()))
 
     def forget(self, org_id: str, digests: Sequence[str]) -> int:
         doomed = set(digests)
@@ -239,10 +242,11 @@ class InMemoryContentProvenance:
 class InMemoryAnalysisStore:
     """Layer 1 derived store, written exactly once per scoped key."""
 
-    __slots__ = ("_artifacts", "_derivations", "_lock")
+    __slots__ = ("_artifacts", "_derivations", "_lock", "_semantic_units")
 
     def __init__(self) -> None:
         self._artifacts: dict[tuple[str, str, str], AnalysisArtifact] = {}
+        self._semantic_units: dict[tuple[str, str, str, str], tuple[SemanticUnit, ...]] = {}
         self._derivations = 0
         self._lock = threading.Lock()
 
@@ -286,9 +290,41 @@ class InMemoryAnalysisStore:
             self._derivations += 1
         return artifact
 
+    def restore(self, org_id: str, artifact: AnalysisArtifact) -> AnalysisArtifact:
+        key = (org_id, artifact.digest, artifact.parser_profile)
+        with self._lock:
+            existing = self._artifacts.get(key)
+            if existing is not None:
+                return existing
+            self._artifacts[key] = artifact
+        return artifact
+
     def count(self, org_id: str) -> int:
         with self._lock:
             return sum(1 for key in self._artifacts if key[0] == org_id)
+
+    def stored_semantic_units(
+        self, org_id: str, keys: Sequence[tuple[str, str]], embedding_version: str
+    ) -> dict[tuple[str, str], tuple[SemanticUnit, ...]]:
+        with self._lock:
+            return {
+                key: units
+                for key in keys
+                if (units := self._semantic_units.get((org_id, key[0], key[1], embedding_version))) is not None
+            }
+
+    def store_semantic_units(
+        self,
+        org_id: str,
+        rows: Sequence[tuple[str, str, tuple[SemanticUnit, ...]]],
+        embedding_version: str,
+    ) -> None:
+        with self._lock:
+            for digest, parser_profile, units in rows:
+                if any(unit.embedding_version != embedding_version for unit in units):
+                    raise ValueError("semantic units must all carry the stored embedding version")
+                if (org_id, digest, parser_profile) in self._artifacts:
+                    self._semantic_units.setdefault((org_id, digest, parser_profile, embedding_version), units)
 
     def stored_bytes(self, org_id: str) -> int:
         """Approximate size of the derived rows, for the storage report."""
@@ -298,6 +334,9 @@ class InMemoryAnalysisStore:
                 if owner != org_id:
                     continue
                 total += self.storage_size(org_id, artifact)
+            for (owner, _digest, _profile, _version), units in self._semantic_units.items():
+                if owner == org_id:
+                    total += sum(32 + 8 * len(unit.embedding) for unit in units)
             return total
 
     def storage_size(self, org_id: str, artifact: AnalysisArtifact) -> int:
@@ -307,6 +346,7 @@ class InMemoryAnalysisStore:
             + 24 * len(artifact.definitions)
             + 16 * len(artifact.references)
             + 8 * len(artifact.embedding)
+            + sum(32 + 8 * len(unit.embedding) for unit in artifact.semantic_units)
         )
 
     def _for_org(self, org_id: str, digests: Sequence[str]) -> list[tuple[str, AnalysisArtifact]]:
@@ -326,6 +366,7 @@ class InMemoryAnalysisStore:
         include_grams: bool = True,
         include_substring_only: bool = True,
         ignored_terms: Sequence[str] = (),
+        document_count: int | None = None,
     ) -> Mapping[str, float]:
         parsed: LexicalQuery = parse_query(query)
         ignored = set(ignored_terms)
@@ -342,7 +383,7 @@ class InMemoryAnalysisStore:
         gram_df = {gram: sum(1 for grams in grams_by_digest.values() if gram in grams) for gram in parsed.grams}
         anchors = set(sorted(parsed.grams, key=lambda gram: (gram_df.get(gram, 0), gram))[:3])
         term_df = {term: sum(1 for terms in terms_by_digest.values() if term in terms) for term in parsed.terms}
-        document_count = len(terms_by_digest)
+        effective_document_count = max(len(terms_by_digest), int(document_count or 0))
         scores: dict[str, float] = {}
         for digest, terms in terms_by_digest.items():
             grams = grams_by_digest.get(digest, set())
@@ -361,13 +402,55 @@ class InMemoryAnalysisStore:
                 parsed,
                 matched_terms=matched_terms,
                 term_document_frequency=term_df,
-                document_count=document_count,
+                document_count=effective_document_count,
                 gram_hits=gram_hits,
                 match_any_term=match_any_term,
             )
             if score > 0:
                 scores[digest] = score
         return scores
+
+    def lexical_candidates(
+        self,
+        org_id: str,
+        query: str,
+        *,
+        limit: int,
+        include_grams: bool = True,
+        include_substring_only: bool = True,
+        ignored_terms: Sequence[str] = (),
+    ) -> tuple[tuple[str, ...], bool]:
+        parsed = parse_query(query)
+        if parsed.empty or limit < 1:
+            return (), False
+        terms = set(parsed.terms) | set(ignored_terms)
+        grams = set(parsed.grams)
+        candidates: set[str] = set()
+        with self._lock:
+            rows = tuple(self._artifacts.items())
+        for (owner, digest, _profile), artifact in rows:
+            if owner != org_id:
+                continue
+            term_hit = bool(terms.intersection(artifact.lexical_terms))
+            gram_hit = bool(
+                include_grams and include_substring_only and grams and grams.issubset(set(artifact.trigrams))
+            )
+            if term_hit or gram_hit:
+                candidates.add(digest)
+        ordered = tuple(sorted(candidates))
+        return ordered[:limit], len(ordered) > limit
+
+    def definition_candidates(self, org_id: str, name: str, *, limit: int) -> tuple[tuple[str, ...], bool]:
+        if not name or limit < 1:
+            return (), False
+        candidates: set[str] = set()
+        with self._lock:
+            rows = tuple(self._artifacts.items())
+        for (owner, digest, _profile), artifact in rows:
+            if owner == org_id and any(item.name == name for item in artifact.definitions):
+                candidates.add(digest)
+        ordered = tuple(sorted(candidates))
+        return ordered[:limit], len(ordered) > limit
 
     def definitions_named(self, org_id: str, digests: Sequence[str], name: str) -> Mapping[str, tuple[SymbolDef, ...]]:
         out: dict[str, set[SymbolDef]] = {}
@@ -394,6 +477,8 @@ class InMemoryAnalysisStore:
             keys = [key for key in self._artifacts if key[0] == org_id and key[1] in doomed]
             for key in keys:
                 del self._artifacts[key]
+            for unit_key in [key for key in self._semantic_units if key[0] == org_id and key[1] in doomed]:
+                del self._semantic_units[unit_key]
             return len(keys)
 
 
@@ -428,6 +513,7 @@ class _View:
     org_id: str
     repo_id: str
     base_revision: str
+    generation_id: str
     root: str
     revision: int
     lease_expires_at: float
@@ -455,11 +541,12 @@ class _View:
 class InMemoryViewStore:
     """Layer 2 with revisioned overlay, leases and reference accounting."""
 
-    __slots__ = ("_clock", "_lock", "_roots", "_views")
+    __slots__ = ("_clock", "_generations", "_lock", "_roots", "_views")
 
     def __init__(self, *, clock: object = time.time) -> None:
         self._views: dict[str, _View] = {}
         self._roots: dict[tuple[str, str], _ManifestRoot] = {}
+        self._generations: dict[tuple[str, str], RepositoryGeneration] = {}
         self._lock = threading.RLock()
         self._clock = clock
 
@@ -523,6 +610,7 @@ class InMemoryViewStore:
             entry_count=len(self._effective(view)),
             lease_expires_at=view.lease_expires_at,
             pending_chunks=pending,
+            generation_id=view.generation_id,
             manifest_complete=complete,
             content_subject=view.content_subject,
             owner_subject=view.owner_subject,
@@ -554,11 +642,24 @@ class InMemoryViewStore:
                     root.complete = manifest_root == canonical_manifest_root(())
                 self._roots[key] = root
             root.last_referenced_at = self._now()
+            generation_id = repository_generation_id(org_id, repo_id, base_revision, manifest_root)
+            generation = self._generations.get((org_id, generation_id))
+            if generation is None:
+                generation = RepositoryGeneration(
+                    generation_id=generation_id,
+                    org_id=org_id,
+                    repo_id=repo_id,
+                    base_revision=base_revision,
+                    manifest_root=manifest_root,
+                    entry_count=len(root.entries) if root.complete else 0,
+                )
+                self._generations[(org_id, generation_id)] = generation
             view = _View(
                 view_id=new_opaque_id("view"),
                 org_id=org_id,
                 repo_id=repo_id,
                 base_revision=base_revision,
+                generation_id=generation_id,
                 root=manifest_root,
                 revision=0,
                 lease_expires_at=self._now() + lease_s,
@@ -586,6 +687,23 @@ class InMemoryViewStore:
     def get(self, org_id: str, view_id: str) -> ViewState:
         with self._lock:
             return self._state(self._require(org_id, view_id))
+
+    def generation(self, org_id: str, view_id: str) -> RepositoryGeneration:
+        with self._lock:
+            view = self._require(org_id, view_id)
+            generation = self._generations.get((org_id, view.generation_id))
+            if generation is None:
+                raise RuntimeError("view generation metadata is missing")
+            return generation
+
+    def generation_membership(self, org_id: str, view_id: str) -> Mapping[str, ManifestEntry]:
+        with self._lock:
+            return self._base(self._require(org_id, view_id))
+
+    def overlay(self, org_id: str, view_id: str) -> tuple[Mapping[str, ManifestEntry], frozenset[str]]:
+        with self._lock:
+            view = self._require(org_id, view_id)
+            return dict(view.overlay), frozenset(view.tombstones)
 
     def put_manifest_chunk(
         self,
@@ -641,6 +759,9 @@ class InMemoryViewStore:
                     )
                 root.entries = candidate
                 root.complete = True
+                generation = self._generations.get((org_id, view.generation_id))
+                if generation is not None and generation.entry_count != len(candidate):
+                    self._generations[(org_id, view.generation_id)] = replace(generation, entry_count=len(candidate))
                 candidate = {}
             # Committed only once the assembly above has had its say, so a
             # refused completion leaves the view exactly where it was.
@@ -671,13 +792,9 @@ class InMemoryViewStore:
                 # acknowledged-revision check while reading somebody else's
                 # overlay. Idempotent, not an error, never a second bump.
                 return replayed
-            if client_seq <= view.last_client_seq:
-                raise ServerError(
-                    ErrorCode.PAYLOAD_INVALID,
-                    "client_seq must increase monotonically within a view",
-                    details={"client_seq": client_seq, "last_client_seq": view.last_client_seq},
-                    action=AgentAction.FIX_REQUEST,
-                )
+            # CAS failure takes precedence over an old client sequence:
+            # a competing replica may commit a higher sequence first, but
+            # the losing writer's actionable error is a stale revision.
             if expected_view_revision != view.revision:
                 raise ServerError(
                     ErrorCode.VIEW_REVISION_CONFLICT,
@@ -688,12 +805,28 @@ class InMemoryViewStore:
                     },
                     action=AgentAction.REFRESH_VIEW_REVISION,
                 )
+            if client_seq <= view.last_client_seq:
+                raise ServerError(
+                    ErrorCode.PAYLOAD_INVALID,
+                    "client_seq must increase monotonically within a view",
+                    details={"client_seq": client_seq, "last_client_seq": view.last_client_seq},
+                    action=AgentAction.FIX_REQUEST,
+                )
+            root = self._roots.get((org_id, view.root))
+            complete = root is not None and root.complete
+            base = root.entries if complete and root is not None else {}
             for entry in entries:
-                view.overlay[entry.path] = entry
+                if complete and base.get(entry.path) == entry:
+                    view.overlay.pop(entry.path, None)
+                else:
+                    view.overlay[entry.path] = entry
                 view.tombstones.discard(entry.path)
             for path in removed_paths:
                 view.overlay.pop(path, None)
-                view.tombstones.add(path)
+                if not complete or path in base:
+                    view.tombstones.add(path)
+                else:
+                    view.tombstones.discard(path)
             view.revision += 1
             view.last_client_seq = client_seq
             state = self._state(view)
@@ -710,6 +843,25 @@ class InMemoryViewStore:
             if path in view.tombstones:
                 return None
             return self._base(view).get(path)
+
+    def entries_for_digests(self, org_id: str, view_id: str, digests: Sequence[str]) -> Mapping[str, ManifestEntry]:
+        wanted = set(digests)
+        if not wanted:
+            return {}
+        with self._lock:
+            effective = self._effective(self._require(org_id, view_id))
+        return {path: entry for path, entry in effective.items() if entry.content_digest in wanted}
+
+    def path_candidates(
+        self, org_id: str, view_id: str, needle: str, *, limit: int
+    ) -> tuple[Mapping[str, ManifestEntry], bool]:
+        if not needle or limit < 1:
+            return {}, False
+        lowered = needle.lower()
+        with self._lock:
+            effective = self._effective(self._require(org_id, view_id))
+        matches = [(path, entry) for path, entry in sorted(effective.items()) if lowered in path.lower()]
+        return dict(matches[:limit]), len(matches) > limit
 
     def membership(self, org_id: str, view_id: str) -> Mapping[str, ManifestEntry]:
         with self._lock:
@@ -729,7 +881,8 @@ class InMemoryViewStore:
     def renew(self, org_id: str, view_id: str, lease_s: float) -> ViewState:
         with self._lock:
             view = self._require(org_id, view_id)
-            view.lease_expires_at = self._now() + lease_s
+            # Extends, never shortens; see SqliteViewStore.renew.
+            view.lease_expires_at = max(view.lease_expires_at, self._now() + lease_s)
             return self._state(view)
 
     def close(self, org_id: str, view_id: str) -> None:
@@ -779,6 +932,10 @@ class InMemoryViewStore:
                 if key in live or root.last_referenced_at > before:
                     continue
                 del self._roots[key]
+                owner, manifest_root = key
+                for generation_key, generation in list(self._generations.items()):
+                    if generation_key[0] == owner and generation.manifest_root == manifest_root:
+                        del self._generations[generation_key]
                 dropped += 1
             return dropped
 
@@ -903,6 +1060,7 @@ def build_memory_backend(
     analysis_store = InMemoryAnalysisStore()
     views = InMemoryViewStore(clock=clock)
     provenance = InMemoryContentProvenance()
+    ops = IndexOpsMetrics()
     sources = LayerSources(
         views=views,
         content=content,
@@ -915,7 +1073,8 @@ def build_memory_backend(
         analysis=analysis_store,
         views=views,
         links=LinkLayer(sources, InMemoryLinkGraphStore(), inline_rebuild_budget=inline_rebuild_budget),
-        semantic=SemanticLayer(sources, inline_rebuild_budget=inline_rebuild_budget),
+        semantic=create_semantic_index(sources, inline_rebuild_budget=inline_rebuild_budget),
         repos=InMemoryRepoIdentityService(),
         provenance=provenance,
+        ops=ops,
     )

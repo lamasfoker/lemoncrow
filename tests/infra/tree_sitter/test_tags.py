@@ -11,14 +11,9 @@ def _definitions(tags: list[Tag]) -> set[str]:
     return {tag.name for tag in tags if tag.kind == "definition"}
 
 
-@pytest.mark.parametrize(
-    ("path", "source", "expected"),
-    [
-        (
-            "Store.java",
-            "package app;\nclass Store { int total; void checkout() {} }\n",
-            {"Store", "total", "checkout"},
-        ),
+def test_tree_sitter_definitions_for_previously_regex_unsupported_languages() -> None:
+    for path, source, expected in [
+        ("Store.java", "package app;\nclass Store { int total; void checkout() {} }\n", {"Store", "total", "checkout"}),
         (
             "invoice.rb",
             "module Billing\n  class Invoice\n    def total\n      1\n    end\n  end\nend\n",
@@ -26,40 +21,18 @@ def _definitions(tags: list[Tag]) -> set[str]:
         ),
         ("store.cs", "namespace App { class Store { public void Add() {} } }\n", {"Store", "Add"}),
         ("store.kt", "class Store { fun add(): Unit {} }\nfun top() {}\n", {"Store", "add", "top"}),
-        (
-            "store.php",
-            "<?php\nclass Store { public function add() {} }\nfunction top() {}\n",
-            {"Store", "add", "top"},
-        ),
+        ("store.php", "<?php\nclass Store { public function add() {} }\nfunction top() {}\n", {"Store", "add", "top"}),
         ("store.swift", "struct Store { func add() {} }\nfunc top() {}\n", {"Store", "add", "top"}),
-        (
-            "store.scala",
-            "class Store { def add(): Unit = {} }\ndef top(): Unit = {}\n",
-            {"Store", "add", "top"},
-        ),
-        (
-            "store.c",
-            "typedef struct Order { int id; } Order;\nint total(int x) { return x; }\n",
-            {"Order", "total"},
-        ),
-        (
-            "store.cpp",
-            "namespace app { class Store { public: void add() {} }; }\n",
-            {"app", "Store", "add"},
-        ),
-    ],
-)
-def test_tree_sitter_definitions_for_previously_regex_unsupported_languages(
-    path: str, source: str, expected: set[str]
-) -> None:
-    tags = extract_tags_from_text(source, Path(path))
-
-    assert expected <= _definitions(tags)
+        ("store.scala", "class Store { def add(): Unit = {} }\ndef top(): Unit = {}\n", {"Store", "add", "top"}),
+        ("store.c", "typedef struct Order { int id; } Order;\nint total(int x) { return x; }\n", {"Order", "total"}),
+        ("store.cpp", "namespace app { class Store { public: void add() {} }; }\n", {"app", "Store", "add"}),
+    ]:
+        tags = extract_tags_from_text(source, Path(path))
+        assert expected <= _definitions(tags)
 
 
-@pytest.mark.parametrize(
-    ("path", "source", "expected"),
-    [
+def test_tree_sitter_definitions_for_shell_sql_and_data_languages() -> None:
+    for path, source, expected in [
         (
             "deploy.sh",
             'NAME=value\nfunction deploy() { echo "$NAME"; }\ncleanup() { echo done; }\n',
@@ -77,12 +50,9 @@ def test_tree_sitter_definitions_for_previously_regex_unsupported_languages(
         ),
         ("service.yaml", "name: demo\nservices:\n  api:\n    image: app\n", {"name", "services"}),
         ("package.json", '{"name":"demo","scripts":{"test":"pytest"}}\n', {"name", "scripts"}),
-    ],
-)
-def test_tree_sitter_definitions_for_shell_sql_and_data_languages(path: str, source: str, expected: set[str]) -> None:
-    tags = extract_tags_from_text(source, Path(path))
-
-    assert expected <= _definitions(tags)
+    ]:
+        tags = extract_tags_from_text(source, Path(path))
+        assert expected <= _definitions(tags)
 
 
 @pytest.mark.parametrize(

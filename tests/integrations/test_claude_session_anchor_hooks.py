@@ -81,3 +81,35 @@ def test_session_start_clear_does_not_anchor_preclear_id(tmp_path: Path, monkeyp
     # Every other source carries the live id and must keep anchoring.
     _run({"session_id": "resumed-sid", "source": "resume", "cwd": str(tmp_path / "ws")})
     assert sw.resolve_window_session_id(root, ws_hash) == "resumed-sid"
+
+
+def test_session_start_seeds_live_review_prewarm_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root, _ws_hash = _setup(tmp_path, monkeypatch)
+    workspace = tmp_path / "ws"
+    calls: list[tuple[Path, Path, str, str]] = []
+    from lemoncrow.pro.capabilities.review import live_runtime
+
+    monkeypatch.setattr(
+        live_runtime,
+        "request_live_review_prepare",
+        lambda store_root, repo_root, *, host, session_id: calls.append(
+            (Path(store_root), Path(repo_root), host, session_id)
+        ),
+    )
+    monkeypatch.setattr(
+        SESSION_START.sys,
+        "stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "session_id": "seed-session",
+                    "source": "startup",
+                    "cwd": str(workspace),
+                    "model": "claude-opus-5",
+                }
+            )
+        ),
+    )
+
+    assert session_start.main() == 0
+    assert calls == [(root, workspace, "claude", "seed-session")]

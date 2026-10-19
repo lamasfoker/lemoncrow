@@ -1,10 +1,8 @@
-"""The `lcr` alias the installer writes, and the uninstaller's removal of it.
+"""Shell-profile persistence stays PATH-only now that lcr is executable.
 
-A shell alias is state we put in a file we do not own, so the two things worth
-pinning are that a re-install does not duplicate it and that `uninstall.sh`
-takes it away again. It lives inside the same sentinel block as the PATH export
-precisely so the second property comes for free -- these tests are what stops
-someone moving it out of the block.
+Older installs wrote an lcr alias inside the LemonCrow-owned sentinel block.
+Re-running the installer rewrites that block, removing the legacy alias without
+touching unrelated user lines.
 """
 
 from __future__ import annotations
@@ -27,11 +25,9 @@ _ensure_path_persistence >/dev/null 2>&1
 """
 
 
-def _persist(home: Path, *, shell: str, times: int = 1, env_extra: dict[str, str] | None = None) -> str:
-    """Run the installer's profile writer under a throwaway HOME."""
+def _persist(home: Path, *, shell: str, times: int = 1) -> str:
     env = os.environ.copy()
     env.update({"HOME": str(home), "SHELL": shell})
-    env.update(env_extra or {})
     script = _HARNESS.format(common=COMMON) * times
     subprocess.run(["bash", "-c", script], check=True, capture_output=True, text=True, env=env)
     profile = {
@@ -42,26 +38,40 @@ def _persist(home: Path, *, shell: str, times: int = 1, env_extra: dict[str, str
     return profile.read_text() if profile.exists() else ""
 
 
-def test_the_installer_writes_the_review_alias(tmp_path: Path) -> None:
-    assert "alias lcr='lc review'" in _persist(tmp_path, shell="/bin/bash")
-
-
-def test_a_second_install_does_not_write_it_twice(tmp_path: Path) -> None:
-    profile = _persist(tmp_path, shell="/bin/bash", times=3)
-    assert profile.count("alias lcr") == 1
-
-
-def test_fish_gets_fish_syntax(tmp_path: Path) -> None:
-    # `alias name=value` is not fish; writing it would break every new shell.
-    profile = _persist(tmp_path, shell="/usr/bin/fish")
-    assert "alias lcr 'lc review'" in profile
-    assert "alias lcr=" not in profile
-
-
-def test_the_alias_can_be_declined(tmp_path: Path) -> None:
-    profile = _persist(tmp_path, shell="/bin/bash", env_extra={"LEMONCROW_NO_ALIAS": "1"})
+def test_installer_writes_path_without_review_alias(tmp_path: Path) -> None:
+    profile = _persist(tmp_path, shell="/bin/bash")
+    assert 'export PATH="' in profile
     assert "alias lcr" not in profile
-    assert "export PATH=" in profile  # the rest of the block still lands
+
+
+def test_reinstall_is_idempotent_without_alias(tmp_path: Path) -> None:
+    profile = _persist(tmp_path, shell="/bin/bash", times=3)
+    assert profile.count("# >>> lemoncrow path setup >>>") == 1
+    assert profile.count("alias lcr") == 0
+
+
+def test_fish_profile_is_path_only(tmp_path: Path) -> None:
+    profile = _persist(tmp_path, shell="/usr/bin/fish")
+    assert "alias lcr" not in profile
+    assert 'export PATH="' in profile
+
+
+def test_reinstall_removes_legacy_alias_from_owned_block(tmp_path: Path) -> None:
+    profile = tmp_path / ".bashrc"
+    profile.write_text(
+        "echo before\n"
+        "# >>> lemoncrow path setup >>>\n"
+        'export PATH="$HOME/.lemoncrow/bin:$PATH"\n'
+        "alias lcr='lc review'\n"
+        "# <<< lemoncrow path setup <<<\n"
+        "echo after\n"
+    )
+
+    updated = _persist(tmp_path, shell="/bin/bash")
+
+    assert "alias lcr" not in updated
+    assert "echo before" in updated
+    assert "echo after" in updated
 
 
 def test_installer_reports_exact_path_directories(tmp_path: Path) -> None:
@@ -83,29 +93,41 @@ def test_installer_reports_exact_path_directories(tmp_path: Path) -> None:
         env=env,
     )
 
-    assert f"Added {tmp_path}/.lemoncrow to PATHs in {tmp_path}/.bashrc" in result.stdout
+    assert "PATH configured in ~/.bashrc (~/.lemoncrow/bin)" in result.stdout
 
 
-def test_uninstall_takes_the_alias_away_with_the_block(tmp_path: Path) -> None:
+def test_uninstall_takes_owned_path_block_away(tmp_path: Path) -> None:
     home = tmp_path
     _persist(home, shell="/bin/bash")
     profile = home / ".bashrc"
     profile.write_text("echo before\n" + profile.read_text() + "echo after\n")
 
-    env = os.environ.copy()
-    env.update({"HOME": str(home), "SHELL": "/bin/bash"})
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    service_calls = tmp_path / "service-calls.log"
+    for name in ("lc", "systemctl"):
+        shim = fake_bin / name
+        shim.write_text(f"#!/bin/sh\nprintf '%s\\n' '{name}' >> '{service_calls}'\nexit 1\n")
+        shim.chmod(0o755)
+
+    env = {
+        "HOME": str(home),
+        "SHELL": "/bin/bash",
+        "PATH": f"{fake_bin}:/usr/bin:/bin",
+        "LEMONCROW_BIN_DIR": str(home / ".lemoncrow" / "bin"),
+        "LEMONCROW_TOOL_DIR": str(home / ".lemoncrow" / "uv-tools"),
+    }
     subprocess.run(
-        ["bash", str(UNINSTALL), "--yes"],
-        check=False,
+        ["bash", str(UNINSTALL), "--profile-only"],
+        check=True,
         capture_output=True,
         text=True,
         env=env,
         cwd=str(tmp_path),
     )
+    assert not service_calls.exists()
 
     remaining = profile.read_text()
-    assert "alias lcr" not in remaining
     assert "lemoncrow" not in remaining
-    # Only our block goes; the user's own lines are theirs.
     assert "echo before" in remaining
     assert "echo after" in remaining

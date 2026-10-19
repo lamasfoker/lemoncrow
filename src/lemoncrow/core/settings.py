@@ -27,6 +27,8 @@ from lemoncrow.core.settings_registry import CATEGORIES, SETTINGS, SettingSpec
 logger = logging.getLogger(__name__)
 
 _BY_KEY: dict[str, SettingSpec] = {spec.key: spec for spec in SETTINGS}
+_SEEDED_ENV: set[str] = set()
+"""Env vars :func:`apply_settings_env` filled into ``os.environ`` in this process."""
 
 __all__ = [
     "CATEGORIES",
@@ -34,6 +36,7 @@ __all__ = [
     "all_settings",
     "apply_settings_env",
     "coerce",
+    "env_override",
     "find_by_key",
     "load_raw",
     "load_settings",
@@ -130,6 +133,14 @@ def write_setting(root: str | Path, key: str, raw_value: Any) -> Any:
         value = coerce(spec, raw_value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"invalid value for {key} (expected {spec.type}): {raw_value!r}") from exc
+    if spec.choices:
+        value = str(value).strip().lower()
+        if value and value not in spec.choices:  # empty clears the choice
+            raise ValueError(f"invalid value for {key}: {raw_value!r} (choices: {', '.join(spec.choices)})")
+    if spec.int_range is not None:
+        low, high = spec.int_range
+        if not low <= int(value) <= high:
+            raise ValueError(f"invalid value for {key}: {raw_value!r} (must be between {low} and {high})")
     raw = load_raw(root)
     raw[key] = value
     _write_json(settings_path(root), raw)
@@ -143,6 +154,16 @@ def unset_setting(root: str | Path, key: str) -> None:
     if key in raw:
         del raw[key]
         _write_json(settings_path(root), raw)
+
+
+def env_override(spec: SettingSpec) -> str | None:
+    """The value of an exported env var that wins over the stored setting, if any.
+
+    Values this process seeded from the settings file itself don't count.
+    """
+    if spec.env_var is None or spec.env_var in _SEEDED_ENV:
+        return None
+    return os.environ.get(spec.env_var)
 
 
 def _resolve_root() -> Path:
@@ -177,3 +198,5 @@ def apply_settings_env(root: str | Path | None = None, *, env: dict[str, str] | 
         except (TypeError, ValueError):
             continue
         target[spec.env_var] = _env_repr(spec, coerced)
+        if target is os.environ:
+            _SEEDED_ENV.add(spec.env_var)

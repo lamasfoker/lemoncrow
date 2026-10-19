@@ -1,3 +1,7 @@
+import { Button as UiButton } from "../components/ui/button";
+import { Input as UiInput } from "../components/ui/input";
+import { Textarea as UiTextarea } from "../components/ui/textarea";
+import { Tip } from "../components/ui/tooltip";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { CircleHelp, RefreshCw } from "lucide-react";
 import {
@@ -18,19 +22,21 @@ import {
   Input,
   PageFrame,
   Select,
+  SelectItem,
   SnippetCard,
   cx,
 } from "../components/WorkbenchUI";
 import { fmtDate } from "../lib/format";
-import { statusTone } from "../lib/status";
+import { setVisibleInterval } from "../lib/visibleInterval";
+import { statusChipTone } from "../lib/status";
 import { WorkflowSection } from "./swarms/WorkflowSection";
 
 function planningTone(
   value?: string | null
-): "cyan" | "amber" | "neutral" | "purple" {
-  if (value === "open-ended") return "purple";
-  if (value === "bounded") return "cyan";
-  if (value === "adaptive") return "amber";
+): "info" | "warning" | "neutral" | "neutral" {
+  if (value === "open-ended") return "neutral";
+  if (value === "bounded") return "info";
+  if (value === "adaptive") return "warning";
   return "neutral";
 }
 
@@ -70,13 +76,15 @@ function worktreePoolHint(repoRoot: string): string {
 
 function HoverHint({ text }: { text: string }) {
   return (
-    <span
-      title={text}
-      aria-label={text}
-      className="inline-flex items-center text-neutral-500 transition hover:text-neutral-300"
-    >
-      <CircleHelp className="h-3.5 w-3.5" />
-    </span>
+    <Tip content={text}>
+      <span
+        tabIndex={0}
+        aria-label={text}
+        className="inline-flex items-center text-muted-foreground transition hover:text-neutral-300"
+      >
+        <CircleHelp className="h-3.5 w-3.5" />
+      </span>
+    </Tip>
   );
 }
 
@@ -132,14 +140,14 @@ function MarkdownSourceEditor({
   };
 
   return (
-    <div className="flex h-full self-stretch flex-col overflow-hidden border border-white/10 bg-neutral-950/50">
-      <div className="flex flex-wrap items-start justify-between gap-3 border-b border-white/10 px-4 py-3">
+    <div className="flex h-full self-stretch flex-col overflow-hidden rounded-lg border border-border/70 bg-background/60">
+      <div className="flex flex-wrap items-start justify-between gap-3 border-b border-border/70 px-4 py-3">
         <div className="min-w-0">
           <FieldLabel>{label}</FieldLabel>
-          <div className="mt-1 truncate font-mono text-sm text-neutral-100">
+          <div className="mt-1 truncate font-mono text-sm text-foreground">
             {path}
           </div>
-          <div className="mt-1 text-xs text-neutral-500">{modeLabel}</div>
+          <div className="mt-1 text-xs text-muted-foreground">{modeLabel}</div>
         </div>
         <div className="flex items-center gap-2">
           <Chip tone="neutral">{lines.length} lines</Chip>
@@ -153,7 +161,7 @@ function MarkdownSourceEditor({
       <div className="grid flex-1 grid-cols-[3.5rem_minmax(0,1fr)]">
         <div
           ref={gutterRef}
-          className="min-h-0 overflow-auto border-r border-white/10 bg-neutral-900/90 px-2 py-3 text-right font-mono text-xs leading-6 text-neutral-500"
+          className="min-h-0 overflow-auto border-r border-border/70 bg-surface-code px-2 py-3 text-right font-mono text-xs leading-6 text-muted-foreground"
           aria-hidden="true"
         >
           {lines.map((line) => (
@@ -161,18 +169,18 @@ function MarkdownSourceEditor({
           ))}
         </div>
         {isEditing ? (
-          <textarea
+          <UiTextarea unstyled
             id="swarm-spec-content"
             value={content}
             onChange={(event) => onChange?.(event.target.value)}
             onScroll={(event) => syncScroll(event.currentTarget.scrollTop)}
-            className="h-full min-h-0 w-full resize-y overflow-auto bg-neutral-950/90 px-4 py-3 font-mono text-sm leading-6 text-neutral-100 outline-none transition focus:bg-neutral-950"
+            className="h-full min-h-0 w-full resize-y overflow-auto bg-background/90 px-4 py-3 font-mono text-sm leading-6 text-foreground outline-none transition focus:bg-background"
             spellCheck={false}
             wrap="off"
           />
         ) : (
           <pre
-            className="h-full min-h-0 overflow-auto bg-neutral-950/90 px-4 py-3 font-mono text-sm leading-6 text-neutral-100"
+            className="h-full min-h-0 overflow-auto bg-background/90 px-4 py-3 font-mono text-sm leading-6 text-foreground"
             onScroll={(event) => syncScroll(event.currentTarget.scrollTop)}
           >
             <code>{content || ""}</code>
@@ -364,13 +372,12 @@ export default function Swarms() {
   }, []);
 
   useEffect(() => {
-    const intervalId = window.setInterval(() => {
+    return setVisibleInterval(() => {
       void loadRuns(selectedRunId);
       if (selectedRunId) {
         void loadRunDetail(selectedRunId);
       }
     }, 15000);
-    return () => window.clearInterval(intervalId);
   }, [selectedRunId]);
 
   useEffect(() => {
@@ -524,7 +531,7 @@ export default function Swarms() {
               </h2>
             </div>
             {loadingLaunchOptions ? (
-              <span className="text-xs text-neutral-500">Loading options…</span>
+              <span className="text-xs text-muted-foreground">Loading options…</span>
             ) : null}
           </div>
 
@@ -539,22 +546,21 @@ export default function Swarms() {
                   id="swarm-working-directory"
                   className="w-full"
                   value={selectedProjectRoot}
-                  onChange={(event) => {
-                    const next = event.target.value;
+                  onValueChange={(next) => {
                     if (!confirmDiscardSpecDraft()) return;
                     setSelectedProjectRoot(next);
                     void loadLaunchOptions(next, undefined);
                   }}
                 >
                   {(launchOptions?.project_roots || []).map((item) => (
-                    <option key={item.path} value={item.path}>
+                    <SelectItem key={item.path} value={item.path}>
                       {item.full_path}
                       {item.has_program_md ? ` · ${defaultSpecPath}` : ""}
-                    </option>
+                    </SelectItem>
                   ))}
                 </Select>
                 {worktreeHint ? (
-                  <p className="text-xs text-neutral-500">
+                  <p className="text-xs text-muted-foreground">
                     Swarms working directory:{" "}
                     <code className="text-neutral-200">{worktreeHint}</code>
                   </p>
@@ -573,8 +579,7 @@ export default function Swarms() {
                   className="w-full"
                   title={`Pick an existing task file or start a new ${defaultSpecPath} buffer.`}
                   value={selectedSpecChoice || selectedSpecPath}
-                  onChange={(event) => {
-                    const next = event.target.value;
+                  onValueChange={(next) => {
                     if (!confirmDiscardSpecDraft()) return;
                     if (next === NEW_SPEC_CHOICE) {
                       setSelectedSpecChoice(NEW_SPEC_CHOICE);
@@ -592,14 +597,14 @@ export default function Swarms() {
                     );
                   }}
                 >
-                  <option value={NEW_SPEC_CHOICE}>
+                  <SelectItem value={NEW_SPEC_CHOICE}>
                     + New file ({defaultSpecPath})
-                  </option>
+                  </SelectItem>
                   {(launchOptions?.files || []).map((item) => (
-                    <option key={item.path} value={item.path}>
+                    <SelectItem key={item.path} value={item.path}>
                       {item.path}
                       {item.is_default ? " · default" : ""}
-                    </option>
+                    </SelectItem>
                   ))}
                 </Select>
               </div>
@@ -619,16 +624,16 @@ export default function Swarms() {
                     className="w-full"
                     title={selectedProvider?.credential_hint || undefined}
                     value={provider}
-                    onChange={(event) => setProvider(event.target.value)}
+                    onValueChange={setProvider}
                   >
                     {(launchOptions?.providers || []).map((item) => (
-                      <option
+                      <SelectItem
                         key={item.id}
                         value={item.id}
                         disabled={!item.supported}
                       >
                         {item.label}
-                      </option>
+                      </SelectItem>
                     ))}
                   </Select>
                   {!selectedProvider?.supported && selectedProvider?.reason ? (
@@ -644,12 +649,12 @@ export default function Swarms() {
                       id="swarm-runner"
                       className="w-full"
                       value={runner}
-                      onChange={(event) => setRunner(event.target.value)}
+                      onValueChange={setRunner}
                     >
                       {(launchOptions?.runners || []).map((item) => (
-                        <option key={item.id} value={item.id}>
+                        <SelectItem key={item.id} value={item.id}>
                           {item.label}
-                        </option>
+                        </SelectItem>
                       ))}
                     </Select>
                   </div>
@@ -739,14 +744,14 @@ export default function Swarms() {
                     Env overrides
                     <HoverHint text="Optional per-run LiteLLM credentials or provider env. Use one KEY=VALUE pair per line. These values are passed only to the coordinator env and are not stored in swarm state." />
                   </FieldLabel>
-                  <textarea
+                  <UiTextarea
                     id="swarm-provider-env"
                     value={providerEnvText}
                     onChange={(event) => setProviderEnvText(event.target.value)}
                     placeholder={
                       "AZURE_API_KEY=...\nAZURE_API_BASE=...\nAZURE_API_VERSION=..."
                     }
-                    className="min-h-[7rem] w-full border border-neutral-700 bg-neutral-950 px-3 py-2 font-mono text-sm text-neutral-200 outline-none transition hover:border-neutral-600 focus:border-brand-500/60"
+                    className="min-h-[7rem] font-mono"
                     spellCheck={false}
                   />
                 </div>
@@ -790,16 +795,16 @@ export default function Swarms() {
                     id="swarm-effort"
                     className="w-full"
                     value={effort}
-                    onChange={(event) => setEffort(event.target.value)}
+                    onValueChange={setEffort}
                   >
-                    <option value="high">high</option>
-                    <option value="medium">medium</option>
-                    <option value="low">low</option>
+                    <SelectItem value="high">high</SelectItem>
+                    <SelectItem value="medium">medium</SelectItem>
+                    <SelectItem value="low">low</SelectItem>
                   </Select>
                 </div>
                 <div className="flex items-end">
                   <Button
-                    variant="accent"
+                    variant="default"
                     className="w-full bg-brand-500/20 text-brand-100 hover:bg-brand-500/30 hover:text-brand-50"
                     onClick={handleLaunch}
                     disabled={
@@ -814,7 +819,7 @@ export default function Swarms() {
               </div>
               <div className="space-y-2 text-sm text-neutral-400">
                 <label className="inline-flex items-center gap-2">
-                  <input
+                  <UiInput unstyled
                     type="checkbox"
                     checked={continuous}
                     onChange={(event) => setContinuous(event.target.checked)}
@@ -822,7 +827,7 @@ export default function Swarms() {
                   Continuous waves
                 </label>
                 <label className="inline-flex items-center gap-2">
-                  <input
+                  <UiInput unstyled
                     type="checkbox"
                     checked={keepWorktrees}
                     onChange={(event) => setKeepWorktrees(event.target.checked)}
@@ -862,7 +867,7 @@ export default function Swarms() {
               <h2 className="text-sm font-semibold uppercase tracking-[0.2em] text-neutral-400">
                 Swarms
               </h2>
-              <p className="text-sm text-neutral-500">
+              <p className="text-sm text-muted-foreground">
                 Compact view of wave count, winner, prompt snapshot, and
                 activity.
               </p>
@@ -870,28 +875,28 @@ export default function Swarms() {
             <Chip tone="neutral">{runs.length} runs</Chip>
           </div>
           {loadingRuns ? (
-            <p className="text-sm text-neutral-500">Loading swarm runs…</p>
+            <p className="text-sm text-muted-foreground">Loading swarm runs…</p>
           ) : runs.length ? (
             <div className="space-y-2">
               {runs.map((run) => (
-                <button
+                <UiButton unstyled
                   key={run.run_id}
                   type="button"
                   onClick={() => setSelectedRunId(run.run_id)}
                   className={cx(
-                    "w-full rounded-none border px-3 py-3 text-left transition",
+                    "w-full rounded-lg border px-3 py-3 text-left transition-colors",
                     selectedRunId === run.run_id
-                      ? "border-brand-400/60 bg-brand-500/10"
-                      : "border-white/10 bg-white/[0.03] hover:border-white/20"
+                      ? "border-border bg-neutral-800/70"
+                      : "border-border/70 bg-background/60 hover:bg-muted/70"
                   )}
                 >
                   <div className="flex items-start justify-between gap-3">
                     <div className="min-w-0">
                       <div className="flex flex-wrap items-center gap-2">
-                        <span className="truncate font-medium text-neutral-100">
+                        <span className="truncate font-medium text-foreground">
                           {run.spec_title || run.run_id}
                         </span>
-                        <Chip tone={statusTone(run.status)}>{run.status}</Chip>
+                        <Chip tone={statusChipTone(run.status)}>{run.status}</Chip>
                         <Chip tone={planningTone(run.planning_mode)}>
                           {run.current_wave}/{run.max_runs}
                         </Chip>
@@ -907,7 +912,7 @@ export default function Swarms() {
                         </p>
                       ) : null}
                     </div>
-                    <div className="shrink-0 text-right text-xs text-neutral-500">
+                    <div className="shrink-0 text-right text-xs text-muted-foreground">
                       <div>{fmtDate(run.updated_at)}</div>
                       <div className="mt-1">
                         accepted {run.accepted_child_ids.length} · fail{" "}
@@ -920,11 +925,11 @@ export default function Swarms() {
                       ) : null}
                     </div>
                   </div>
-                </button>
+                </UiButton>
               ))}
             </div>
           ) : (
-            <p className="text-sm text-neutral-500">
+            <p className="text-sm text-muted-foreground">
               No swarm runs captured yet.
             </p>
           )}
@@ -937,10 +942,10 @@ export default function Swarms() {
                 <div className="flex flex-wrap items-start justify-between gap-3">
                   <div>
                     <div className="flex flex-wrap items-center gap-2">
-                      <h2 className="text-lg font-semibold text-neutral-100">
+                      <h2 className="text-lg font-semibold text-foreground">
                         {detail.spec.title}
                       </h2>
-                      <Chip tone={statusTone(detail.run.status)}>
+                      <Chip tone={statusChipTone(detail.run.status)}>
                         {detail.run.status}
                       </Chip>
                       <Chip tone={planningTone(detail.run.planning_mode)}>
@@ -951,7 +956,7 @@ export default function Swarms() {
                       {selectedRun.repo_label} · {detail.run.run_id} ·{" "}
                       {fmtDate(detail.run.updated_at)}
                     </p>
-                    <p className="mt-2 text-sm text-neutral-500">
+                    <p className="mt-2 text-sm text-muted-foreground">
                       {detail.run.runner_name}
                       {detail.run.runner_model
                         ? ` / ${detail.run.runner_model}`
@@ -975,35 +980,35 @@ export default function Swarms() {
 
                 <div className="grid gap-3 lg:grid-cols-4">
                   <Card className="p-3">
-                    <div className="text-xs uppercase tracking-[0.2em] text-neutral-500">
+                    <div className="text-xs uppercase tracking-[0.2em] text-muted-foreground">
                       Wave
                     </div>
-                    <div className="mt-2 text-xl font-semibold text-neutral-100">
+                    <div className="mt-2 text-xl font-semibold text-foreground">
                       {detail.run.current_wave}/
                       {detail.run.max_runs || detail.run.runs}
                     </div>
                   </Card>
                   <Card className="p-3">
-                    <div className="text-xs uppercase tracking-[0.2em] text-neutral-500">
+                    <div className="text-xs uppercase tracking-[0.2em] text-muted-foreground">
                       Accepted
                     </div>
-                    <div className="mt-2 text-xl font-semibold text-neutral-100">
+                    <div className="mt-2 text-xl font-semibold text-foreground">
                       {detail.run.accepted_child_ids.length}
                     </div>
                   </Card>
                   <Card className="p-3">
-                    <div className="text-xs uppercase tracking-[0.2em] text-neutral-500">
+                    <div className="text-xs uppercase tracking-[0.2em] text-muted-foreground">
                       Children
                     </div>
-                    <div className="mt-2 text-xl font-semibold text-neutral-100">
+                    <div className="mt-2 text-xl font-semibold text-foreground">
                       {detail.run.children.length}
                     </div>
                   </Card>
                   <Card className="p-3">
-                    <div className="text-xs uppercase tracking-[0.2em] text-neutral-500">
+                    <div className="text-xs uppercase tracking-[0.2em] text-muted-foreground">
                       Winner
                     </div>
-                    <div className="mt-2 truncate text-sm font-medium text-neutral-100">
+                    <div className="mt-2 truncate text-sm font-medium text-foreground">
                       {detail.run.primary_winner_child_id || "—"}
                     </div>
                   </Card>
@@ -1016,12 +1021,12 @@ export default function Swarms() {
                     <h3 className="text-sm font-semibold uppercase tracking-[0.2em] text-neutral-400">
                       Frozen spec snapshot
                     </h3>
-                    <p className="text-sm text-neutral-500">
+                    <p className="text-sm text-muted-foreground">
                       Rendered from the copied run snapshot, not the live
                       mutable file.
                     </p>
                   </div>
-                  <div className="text-right text-xs text-neutral-500">
+                  <div className="text-right text-xs text-muted-foreground">
                     <div>{detail.spec.source_path}</div>
                     <div>{detail.spec.copied_path}</div>
                   </div>
@@ -1041,7 +1046,7 @@ export default function Swarms() {
                     <h3 className="text-sm font-semibold uppercase tracking-[0.2em] text-neutral-400">
                       Accepted commits
                     </h3>
-                    <Chip tone="emerald">
+                    <Chip tone="success">
                       {detail.export.accepted_commits.length}
                     </Chip>
                   </div>
@@ -1050,13 +1055,13 @@ export default function Swarms() {
                       {detail.export.accepted_commits.map((commit) => (
                         <div
                           key={`${commit.child_id}-${commit.order}`}
-                          className="rounded-sm border border-neutral-800 bg-neutral-950/40 p-3"
+                          className="rounded-lg border border-border/70 bg-background/60 p-3"
                         >
                           <div className="flex items-center justify-between gap-3">
-                            <span className="font-medium text-neutral-100">
+                            <span className="font-medium text-foreground">
                               {commit.child_id}
                             </span>
-                            <span className="text-xs text-neutral-500">
+                            <span className="text-xs text-muted-foreground">
                               #{commit.order} · {commitLabel(commit)}
                             </span>
                           </div>
@@ -1067,7 +1072,7 @@ export default function Swarms() {
                       ))}
                     </div>
                   ) : (
-                    <p className="text-sm text-neutral-500">
+                    <p className="text-sm text-muted-foreground">
                       No accepted commits recorded yet.
                     </p>
                   )}
@@ -1087,7 +1092,7 @@ export default function Swarms() {
                       <h3 className="text-sm font-semibold uppercase tracking-[0.2em] text-neutral-400">
                         Child logs
                       </h3>
-                      <p className="text-sm text-neutral-500">
+                      <p className="text-sm text-muted-foreground">
                         Tail output from the selected child worktree.
                       </p>
                     </div>
@@ -1107,30 +1112,28 @@ export default function Swarms() {
                     <Select
                       id="swarm-child-logs"
                       value={selectedChildId}
-                      onChange={(event) =>
-                        setSelectedChildId(event.target.value)
-                      }
+                      onValueChange={setSelectedChildId}
                     >
                       {detail.run.children.map((child) => (
-                        <option key={child.child_id} value={child.child_id}>
+                        <SelectItem key={child.child_id} value={child.child_id}>
                           {child.child_id} · {child.status}
-                        </option>
+                        </SelectItem>
                       ))}
                     </Select>
                   </div>
 
-                  <pre className="max-h-[28rem] overflow-auto rounded-sm border border-neutral-800 bg-neutral-950/80 p-4 text-xs leading-6 text-neutral-100">
+                  <pre className="max-h-[28rem] overflow-auto rounded-lg border border-border/70 bg-surface-code p-4 text-xs leading-6 text-foreground">
                     {logs || "No logs captured yet for this run."}
                   </pre>
                 </Card>
               </div>
             </>
           ) : loadingDetail ? (
-            <Card className="p-4 text-sm text-neutral-500">
+            <Card className="p-4 text-sm text-muted-foreground">
               Loading swarm detail…
             </Card>
           ) : (
-            <Card className="p-4 text-sm text-neutral-500">
+            <Card className="p-4 text-sm text-muted-foreground">
               Select a run to inspect its frozen prompt snapshot, accepted
               commits, and logs.
             </Card>
@@ -1147,7 +1150,7 @@ export default function Swarms() {
               <h2 className="text-sm font-semibold uppercase tracking-[0.2em] text-neutral-400">
                 Workflow (advanced)
               </h2>
-              <p className="text-sm text-neutral-500">
+              <p className="text-sm text-muted-foreground">
                 Workspace-local `workflow` runtime snapshot — pause, stop, and
                 inspect step outputs.
               </p>

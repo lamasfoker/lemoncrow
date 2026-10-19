@@ -26,18 +26,34 @@ in :func:`lemoncrow_client.routing.route_for`.
 from __future__ import annotations
 
 import os
+import threading
+import time
+from collections import OrderedDict
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 from .config import ClientConfig
 from .errors import AgentAction, ClientError, ErrorCode, error_block
 from .localtools import LocalContext, LocalResult, executor_for
+from .localtools.shell import background_running, close_background
 from .routing import Route, Site, route_for
 from .session import RemoteSession
+from .trace import ClientTraceWriter, new_trace_id, trace_scope
+from .worktrees import LinkedWorktree, WorktreeCatalog
 
 __all__ = ["Dispatcher", "ToolOutcome"]
+
+#: Worktree sessions kept open at once. Each owns an independent checkout
+#: view; content-addressed blobs let unchanged file content be reused. The bound
+#: keeps a long session's live-view cost flat.
+_MAX_WORKTREE_SESSIONS: Final[int] = 3
+#: A worktree session that failed to open is not retried on every call.
+_WORKTREE_RETRY_S: Final[float] = 30.0
+#: The visible line a degraded answer carries (``code_search`` renders its own).
+_DEGRADED_MARK: Final[str] = "! degraded"
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +68,13 @@ class ToolOutcome:
     site: str = ""
     view_revision: int | None = None
     structured: Mapping[str, Any] | None = None
+    #: The call's runtime trace id (``lt_...``). Not sent to the model; look
+    #: it up with ``lemoncrow trace show``.
+    trace_id: str = ""
+    #: The session/view that answered, set only when the call ran in a worktree's
+    #: own session, so a result cache never mixes two checkouts.
+    session_id: str = ""
+    view_id: str = ""
 
     def to_mcp(self, *, include_structured: bool = False) -> dict[str, Any]:
         """Render an MCP tool result for a consumer boundary.
@@ -74,17 +97,42 @@ class ToolOutcome:
                 "lemoncrow/degraded": True,
                 "lemoncrow/degraded_reason": self.degraded_reason,
             }
+            # ``_meta`` is for programs; hosts do not show it to the model. The
+            # agent must see that an answer is partial, or it trusts it as whole.
+            if not any(_DEGRADED_MARK in str(block.get("text", "")) for block in self.content):
+                reason = self.degraded_reason.strip()
+                payload["content"].append(
+                    {"type": "text", "text": f"{_DEGRADED_MARK}{': ' + reason if reason else ''}"}
+                )
         return payload
 
 
 class Dispatcher:
-    """Routes one tool call. Holds the session; owns no state of its own."""
+    """Routes one tool call and owns session-scoped checkout routing state."""
 
-    __slots__ = ("_config", "_context", "_session")
+    __slots__ = (
+        "_active_worktree",
+        "_catalog",
+        "_child_attempts",
+        "_child_lock",
+        "_children",
+        "_config",
+        "_context",
+        "_routing_lock",
+        "_session",
+        "_traces",
+    )
 
     def __init__(self, config: ClientConfig, session: RemoteSession) -> None:
         self._config = config
         self._session = session
+        self._catalog = WorktreeCatalog(config.repo_root)
+        self._active_worktree: LinkedWorktree | None = None
+        self._routing_lock = threading.Lock()
+        self._children: OrderedDict[Path, Dispatcher] = OrderedDict()
+        self._child_attempts: dict[Path, float] = {}
+        self._child_lock = threading.Lock()
+        self._traces = ClientTraceWriter(config.runtime_state_dir, hosted=bool(getattr(config, "hosted", False)))
         self._context = LocalContext(
             config=config,
             repo_root=config.repo_root,
@@ -96,15 +144,166 @@ class Dispatcher:
     def session(self) -> RemoteSession:
         return self._session
 
+    def background_running(self) -> bool:
+        """Whether a ``bash bg=true`` run of this session is still alive."""
+        with self._child_lock:
+            children = list(self._children.values())
+        return background_running(self._context.memory) or any(child.background_running() for child in children)
+
+    def close_background(self) -> int:
+        """Kill this session's ``bash bg=true`` runs; nothing outlives the session."""
+        with self._child_lock:
+            children = list(self._children.values())
+        return close_background(self._context.memory) + sum(child.close_background() for child in children)
+
+    def close_worktrees(self) -> None:
+        """Close every worktree session this one opened."""
+        with self._child_lock:
+            children = list(self._children.values())
+            self._children.clear()
+        for child in children:
+            child.close_background()
+            child.session.close()
+
     def call(self, tool: str, arguments: Mapping[str, Any]) -> ToolOutcome:
-        """Dispatch, turning every typed refusal into an agent-readable result."""
+        """Dispatch, turning every typed refusal into an agent-readable result.
+
+        Mints the call's trace id; server-routed calls carry it as their
+        request id so every layer's trace record shares it.
+        """
+        trace_id = new_trace_id()
+        started_at = datetime.now(UTC)
+        started = time.perf_counter()
+        recoveries_before = len(getattr(getattr(self._session, "state", None), "recovery_events", ()) or ())
+        routed = None
+        with trace_scope(trace_id):
+            try:
+                # project_id is a persistent-gateway concern. Refuse it before
+                # worktree routing so it can never acquire a second meaning.
+                self._refuse_project_routing(arguments)
+                with self._routing_lock:
+                    active = self._active_worktree
+                routed = self._catalog.route(arguments, active=active)
+                route = route_for(tool)
+                if routed.worktree is None:
+                    outcome = self._route(route, routed.arguments)
+                else:
+                    child = self._worktree_session(routed.worktree)
+                    outcome = replace(
+                        child._route(route, routed.arguments),
+                        session_id=child.session.state.session_id,
+                        view_id=child.session.state.view_id,
+                    )
+                if not outcome.is_error and routed.explicit:
+                    with self._routing_lock:
+                        self._active_worktree = routed.worktree
+                if routed.sticky and routed.worktree is not None:
+                    outcome = _with_worktree_header(outcome, routed.worktree)
+            except ClientError as exc:
+                outcome = ToolOutcome(content=(error_block(exc),), is_error=True, site="refused")
+        self._trace(trace_id, tool, arguments, started_at, started, outcome, recoveries_before)
+        return replace(outcome, trace_id=trace_id)
+
+    def _worktree_session(self, worktree: LinkedWorktree) -> Dispatcher:
+        """The open session for a linked worktree, created on first use.
+
+        Sessions are opened lazily and kept least-recently-used, so an unused
+        worktree costs nothing and a long-lived client has a fixed upper bound.
+        """
+        with self._child_lock:
+            child = self._children.pop(worktree.root, None)
+            if child is None:
+                config = replace(self._config, repo_root=worktree.root)
+                child = Dispatcher(config, RemoteSession(config))
+            self._children[worktree.root] = child
+            for root, idle in list(self._children.items()):
+                if len(self._children) <= _MAX_WORKTREE_SESSIONS:
+                    break
+                if root != worktree.root and not idle.background_running():
+                    del self._children[root]
+                    idle.session.close()
+            session = child.session
+            if not session.bootstrapped:
+                now = time.monotonic()
+                if now - self._child_attempts.get(worktree.root, float("-inf")) >= _WORKTREE_RETRY_S:
+                    self._child_attempts[worktree.root] = now
+                    try:
+                        report = session.bootstrap(
+                            deadline_s=max(self._config.startup_budget_s, self._config.request_timeout_s)
+                        )
+                    except ClientError as exc:
+                        session.state.go_offline(f"{exc.server_code}: {exc.message}")
+                    else:
+                        if not report.ok:
+                            session.state.go_offline(report.reason)
+            return child
+
+    def _refuse_project_routing(self, arguments: Mapping[str, Any]) -> None:
+        """``project_id`` needs the persistent gateway; never ignore it silently.
+
+        This client is bound to one workspace and has no project registry, so
+        honouring the argument is impossible -- and dropping it would run the
+        call (an ``edit``, a ``bash``) against the wrong tree without a word.
+        """
+        project = arguments.get("project_id")
+        if isinstance(project, str) and project.strip():
+            raise ClientError(
+                ErrorCode.LOCAL_TOOL_UNAVAILABLE,
+                "project_id is not supported by this client",
+                details={
+                    "detail": "project_id is resolved by the persistent MCP gateway; this client serves one "
+                    f"workspace ({self._config.repo_root}). Omit project_id to use that workspace."
+                },
+                action=AgentAction.FIX_REQUEST,
+            )
+
+    def _trace(
+        self,
+        trace_id: str,
+        tool: str,
+        arguments: Mapping[str, Any],
+        started_at: datetime,
+        started: float,
+        outcome: ToolOutcome,
+        recoveries_before: int,
+    ) -> None:
+        if not self._traces.enabled:
+            return
         try:
-            return self._route(route_for(tool), arguments)
-        except ClientError as exc:
-            return ToolOutcome(content=(error_block(exc),), is_error=True, site="refused")
+            state = self._session.state
+            # The event list is bounded; if it rotated mid-call, keep the tail.
+            recent = state.recovery_events[min(recoveries_before, len(state.recovery_events)) :]
+            self._traces.record(
+                trace_id=trace_id,
+                tool=tool,
+                arguments=arguments,
+                started_at=started_at,
+                duration_ms=round((time.perf_counter() - started) * 1000),
+                site=outcome.site,
+                is_error=outcome.is_error,
+                degraded=outcome.degraded,
+                degraded_reason=outcome.degraded_reason,
+                output_chars=sum(len(str(block.get("text") or "")) for block in outcome.content),
+                session_id=getattr(state, "session_id", "") or None,
+                view_revision=outcome.view_revision,
+                state_token=state.state_token(),
+                recoveries=[f"{event.kind}:{event.outcome}" for event in recent],
+            )
+        except Exception:  # a trace must never fail a tool call
+            return
 
     def _route(self, route: Route, arguments: Mapping[str, Any]) -> ToolOutcome:
         if route.tool == "read":
+            if not arguments.get("symbol"):
+                local = executor_for("read_from_disk")(self._context, arguments)
+                rev = getattr(getattr(self._session, "state", None), "view_revision", None)
+                return ToolOutcome(
+                    content=local.content,
+                    is_error=local.is_error,
+                    site=Site.CLIENT.value,
+                    view_revision=rev if self._session.state.view_bound else None,
+                    structured=local.structured,
+                )
             split = _split_absolute_read_files(arguments)
             if split is not None:
                 return self._read_with_absolute_files(route, *split)
@@ -143,13 +342,21 @@ class Dispatcher:
     def _local(self, route: Route, arguments: Mapping[str, Any]) -> ToolOutcome:
         result = executor_for(route.executor)(self._context, arguments)
         revision: int | None = None
+        degraded, degraded_reason = result.degraded, result.degraded_reason
         if route.pushes_blobs and result.changed_paths:
-            revision = self._push(result.changed_paths)
+            try:
+                revision = self._push(result.changed_paths)
+            except ClientError as exc:
+                # The write landed; only the server's copy lags, and every
+                # View-reading call syncs the tree before it answers. Reported
+                # as an error, an applied edit read as a failed one, and agents
+                # redid it into ``old_string not found``.
+                degraded, degraded_reason = True, f"{exc.code.value}: {exc.message}"
         return ToolOutcome(
             content=result.content,
             is_error=result.is_error,
-            degraded=result.degraded,
-            degraded_reason=result.degraded_reason,
+            degraded=degraded,
+            degraded_reason=degraded_reason,
             site=route.site.value,
             view_revision=revision,
             structured=result.structured,
@@ -159,9 +366,10 @@ class Dispatcher:
         """Bring the server's view forward, or say why it could not.
 
         A push failure is not allowed to lose the edit -- the file is already
-        written -- so it degrades the *result* rather than raising. The agent
-        is told the server's copy is behind, which is exactly the fact a
-        subsequent server-side read would otherwise get wrong.
+        written -- so :meth:`_local` degrades the *result* with this error
+        rather than failing the call. The agent is told the server's copy is
+        behind, which is exactly the fact a subsequent server-side read would
+        otherwise get wrong.
         """
         if not self._session.online or not self._session.state.view_bound:
             return None
@@ -184,7 +392,29 @@ class Dispatcher:
     def _remote(self, route: Route, arguments: Mapping[str, Any]) -> ToolOutcome:
         if not self._session.bootstrapped:
             return self._offline(route, arguments)
-        answer = self._session.call_tool(route.tool, arguments)
+        if route.offline and not self._session.indexed:
+            # No view outside a git repository: read the file from disk.
+            local = executor_for(route.offline)(self._context, arguments)
+            return ToolOutcome(
+                content=local.content,
+                is_error=local.is_error,
+                site=Site.CLIENT.value,
+                structured=local.structured,
+            )
+        try:
+            answer = self._session.call_tool(route.tool, arguments)
+        except ClientError as exc:
+            if exc.code in {ErrorCode.SERVER_UNREACHABLE, ErrorCode.SERVER_SESSION_UNAVAILABLE} and route.offline:
+                local = executor_for(route.offline)(self._context, arguments)
+                rev = getattr(getattr(self._session, "state", None), "view_revision", None)
+                return ToolOutcome(
+                    content=local.content,
+                    is_error=local.is_error,
+                    site=Site.CLIENT.value,
+                    view_revision=rev if rev else None,
+                    structured=local.structured,
+                )
+            raise
         return ToolOutcome(
             content=answer.content,
             is_error=answer.is_error,
@@ -210,11 +440,24 @@ class Dispatcher:
         return ToolOutcome(
             content=result.content,
             is_error=result.is_error,
-            degraded=True,
-            degraded_reason=result.degraded_reason or f"server_unreachable:{route.offline}",
-            site="client_offline_fallback",
+            degraded=result.degraded,
+            degraded_reason=result.degraded_reason,
+            site=Site.CLIENT.value,
             structured=result.structured,
         )
+
+
+def _with_worktree_header(outcome: ToolOutcome, worktree: LinkedWorktree) -> ToolOutcome:
+    """Mark a result whose checkout came only from sticky session context."""
+    prefix = f"[worktree {worktree.name}]"
+    blocks = [dict(block) for block in outcome.content]
+    for index, block in enumerate(blocks):
+        value = block.get("text")
+        if block.get("type") == "text" and isinstance(value, str):
+            block["text"] = f"{prefix}\n{value}" if value else prefix
+            blocks[index] = block
+            return replace(outcome, content=tuple(blocks))
+    return replace(outcome, content=({"type": "text", "text": prefix}, *outcome.content))
 
 
 def _read_entry_path(entry: object) -> str:

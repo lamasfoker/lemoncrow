@@ -16,22 +16,22 @@ Run LemonCrow on official [Harbor](https://harborframework.com) benchmark datase
 # from benchmarks/harbor/.env (CLAUDE_CODE_OAUTH_TOKEN_1/_2).
 
 # Quick smoke test (3 tasks, 1 attempt):
-lc benchmark harbor --limit 3 --attempts 1 -y
+lc rt benchmark harbor --limit 3 --attempts 1 -y
 
 # A/B comparison (LemonCrow augmentation on vs off):
-lc benchmark harbor -y
-lc benchmark harbor --baseline -y
+lc rt benchmark harbor -y
+lc rt benchmark harbor --baseline -y
 
 # With Bedrock credentials:
 export AWS_BEARER_TOKEN_BEDROCK=...
 export AWS_REGION=us-east-1
-lc benchmark harbor --agent lemoncrow-bedrock --limit 5 -y
+lc rt benchmark harbor --agent lemoncrow-bedrock --limit 5 -y
 ```
 
 ## Command reference
 
 ```
-lc benchmark harbor [OPTIONS]
+lc rt benchmark harbor [OPTIONS]
 
 Options:
   -d, --dataset TEXT        Harbor dataset (default: terminal-bench/terminal-bench-2-1)
@@ -71,13 +71,13 @@ harbor run -d "terminal-bench/terminal-bench-core@0.1.1" \
 
 | Command | Purpose |
 |---------|---------|
-| `lc benchmark mini --dry-run` | Offline schema validation, no Docker needed |
-| `lc benchmark mini --limit 5` | Live local repo tasks, cheap, no Docker |
-| `lc benchmark harbor --limit 5` | Official Harbor datasets in Docker containers |
+| `lc rt benchmark mini --dry-run` | Offline schema validation, no Docker needed |
+| `lc rt benchmark mini --limit 5` | Live local repo tasks, cheap, no Docker |
+| `lc rt benchmark harbor --limit 5` | Official Harbor datasets in Docker containers |
 | `make proof-cost-quality` | Deterministic proof gate (zero live calls) |
 
-Start with `lc benchmark mini --dry-run` to verify setup, then escalate to
-`lc benchmark harbor` for credible published results.
+Start with `lc rt benchmark mini --dry-run` to verify setup, then escalate to
+`lc rt benchmark harbor` for credible published results.
 
 ## Environment variables
 

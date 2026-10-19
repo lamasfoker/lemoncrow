@@ -13,7 +13,7 @@
 #   --claude       Only install Claude Code
 #   --codex        Only install Codex
 #   --opencode     Only install opencode
-#   --pi           Install the managed Pi frontend
+#   --pi           Install the managed Pi host
 #   --lemoncode    Only install LemonCode
 #   --copilot      Only install Copilot
 #   --antigravity  Only install Antigravity / agy
@@ -129,8 +129,7 @@ host_is_detected() {
         claude) _resolve_claude_cli ;;
         codex) command -v codex >/dev/null 2>&1 ;;
         opencode) command -v opencode >/dev/null 2>&1 ;;
-        # The LemonCode *host binary*, not the `lemoncode` wheel console script
-        # (an alias for `lc code`) that ships with every LemonCrow install.
+        # The LemonCode managed host binary installed by `lc host`.
         pi) [[ -x "${LEMONCROW_ROOT:-${HOME}/.lemoncrow}/bin/pi-host" ]] ;;
         lemoncode) lemoncrow_lemoncode_host_installed ;;
         copilot) command -v code >/dev/null 2>&1 ;;
@@ -184,7 +183,7 @@ run_host_installer() {
         }
 
         local $SIG{ALRM} = sub {
-            print STDERR "[lemoncrow:install] ERROR: host installer timed out after ${timeout}s\n";
+            print STDERR "[lc:install] ERROR: host installer timed out after ${timeout}s\n";
             kill "TERM", $pid;
             sleep 2;
             kill "KILL", $pid;
